@@ -68,7 +68,7 @@ impl AckTracker {
         }
 
         // Update largest received
-        if self.largest_received.map_or(true, |l| pn > l.as_u64()) {
+        if self.largest_received.is_none_or(|l| pn > l.as_u64()) {
             if let Some(prev) = self.largest_received {
                 if pn > prev.as_u64() + 1 {
                     self.has_gap = true;

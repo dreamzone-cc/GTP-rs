@@ -7,10 +7,12 @@ use crate::async_connection::AsyncGtpConnection;
 use gtp_core::{GtpConnection, ReceivedMessage};
 use gtp_types::{ConnectionId, MonotonicTime, Result, TransportError};
 
+type ConnectionMap = Arc<RwLock<HashMap<ConnectionId, (Arc<Mutex<GtpConnection>>, mpsc::Sender<ReceivedMessage>)>>>;
+
 /// Async GTP Endpoint running on top of Tokio.
 pub struct GtpEndpoint {
     socket: Arc<UdpSocket>,
-    connections: Arc<RwLock<HashMap<ConnectionId, (Arc<Mutex<GtpConnection>>, mpsc::Sender<ReceivedMessage>)>>>,
+    connections: ConnectionMap,
 }
 
 impl GtpEndpoint {
@@ -60,25 +62,20 @@ impl GtpEndpoint {
 
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((bytes, src)) => {
-                        let now = MonotonicTime::now();
-                        let mut datagram_copy = buf[..bytes].to_vec();
+            while let Ok((bytes, src)) = socket.recv_from(&mut buf).await {
+                let now = MonotonicTime::now();
+                let mut datagram_copy = buf[..bytes].to_vec();
 
-                        let conns = connections.read().await;
-                        for (conn_arc, tx) in conns.values() {
-                            let mut guard = conn_arc.lock().await;
-                            if guard.peer_addr() == src || true {
-                                if let Ok(msgs) = guard.handle_incoming_datagram(src, &mut datagram_copy, now) {
-                                    for msg in msgs {
-                                        let _ = tx.send(msg).await;
-                                    }
-                                }
+                let conns = connections.read().await;
+                for (conn_arc, tx) in conns.values() {
+                    let mut guard = conn_arc.lock().await;
+                    if guard.peer_addr() == src || true {
+                        if let Ok(msgs) = guard.handle_incoming_datagram(src, &mut datagram_copy, now) {
+                            for msg in msgs {
+                                let _ = tx.send(msg).await;
                             }
                         }
                     }
-                    Err(_) => break,
                 }
             }
         });

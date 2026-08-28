@@ -122,6 +122,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gtp"
+version = "0.1.0"
+dependencies = [
+ "gtp-cc",
+ "gtp-core",
+ "gtp-crypto",
+ "gtp-io",
+ "gtp-path",
+ "gtp-recovery",
+ "gtp-runtime-tokio",
+ "gtp-scheduler",
+ "gtp-sim",
+ "gtp-types",
+ "gtp-wire",
+]
+
+[[package]]
 name = "gtp-cc"
 version = "0.1.0"
 dependencies = [

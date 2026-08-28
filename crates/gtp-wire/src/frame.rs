@@ -29,6 +29,7 @@ pub struct AckRange {
 
 /// Strongly typed frames for the GTP wire format.
 #[derive(Clone, Eq, PartialEq, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Frame<'a> {
     Ack {
         largest_acked: PacketNumber,
@@ -158,10 +159,10 @@ impl<'a> Frame<'a> {
                 offset += 1;
 
                 let count = (*range_count as usize).min(MAX_ACK_RANGES);
-                for i in 0..count {
-                    buf[offset..offset + 4].copy_from_slice(&ranges[i].gap.to_be_bytes());
+                for range in ranges.iter().take(count) {
+                    buf[offset..offset + 4].copy_from_slice(&range.gap.to_be_bytes());
                     offset += 4;
-                    buf[offset..offset + 4].copy_from_slice(&ranges[i].length.to_be_bytes());
+                    buf[offset..offset + 4].copy_from_slice(&range.length.to_be_bytes());
                     offset += 4;
                 }
 
@@ -422,12 +423,12 @@ impl<'a> Frame<'a> {
                 }
 
                 let mut ranges = [AckRange::default(); MAX_ACK_RANGES];
-                for i in 0..(range_count as usize) {
+                for range in ranges.iter_mut().take(range_count as usize) {
                     let gap = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
                     offset += 4;
                     let length = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
                     offset += 4;
-                    ranges[i] = AckRange { gap, length };
+                    *range = AckRange { gap, length };
                 }
 
                 let ect0 = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());

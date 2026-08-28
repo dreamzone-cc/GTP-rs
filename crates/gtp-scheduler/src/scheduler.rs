@@ -121,9 +121,6 @@ impl GameScheduler {
                     if size <= send_budget && self.deficits[idx] >= size {
                         self.deficits[idx] -= size;
                         return Some(front);
-                    } else if size > send_budget {
-                        self.queues[idx].push_front(front);
-                        break;
                     } else {
                         self.queues[idx].push_front(front);
                         break;

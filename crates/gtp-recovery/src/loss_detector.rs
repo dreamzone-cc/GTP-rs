@@ -126,7 +126,7 @@ impl LossDetector {
 
         self.total_bytes_acked += bytes_acked as u64;
 
-        if self.largest_acked_packet.map_or(true, |l| largest_pn > l.as_u64()) {
+        if self.largest_acked_packet.is_none_or(|l| largest_pn > l.as_u64()) {
             self.largest_acked_packet = Some(largest_acked);
         }
 
