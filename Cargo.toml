@@ -12,6 +12,7 @@ members = [
     "crates/gtp-runtime-tokio",
     "crates/gtp-sim",
     "crates/gtp-cli",
+    "crates/gtp",
 ]
 resolver = "2"
 

@@ -1,0 +1,27 @@
+[package]
+name = "gtp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "High-Performance Game Transport Protocol (GTP/1.1) SDK for Rust"
+readme = "../../README.md"
+repository = "https://github.com/dreamzone-cc/GTP-rs"
+
+[dependencies]
+gtp-types = { workspace = true }
+gtp-wire = { workspace = true }
+gtp-recovery = { workspace = true }
+gtp-cc = { workspace = true }
+gtp-scheduler = { workspace = true }
+gtp-path = { workspace = true }
+gtp-crypto = { workspace = true }
+gtp-core = { workspace = true }
+gtp-io = { workspace = true }
+gtp-runtime-tokio = { workspace = true, optional = true }
+gtp-sim = { workspace = true, optional = true }
+
+[features]
+default = ["tokio"]
+tokio = ["dep:gtp-runtime-tokio"]
+sim = ["dep:gtp-sim"]
