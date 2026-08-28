@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "crates/gtp-types",
+    "crates/gtp-wire",
+    "crates/gtp-recovery",
+    "crates/gtp-cc",
+    "crates/gtp-scheduler",
+    "crates/gtp-path",
+    "crates/gtp-crypto",
+    "crates/gtp-core",
+    "crates/gtp-io",
+    "crates/gtp-runtime-tokio",
+    "crates/gtp-sim",
+    "crates/gtp-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["GTP Engineering Team"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+gtp-types = { path = "crates/gtp-types" }
+gtp-wire = { path = "crates/gtp-wire" }
+gtp-recovery = { path = "crates/gtp-recovery" }
+gtp-cc = { path = "crates/gtp-cc" }
+gtp-scheduler = { path = "crates/gtp-scheduler" }
+gtp-path = { path = "crates/gtp-path" }
+gtp-crypto = { path = "crates/gtp-crypto" }
+gtp-core = { path = "crates/gtp-core" }
+gtp-io = { path = "crates/gtp-io" }
+gtp-runtime-tokio = { path = "crates/gtp-runtime-tokio" }
+gtp-sim = { path = "crates/gtp-sim" }
+
+# Standard dependencies
+bytes = "1.9"
+socket2 = "0.5"
+tokio = { version = "1.40", features = ["rt", "net", "sync", "macros", "time"] }
+clap = { version = "4.5", features = ["derive"] }
+rand = "0.8"

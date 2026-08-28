@@ -1,0 +1,27 @@
+[package]
+name = "gtp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+gtp-types = { workspace = true }
+gtp-wire = { workspace = true }
+gtp-recovery = { workspace = true }
+gtp-cc = { workspace = true }
+gtp-scheduler = { workspace = true }
+gtp-path = { workspace = true }
+gtp-crypto = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+    "gtp-types/std",
+    "gtp-wire/std",
+    "gtp-recovery/std",
+    "gtp-cc/std",
+    "gtp-scheduler/std",
+    "gtp-path/std",
+    "gtp-crypto/std",
+]

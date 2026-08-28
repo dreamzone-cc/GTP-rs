@@ -1,0 +1,12 @@
+[package]
+name = "gtp-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+gtp-types = { workspace = true }
+gtp-core = { workspace = true }
+gtp-wire = { workspace = true }
+rand = { workspace = true }
