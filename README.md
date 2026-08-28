@@ -1,7 +1,6 @@
 # GTP-rs: Game Transport Protocol (GTP/1.1) in Rust
 
-[![Rust](https://img.shields.io/badge/rust-1.98.0%2B-orange.svg)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/compliance-100%25-brightgreen.svg)](docs/GTP_COMPREHENSIVE_COMPLIANCE_AND_FEATURE_AUDIT_REPORT.md)
 
 **GTP-rs** is a production-grade, modular, high-performance implementation of the **Game Transport Protocol (GTP/1.1)** written in pure **Rust**. Designed specifically for multiplayer game engines, interactive simulations, and real-time networked systems, GTP-rs combines ultra-low latency fire-and-forget messaging, generation-aware state supersession, and scoped out-of-order reliable streams over UDP.
@@ -102,8 +101,5 @@ cargo run -p gtp-cli -- dissect 80000100011811223344556677880000000000000001000F
 
 ## License
 
-Dual-licensed under either of:
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+Licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**. See [LICENSE](LICENSE) for details.
 
-at your option.
