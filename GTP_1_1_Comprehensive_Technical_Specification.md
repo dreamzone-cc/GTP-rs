@@ -1,28 +1,28 @@
 # Game Transport Protocol v1.1 (GTP/1)
-## المواصفة التقنية الشاملة لبروتوكول نقل ألعاب تنافسي منخفض الكمون فوق UDP
+## Comprehensive Technical Specification for Low-Latency Competitive Game Transport over UDP
 
-**الحالة:** Technical Architecture / Research Specification
-**تاريخ الإصدار:** 28 أغسطس 2026
-**اللغة المستهدفة للتنفيذ:** Rust
-**المنصة المرجعية:** Linux / Internet / Data Center / LAN
-**الملف:** GTP/1.1 Comprehensive Technical Specification
+**Status:** Technical Architecture / Research Specification
+**Release Date:** August 28, 2026
+**Target Implementation Language:** Rust
+**Reference Platform:** Linux / Internet / Data Center / LAN
+**File:** GTP/1.1 Comprehensive Technical Specification
 
-> **ملاحظة منهجية:** هذه الوثيقة توسع وتعيد ضبط ورقة GTP/1 السابقة. القرارات الأساسية الخاصة بدلالات الرسائل، Connection ID، ACK ranges، selective retransmission، deadlines، pacing، multi-core affinity، والـ I/O abstraction محفوظة، بينما أضيفت إليها متطلبات أحدث مرتبطة بالـ QUIC recovery، ACK Frequency، UDP GSO/GRO، io_uring، thread-per-core، وبنية Rust منخفضة الكلفة.
+> **Methodological Note:** This document expands and refines the prior GTP/1 specification. Core architectural decisions regarding message semantics, Connection ID, ACK ranges, selective retransmission, deadlines, pacing, multi-core affinity, and I/O abstractions are preserved, while incorporating advanced requirements for QUIC RFC 9002 loss recovery, ACK Frequency negotiation, UDP GSO/GRO offload, io_uring zero-copy batching, thread-per-core scalability, and low-cost zero-allocation Rust structures.
 
 ---
 
-# 1. الملخص التنفيذي
+# 1. Executive Summary
 
-يقترح هذا المستند **Game Transport Protocol v1 (GTP/1)** كطبقة نقل متخصصة للألعاب real-time والتنافسية فوق UDP، وليست بديلاً عامًا لـ TCP أو QUIC.
+This document specifies the **Game Transport Protocol v1 (GTP/1)** as a specialized transport layer designed for real-time and competitive multiplayer gaming over UDP, rather than a generic replacement for TCP or QUIC.
 
-الهدف هو بناء Transport يعرف دلالة البيانات وعمرها، ويستطيع اتخاذ قرار النقل وفق أربعة أبعاد مستقلة:
+The objective is to establish a transport protocol that inherently understands application data semantics and freshness, making transmission decisions along four independent dimensions:
 
-1. هل يجب أن تصل الرسالة؟
-2. هل يهم ترتيبها؟
-3. هل ما زالت الرسالة صالحة عند وقت التسليم؟
-4. ما مقدار الموارد التي يجوز إنفاقها عليها في ظل حالة الشبكة؟
+1. Must the message arrive reliably?
+2. Does message delivery ordering matter?
+3. Is the message still valid upon delivery (freshness/deadline)?
+4. What bandwidth/congestion budget may be allocated under current network conditions?
 
-يحتوي البروتوكول على أربع دلالات أساسية:
+The protocol provides four core delivery semantics:
 
 ```text
 UNRELIABLE
@@ -31,9 +31,9 @@ RELIABLE_UNORDERED
 RELIABLE_ORDERED
 ```
 
-ويستخدم اتصالاً واحداً ومساراً منطقياً واحداً وCongestion Controller واحداً وPacing واحداً، مع Queue/Scheduler متعدد الدلالات.
+It operates over a single logical connection, unified path, single Congestion Controller, and single Pacing Engine, governed by a multi-semantic priority Queue/Scheduler.
 
-التصميم يأخذ من:
+The architectural design synthesizes proven concepts from:
 
 ```text
 KCP
@@ -72,9 +72,9 @@ Rust
   compile-time invariants
 ```
 
-لكن GTP لا ينسخ أي بروتوكول بصورة كاملة.
+However, GTP does not clone any single existing protocol in full.
 
-المبدأ النهائي هو:
+The definitive design principle is:
 
 ```text
 Game Semantics
@@ -100,81 +100,81 @@ Linux Fast Path / NIC
 
 ---
 
-# 2. النطاق
+# 2. Scope
 
-## 2.1 داخل النطاق
+## 2.1 In-Scope
 
-GTP/1 مصمم لـ:
+GTP/1 is specifically designed for:
 
-- ألعاب FPS التنافسية.
-- Racing.
-- Battle Royale.
-- ألعاب الحركة real-time.
-- ألعاب multiplayer واسعة النطاق.
-- game state replication.
-- player input.
-- snapshots.
-- gameplay events.
-- RPC/events التي تتطلب ترتيباً جزئياً.
-- Internet وNAT.
-- LAN وData Center.
-- خوادم متعددة الأنوية.
+- Competitive First-Person Shooters (FPS).
+- Racing and Vehicular Simulations.
+- Battle Royale and High-Player-Density Games.
+- Real-time Action and Fighting Games.
+- Large-scale Multiplayer Games (MMOs).
+- Server-authoritative Game State Replication.
+- Client Player Input Streaming.
+- Entity World State Snapshots.
+- Critical Gameplay Events and RPCs.
+- RPCs/Events requiring scoped partial ordering.
+- Public Internet, NAT traversal, and Mobile Roaming.
+- Local LAN tournaments and Dedicated Server Clusters.
+- Multi-threaded and Thread-per-core Game Servers.
 
-## 2.2 خارج النطاق
+## 2.2 Out-of-Scope
 
-لا يكون GTP transport مناسباً أساساً لـ:
+GTP is explicitly not intended for:
 
-- HTTP/3 compatibility.
-- browser-native WebTransport replacement.
-- file transfer العام.
-- byte-stream compatibility.
-- mail/transaction systems.
-- bulk transport غير المرتبط بالألعاب.
+- HTTP/3 web compatibility.
+- Browser-native WebTransport replacement.
+- Generic large-scale bulk file transfers.
+- Arbitrary infinite byte-stream protocols.
+- Mail or transactional database replication.
+- Generic non-gaming bulk transport.
 
-يمكن استخدام reliable mode في نقل بيانات كبيرة صغيرة/متوسطة داخل اللعبة، لكن ذلك ليس هدف البروتوكول الرئيسي.
+Reliable streams can accommodate small-to-medium in-game asset transfers, but bulk transport is not the primary design target.
 
 ---
 
-# 3. أهداف التصميم
+# 3. Design Goals
 
-## 3.1 أهداف MUST
+## 3.1 MUST Requirements
 
-يجب أن:
+The protocol MUST:
 
-- يعمل فوق UDP.
-- يطبق congestion control على إجمالي traffic الخاص بالجلسة.
-- يطبق pacing.
-- يدعم loss detection سريعاً.
-- يفرق بين packet identity وmessage identity.
-- يدعم unreliable وreliable semantics.
-- لا يعيد إرسال state أصبحت قديمة.
-- يمنع HoL بين message classes المختلفة.
-- يدعم Connection ID.
-- يدعم packet number.
-- يدعم ACK ranges.
-- يدعم path validation.
-- يدعم NAT rebinding.
-- يدعم anti-amplification.
-- يدعم authenticated/encrypted Internet mode.
-- يمنع allocation لكل packet في steady state.
-- يسمح بالـ batch I/O.
-- يفصل protocol core عن runtime والـ kernel backend.
+- Operate directly over UDP.
+- Enforce congestion control across all aggregate session traffic.
+- Apply token-bucket pacing to eliminate micro-burst network queueing.
+- Support rapid loss detection with RFC 9002 algorithms.
+- Strictly decouple packet numbering from application message identity.
+- Support both unreliable and reliable delivery semantics within a single session.
+- Automatically suppress retransmission of superseded or obsolete state.
+- Prevent Head-of-Line (HoL) blocking between independent message classes.
+- Use 64-bit Connection IDs for resilient routing across NAT rebinding.
+- Use monotonically increasing 64-bit Packet Numbers.
+- Support compact ACK range blocks bounded to 32 intervals.
+- Support 3-way path validation challenge/response.
+- Support automatic NAT rebinding without session termination.
+- Enforce 3x anti-amplification limits on unvalidated peer paths.
+- Support AEAD encryption and authenticated headers for secure public Internet play.
+- Enforce zero heap allocation in steady-state per-packet RX/TX paths.
+- Support batch I/O operations (sendmmsg/recvmmsg, GSO/GRO).
+- Decouple protocol core state machines from async runtimes and OS backends.
 
-## 3.2 أهداف SHOULD
+## 3.2 SHOULD Requirements
 
-يفضل أن:
+The protocol SHOULD:
 
-- يدعم ECN.
-- يدعم adaptive ACK frequency.
-- يدعم GSO/GRO على Linux.
-- يدعم io_uring backend.
-- يدعم thread-per-core.
-- يدعم application-level redundancy.
-- يسمح بإضافة FEC مستقبلاً.
-- يدعم PMTU probing.
-- يقدم observability شاملة دون packet logging دائم.
+- Support Explicit Congestion Notification (ECN ECT0/ECT1/CE processing).
+- Support dynamic ACK Frequency frames to optimize reverse-path bandwidth.
+- Leverage Linux UDP GSO/GRO hardware offloads where available.
+- Support io_uring zero-copy buffer groups where supported by the kernel.
+- Scale linearly on thread-per-core multi-queue architectures.
+- Support redundant packet transmission for critical ultra-low-latency inputs.
+- Allow seamless extension with Forward Error Correction (FEC) frames.
+- Support dynamic Path MTU Discovery via MTU_PROBE frames.
+- Provide lightweight telemetry snapshots without intrusive logging overhead.
 
-## 3.3 OPTIONAL
+## 3.3 OPTIONAL Features
 
 - multipath.
 - 0-RTT.
@@ -185,7 +185,7 @@ GTP/1 مصمم لـ:
 - compression.
 - advanced ECN strategies.
 
-## 3.4 EXPERIMENTAL
+## 3.4 EXPERIMENTAL Prototypes
 
 - GTP-BBR-like controller.
 - receiver-assisted scheduling.
@@ -195,11 +195,11 @@ GTP/1 مصمم لـ:
 
 ---
 
-# 4. المبادئ الأساسية
+# 4. Fundamental Axioms
 
-## 4.1 البيانات ليست متساوية
+## 4.1 Game Data is Not Created Equal
 
-المعلومة التالية ليست مثل السابقة:
+Different game events possess entirely different latency and delivery requirements:
 
 ```text
 Player position
@@ -208,33 +208,33 @@ Weapon fired
 Cosmetic effect
 ```
 
-لذلك لا يجب دفعها كلها داخل ordered reliable stream واحد.
+Therefore, heterogeneous game traffic MUST NOT be serialized into a single monolithic ordered stream.
 
-## 4.2 Packet != Message
+## 4.2 Packet != Message Decoupling
 
-Packet هو وحدة النقل على الشبكة.
+A Packet is the physical unit of transport across the network.
 
-Message هي وحدة معنى في اللعبة.
+A Message is a semantic unit of game logic.
 
-قد يحتوي packet واحد على عدة messages، وقد تحتاج message واحدة إلى عدة packets.
+A single packet may multiplex multiple messages, and a single large message may span multiple packet fragments.
 
-## 4.3 Freshness جزء من transport semantics
+## 4.3 Freshness as an Intrinsic Transport Semantic
 
-في لعبة real-time، الرسالة الصحيحة التي تصل متأخرة قد تصبح خاطئة عملياً.
+In real-time multiplayer games, a correct state update that arrives late is functionally incorrect and destructive to gameplay.
 
-لذلك يجب أن يستطيع النقل أن يقول:
+Therefore, the transport layer must natively enforce:
 
 ```text
 expired => DROP
 ```
 
-بدلاً من تنفيذ retransmission أعمى.
+instead of executing blind, wasteful retransmissions.
 
-## 4.4 Congestion control لا يجوز تجاوزه
+## 4.4 Congestion Control is Mandatory
 
-Priority تعني الاختيار داخل budget فقط.
+Priority denotes precedence within the available transmission budget.
 
-لا تعني:
+It does NOT mean:
 
 ```text
 HIGH PRIORITY => ignore cwnd
@@ -242,35 +242,35 @@ HIGH PRIORITY => ignore cwnd
 
 ---
 
-# 5. نموذج الاتصال
+# 5. Connection Model
 
-يستخدم GTP مفهوم Session/Connection ID بدلاً من الاعتماد الكامل على 5-tuple.
+GTP uses explicit 64-bit Connection IDs (CIDs) rather than relying solely on the IP/port 5-tuple.
 
 ```text
 Connection ID = 64 bits minimum target
 ```
 
-ويجب أن يكون opaque بالنسبة للطرف الآخر وألا يكشف:
+The Connection ID MUST be opaque to external observers and must not reveal:
 
-- IP.
-- Port.
-- User ID.
-- Shard ID الخام.
-- CPU core.
+- Underlying IP addresses.
+- Underlying Port numbers.
+- Player/User account identifiers.
+- Raw internal game server shard IDs.
+- Dedicated CPU core/worker IDs.
 
-يمكن للتنفيذ أن يستخدم mapping داخلياً:
+The implementation may internally map:
 
 ```text
 CID → worker/shard
 ```
 
-من أجل scaling.
+for linear multi-core server scaling.
 
 ---
 
-# 6. Packet Identity
+# 6. Packet & Identity Decoupling
 
-يجب فصل:
+The protocol strictly decouples:
 
 ```text
 Packet Number
@@ -283,35 +283,35 @@ Generation ID
 
 ### Packet Number
 
-يمثل packet على مستوى transport.
+Identifies physical transport datagrams monotonically.
 
 ### Message ID
 
-يمثل logical game message.
+Identifies logical application game messages.
 
 ### Fragment ID
 
-يحدد جزء message مجزأة.
+Identifies fragment index within a segmented message.
 
 ### Transmission ID
 
-يحدد محاولة إرسال معينة للـ message/fragment.
+Identifies the specific retransmission attempt of a message fragment.
 
 ### State Sequence
 
-يحدد freshness ضمن state key.
+Defines freshness versioning within a specific StateKey using RFC 1982 modulo arithmetic.
 
 ### Generation ID
 
-يحدد جيل snapshot/state الكامل.
+Identifies the full epoch generation of the replicated game world state.
 
 ---
 
-# 7. دلالات الرسائل
+# 7. Message Delivery Semantics
 
 ## 7.1 UNRELIABLE
 
-للبيانات التي يمكن تعويضها برسالة لاحقة:
+For transient gameplay data continuously superseded by subsequent updates:
 
 - position.
 - rotation.
@@ -319,7 +319,7 @@ Generation ID
 - aim.
 - snapshot fragments.
 
-عند الفقد:
+Upon packet loss:
 
 ```text
 DROP
@@ -327,9 +327,9 @@ DROP
 
 ## 7.2 UNRELIABLE_SEQUENCED
 
-تستخدم عندما تكون أحدث نسخة فقط ذات قيمة.
+Used when only the newest state version holds value for simulation.
 
-مثال:
+Example:
 
 ```text
 seq 100 → accept
@@ -339,7 +339,7 @@ seq 101 → drop
 
 ## 7.3 RELIABLE_UNORDERED
 
-معلومات يجب ألا تضيع، لكن لا يجب أن تنتظر رسائل أخرى:
+Guaranteed delivery without head-of-line blocking across unrelated events:
 
 ```text
 achievement unlocked
@@ -350,7 +350,7 @@ combat trigger
 
 ## 7.4 RELIABLE_ORDERED
 
-يجب أن تستخدم فقط عندما يكون الترتيب جزءاً من الدلالة:
+Used strictly when chronological order is essential to semantic correctness:
 
 ```text
 JOIN
@@ -359,13 +359,13 @@ START
 END
 ```
 
-ولا تكون default path.
+Must NOT be used as the default path for general gameplay data.
 
 ---
 
 # 8. Message Descriptor
 
-كل message يمكن أن ترتبط داخلياً بهذا النموذج:
+Every application message is tracked internally via this descriptor model:
 
 ```text
 MessageDescriptor
@@ -383,13 +383,13 @@ MessageDescriptor
     retransmission_policy
 ```
 
-هذه المعلومات ليست كلها ضرورية على wire؛ بعضها application/transport internal metadata.
+Not all descriptor fields are transmitted on the wire; several represent internal scheduler metadata.
 
 ---
 
-# 9. Generation-Aware State
+# 9. Generation-Aware State Multiplexing
 
-لتقليل queue pressure:
+To eliminate queue buildup during network congestion:
 
 ```text
 state_key
@@ -398,23 +398,23 @@ state_key
   deadline
 ```
 
-إذا وصلت generation حديثة، يمكن إسقاط generations الأقدم دفعة واحدة.
+When a newer generation arrives, older generations can be evicted en masse.
 
-مثال:
+Example:
 
 ```text
 world_state generation 55
 ```
 
-أي queued state من generation < 55 يمكن إسقاطه عندما تكون semantics تسمح بذلك.
+Any queued state from generation < 55 can be evicted when message semantics permit.
 
 ---
 
 # 10. Deadline Semantics
 
-الـ deadline يجب أن يكون transport-aware.
+The deadline mechanism MUST be transport-aware.
 
-الصيغة المفاهيمية:
+Conceptual formula:
 
 ```text
 now
@@ -422,7 +422,7 @@ created_at
 remaining_lifetime = deadline - now
 ```
 
-والـ scheduler يجب أن يعرف:
+And the scheduler MUST track:
 
 - priority.
 - urgency.
@@ -431,21 +431,21 @@ remaining_lifetime = deadline - now
 - expected delivery time.
 - retransmission value.
 
-الرسالة المنتهية:
+Expired message policy:
 
 ```text
 DROP
 ```
 
-بغض النظر عن reliability الأصلية إذا كانت الدلالة تسمح بانتهاء صلاحيتها.
+Regardless of original reliability if the semantics permit expiration.
 
 ---
 
-# 11. Scheduler
+# 11. Multi-Tier Priority Scheduler
 
-الـ scheduler المقترح ليس priority queue عادية.
+The proposed scheduler is not a standard priority queue.
 
-المعمارية:
+Architecture:
 
 ```text
 Deadline Scheduling
@@ -459,7 +459,7 @@ Weighted Fairness
 Cwnd / Pacing Budget
 ```
 
-## 11.1 طبقات الأولوية
+## 11.1 Priority Tiers
 
 ```text
 P0 Control
@@ -469,15 +469,15 @@ P3 Reliable Gameplay
 P4 Cosmetic/Bulk
 ```
 
-ولكن جميعها تخضع للـ congestion budget.
+However, all traffic remains strictly subject to the congestion budget.
 
 ## 11.2 starvation prevention
 
-يجب منع starvation باستخدام weighted service أو aging.
+Starvation must be prevented using weighted service or deficit aging.
 
 ## 11.3 stale drop
 
-عند ازدحام queue:
+Under queue congestion:
 
 ```text
 stale state
@@ -485,23 +485,23 @@ stale state
 drop first
 ```
 
-قبل البيانات reliable غير المنتهية.
+before unexpired reliable data.
 
 ---
 
-# 12. Effective Queue
+# 12. Effective Queue Calculation
 
-لا ينبغي قياس queue فقط بعدد bytes.
+The queue must not be measured solely by raw byte count.
 
-نقترح مفهوم:
+We propose the concept:
 
 ```text
 effective_queue_bytes
 ```
 
-أي حجم البيانات التي ما زالت تحمل utility فعلية.
+i.e., the volume of data that still holds actionable utility.
 
-مثال:
+Example:
 
 ```text
 queued = 100 KB
@@ -509,19 +509,19 @@ expired = 70 KB
 valid = 30 KB
 ```
 
-فيصبح الضغط المنطقي أقرب إلى:
+Logical queue pressure becomes approximately:
 
 ```text
 30 KB useful queue
 ```
 
-بعد إزالة stale state.
+after eliminating stale state.
 
 ---
 
 # 13. Packet Format
 
-الهيكل المنطقي:
+Logical structure:
 
 ```text
 +-------------------------------+
@@ -545,17 +545,17 @@ valid = 30 KB
 
 ## 13.1 Common Header Target
 
-الهدف المبدئي:
+Initial target:
 
 ```text
 ~ 20–28 bytes
 ```
 
-ولكن يجب ألا يفرض الرقم نفسه قبل profiling وwire-format review.
+However, the exact figure should not be fixed prior to profiling and wire-format review.
 
 ## 13.2 Long Header
 
-يستخدم للـ:
+Used for:
 
 - handshake.
 - version negotiation.
@@ -564,13 +564,13 @@ valid = 30 KB
 
 ## 13.3 Short Header
 
-يستخدم بعد استقرار الاتصال لتقليل overhead.
+Used after connection establishment to minimize header overhead.
 
 ---
 
-# 14. Frames
+# 14. TLV Frame Repertoire
 
-الـ packet قد يحتوي على:
+A packet may multiplex:
 
 ```text
 ACK
@@ -585,7 +585,7 @@ MTU_PROBE
 CLOSE
 ```
 
-قد تُضاف:
+May be added:
 
 ```text
 ACK_FREQUENCY
@@ -593,15 +593,15 @@ FEC
 PADDING
 ```
 
-كامتدادات مستقبلية.
+as future protocol extensions.
 
 ---
 
 # 15. ACK Architecture
 
-ACK لا يعني فقط retransmission.
+ACK    retransmission.
 
-بل يوفر:
+:
 
 ```text
 Delivery evidence
@@ -611,7 +611,7 @@ Congestion signal
 ECN feedback
 ```
 
-لذلك:
+:
 
 ```text
 ACK
@@ -631,9 +631,9 @@ Pacing
 
 # 16. ACK Ranges
 
-يستخدم GTP تمثيل ranges بدلاً من ACK packet لكل packet.
+GTP  ranges   ACK packet  packet.
 
-مثال:
+Example:
 
 ```text
 Largest = 1050
@@ -643,15 +643,15 @@ Largest = 1050
 1030-1040
 ```
 
-هذا يسمح بتمثيل loss المتفرق وإعادة الترتيب بكفاءة.
+loss    .
 
 ---
 
 # 17. Adaptive ACK Frequency
 
-GTP يضيف مفهوماً مشابهاً لاتجاه QUIC ACK Frequency الحديث: يمكن للمستقبل والمرسل التكيف مع packet rate والحالة.
+GTP     QUIC ACK Frequency Limit: MAY  Sent   packet rate State.
 
-سياسات محتملة:
+:
 
 ```text
 normal:
@@ -667,15 +667,15 @@ critical measurement:
 immediate ACK
 ```
 
-ولا يجب تثبيت ACK every 2 packets كقانون دائم.
+MUST  ACK every 2 packets  .
 
-**ملاحظة زمنية:** كان QUIC ACK Frequency ما يزال Internet-Draft في 2026 وليس RFC نهائياً في وقت إعداد هذه الورقة، لذلك يستخدم GTP الفكرة كمرجع تصميمي لا كاعتماد معياري مباشر.
+** :**  QUIC ACK Frequency   Internet-Draft  2026  RFC         GTP       .
 
 ---
 
-# 18. RTT Estimation
+# 18. RTT Estimation (RFC 9002)
 
-يجب الاحتفاظ على الأقل بـ:
+MUST    :
 
 ```text
 latest_rtt
@@ -685,13 +685,13 @@ rttvar
 ack_delay
 ```
 
-ويجب عدم اتخاذ كل قرار congestion اعتماداً على RTT خام واحد.
+MUST     congestion   RTT  .
 
 ---
 
 # 19. Loss Detection
 
-مصادر loss:
+loss:
 
 ```text
 ACK gap
@@ -700,7 +700,7 @@ Time threshold
 PTO-like timeout
 ```
 
-يجب الفصل بين:
+MUST  :
 
 ```text
 loss declaration
@@ -708,13 +708,13 @@ retransmission policy
 congestion reaction
 ```
 
-لأن فقد state غير موثوقة قد لا يعني retransmission.
+state Unreliable    retransmission.
 
 ---
 
 # 20. Selective Recovery
 
-عند فقد packet:
+packet:
 
 ```text
 Packet 100
@@ -723,16 +723,16 @@ Packet 100
   DATA C
 ```
 
-لا يعاد packet 100 كاملاً بالضرورة.
+packet 100  .
 
-إذا كانت B فقط reliable:
+B  reliable:
 
 ```text
 Packet 105
   RETX B
 ```
 
-هذه قاعدة مركزية:
+:
 
 > Retransmission is logical-message/frame based, not packet-copy based.
 
@@ -740,7 +740,7 @@ Packet 105
 
 # 21. Transmission Records
 
-لكل transmission record يمكن الاحتفاظ:
+transmission record MAY :
 
 ```text
 packet_number
@@ -753,7 +753,7 @@ ack_eliciting
 retransmittable
 ```
 
-ويجب أن يدعم هذا record:
+MUST    record:
 
 - loss detection.
 - RTT.
@@ -763,11 +763,11 @@ retransmittable
 
 ---
 
-# 22. KCP v2.1.1 Lessons
+# 22. Architectural Lessons from KCP
 
-تطور KCP في 2026 مهم لتصميم GTP. الإصدار 2.0 أضاف نظام congestion-control قابل للاستبدال، والإصدار 2.1.1 أضاف `acked_bytes` و`xmit` لدعم bandwidth estimation، ونقل callback الإرسال إلى نقطة الإرسال الفعلية، وأضاف pacing اختيارياً وحسّن ssthresh/cwnd growth.
+KCP  2026   GTP.  2.0   congestion-control    2.1.1  `acked_bytes` `xmit`  bandwidth estimation  callback       pacing   ssthresh/cwnd growth.
 
-GTP يجب أن يأخذ من ذلك:
+GTP MUST    :
 
 ```text
 acked bytes
@@ -777,13 +777,13 @@ pluggable congestion controller
 optional pacing hooks
 ```
 
-لكن لا يتبنى KCP نفسه كقلب transport.
+KCP   transport.
 
 ---
 
 # 23. Delivery-Rate Telemetry
 
-كل ACK processing يجب أن يستطيع إنتاج:
+ACK processing MUST   :
 
 ```text
 acked_bytes
@@ -793,19 +793,19 @@ prior_inflight
 delivery_interval
 ```
 
-ثم:
+:
 
 ```text
 delivery_rate = delivered_bytes / delivery_interval
 ```
 
-ويجب حفظ samples بطريقة لا تولد allocation على كل ACK.
+MUST  samples    allocation   ACK.
 
 ---
 
 # 24. Congestion Control API
 
-الواجهة المنطقية:
+Interface :
 
 ```rust
 trait CongestionController {
@@ -821,7 +821,7 @@ trait CongestionController {
 }
 ```
 
-الـ actual API يمكن تحسينه أثناء التنفيذ.
+actual API MAY   Implementation.
 
 ---
 
@@ -829,23 +829,23 @@ trait CongestionController {
 
 ## 25.1 Baseline
 
-النسخة المرجعية:
+:
 
 ```text
 CUBIC / NewReno-compatible behavior
 ```
 
-لضمان سلوك مفهوم وسهل المقارنة.
+.
 
 ## 25.2 Delivery-rate controller
 
-تجريبي:
+:
 
 ```text
 BBR-inspired
 ```
 
-مع قياس:
+:
 
 - delivery rate.
 - RTT.
@@ -855,13 +855,13 @@ BBR-inspired
 
 ## 25.3 GTP-specific controller
 
-مستقبلاً يمكن تصميم:
+MAY :
 
 ```text
 GTP-CC
 ```
 
-ليوازن:
+:
 
 ```text
 fairness
@@ -871,15 +871,15 @@ loss
 throughput
 ```
 
-لكن يجب عدم اعتماده production قبل benchmark واسع.
+MUST   production  benchmark .
 
 ---
 
-# 26. Fairness
+# 26. Network Fairness
 
-GTP يعمل فوق Internet، وبالتالي لا يجوز تصميمه لاحتكار bottleneck.
+GTP   Internet  MUST NOT   bottleneck.
 
-يجب اختبار مشاركته مع:
+MUST   :
 
 ```text
 TCP
@@ -887,20 +887,20 @@ QUIC
 GTP
 ```
 
-والتحقق من:
+Validation :
 
 - throughput fairness.
 - RTT stability.
 - no congestion collapse.
 - ECN response.
 
-لا يعني game priority السماح لـ GTP بتجاوز congestion control.
+game priority   GTP  congestion control.
 
 ---
 
-# 27. ECN
+# 27. Explicit Congestion Notification (ECN)
 
-يدعم التصميم:
+Design:
 
 ```text
 ECT(0)
@@ -908,17 +908,17 @@ ECT(1)
 CE
 ```
 
-ويجب أن يكون للـ CC handler صريح:
+MUST    CC handler :
 
 ```text
 on_ecn()
 ```
 
-لأن CE signal قد يصل قبل loss.
+CE signal    loss.
 
 ---
 
-# 28. Pacing
+# 28. Transmission Pacing
 
 Pacing mandatory architectural component.
 
@@ -934,13 +934,13 @@ Scheduler
 Packet Builder
 ```
 
-الهدف منع bursts غير الضرورية وتقليل queue buildup.
+bursts    queue buildup.
 
 ---
 
-# 29. Pacing Model
+# 29. Pacing Engine Model
 
-يستخدم:
+:
 
 ```text
 next_send_time
@@ -948,33 +948,33 @@ send_budget
 burst_cap
 ```
 
-ولا يعتمد فقط على `sleep()`.
+`sleep()`.
 
-يمكن أن يستخدم loop/event timer مع batching إذا كان الوقت يسمح.
+MAY   loop/event timer  batching   Time .
 
 ---
 
-# 30. Burst Control
+# 30. Micro-Burst Control
 
-يسمح Burst صغير controlled:
+Burst  controlled:
 
 ```text
 burst <= configured bound
 ```
 
-لكن لا يجوز تفريغ عشرات packets دفعة واحدة فقط بسبب وصول ACK burst.
+MUST NOT   packets      ACK burst.
 
 ---
 
-# 31. Transport Budget
+# 31. Unified Transport Budget
 
-يقترح GTP متغيراً مفاهيمياً:
+GTP  :
 
 ```text
 send_budget
 ```
 
-مصادره:
+:
 
 ```text
 cwnd
@@ -984,32 +984,32 @@ queue state
 path state
 ```
 
-الـ scheduler يختار ما يدخل هذا budget.
+scheduler     budget.
 
 ---
 
-# 32. Freshness-Aware Congestion
+# 32. Freshness-Aware Congestion Avoidance
 
-هذه إحدى أهم إضافات GTP.
+GTP.
 
-الازدحام لا يجب أن يعامل 100 KB queued على أنها 100 KB useful دائماً.
+Congestion  MUST   100 KB queued   100 KB useful .
 
-إذا:
+:
 
 ```text
 70 KB expired
 30 KB valid
 ```
 
-فالأولوية هي حذف الـ70KB ودفع الـ30KB ذات القيمة.
+70KB  30KB  .
 
-هذا يساعد على مقاومة application-level queue buildup وbufferbloat.
+application-level queue buildup bufferbloat.
 
 ---
 
-# 33. Backpressure
+# 33. Engine Backpressure Signaling
 
-مستويات الضغط المقترحة:
+:
 
 ```text
 LOW
@@ -1027,13 +1027,13 @@ CRITICAL
     stop non-essential injection
 ```
 
-القيم النهائية يجب أن تضبط بالـ benchmark.
+Final MUST    benchmark.
 
 ---
 
-# 34. Realtime Redundancy
+# 34. Realtime Input Redundancy
 
-بدلاً من retransmission التقليدي يمكن إرسال:
+retransmission  MAY :
 
 ```text
 Packet 100:
@@ -1043,22 +1043,22 @@ Packet 101:
 state 101 + compact state 100
 ```
 
-لكن redundancy:
+redundancy:
 
 - optional.
 - bounded.
 - congestion-controlled.
 - adaptive.
 
-ولا يجوز أن تتحول إلى congestion amplification.
+MUST NOT    congestion amplification.
 
 ---
 
-# 35. FEC
+# 35. Forward Error Correction (FEC)
 
-FEC ليست mandatory في v1.
+FEC  mandatory  v1.
 
-لكن architecture يجب أن تسمح بـ:
+architecture MUST   :
 
 ```text
 Protection Group
@@ -1068,7 +1068,7 @@ Protection Group
   parity
 ```
 
-الأولوية التنفيذية:
+Implementation:
 
 ```text
 ACK/loss
@@ -1080,18 +1080,18 @@ ACK/loss
 
 ---
 
-# 36. Fragmentation
+# 36. Message Fragmentation & Reassembly
 
-لا يسمح protocol بإرسال UDP/IP datagrams غير منضبطة قد تؤدي إلى fragmentation على IP.
+protocol  UDP/IP datagrams      fragmentation  IP.
 
-ينبغي أن يكون:
+:
 
 ```text
 realtime message
     <= one packet whenever practical
 ```
 
-والرسائل الكبيرة:
+Messages :
 
 ```text
 message
@@ -1101,15 +1101,15 @@ fragments
 selective recovery
 ```
 
-كل fragment يجب أن يملك هوية مستقلة في recovery state.
+fragment MUST      recovery state.
 
 ---
 
-# 37. MTU / PMTU
+# 37. Path MTU Discovery (PMTU)
 
-يبدأ الاتصال بحجم محافظ.
+Connection  .
 
-ثم:
+:
 
 ```text
 probe
@@ -1119,36 +1119,36 @@ ack
 raise MTU
 ```
 
-عند failure:
+failure:
 
 ```text
 lower MTU
 ```
 
-لا ينبغي الاعتماد على IP fragmentation.
+IP fragmentation.
 
-على المسار المرجعي، يمكن اعتماد 1200-byte-class packets كـ baseline محافظ ثم probing نحو قيم أعلى حسب path capability.
+Path  MAY  1200-byte-class packets  baseline   probing     path capability.
 
 ---
 
-# 38. Linux UDP Offload
+# 38. Linux UDP Offload Capabilities
 
-يجب أن يدعم backend Linux قدر الإمكان:
+MUST   backend Linux  :
 
 ```text
 UDP_SEGMENT / GSO
 UDP_GRO
 ```
 
-Linux يوثق أن UDP segmentation offload يسمح بتمرير عدة datagrams في إرسال واحد عبر kernel transmit path، مع تقسيم لاحق وفق segment size، بينما UDP GRO يعكس ذلك في RX ويجمع عدة datagrams ضمن buffer كبير.
+Linux   UDP segmentation offload    datagrams     kernel transmit path     segment size  UDP GRO    RX   datagrams  buffer .
 
-هذه التحسينات **backend-specific** ولا تدخل في wire protocol.
+**backend-specific**    wire protocol.
 
 ---
 
-# 39. GSO Strategy
+# 39. GSO Offload Strategy
 
-بدلاً من:
+:
 
 ```text
 send()
@@ -1157,21 +1157,21 @@ send()
 send()
 ```
 
-يمكن للـ backend تجميع عدة GTP packets المستقلة في إرسال أكبر عندما تكون:
+MAY  backend   GTP packets      :
 
-- متوافقة مع MTU بعد segmentation.
-- ضمن نفس socket/path.
-- متوافقة مع pacing budget.
+-   MTU  segmentation.
+-   socket/path.
+-   pacing budget.
 
-يجب ألا يسمح GSO بتجاوز pacing أو تشكيل burst غير مرغوب.
+MUST   GSO  pacing   burst  .
 
 ---
 
-# 40. GRO Strategy
+# 40. GRO Offload Strategy
 
-RX path يمكن أن يستقبل buffer يحتوي عدة datagrams.
+RX path MAY   buffer   datagrams.
 
-يجب أن يبقى GTP parser قادراً على:
+MUST   GTP parser  :
 
 ```text
 split
@@ -1180,15 +1180,15 @@ parse
 process
 ```
 
-من دون نسخ غير ضروري.
+.
 
-GRO لا يغير packet numbering semantics؛ هو optimization في I/O layer فقط.
+GRO   packet numbering semantics  optimization  I/O layer .
 
 ---
 
 # 41. I/O Backend Abstraction
 
-الواجهة المفاهيمية:
+Interface :
 
 ```rust
 trait PacketIo {
@@ -1198,7 +1198,7 @@ trait PacketIo {
 }
 ```
 
-الـ backends:
+backends:
 
 ```text
 portable UDP
@@ -1212,9 +1212,9 @@ DPDK future
 
 ---
 
-# 42. io_uring Backend
+# 42. io_uring Asynchronous Backend
 
-بالنسبة إلى Linux الحديثة، يجب دراسة:
+Linux Limit MUST :
 
 ```text
 multishot recv
@@ -1223,31 +1223,31 @@ recvmsg multishot
 bundle-based receives
 ```
 
-الإصدارات الحديثة من Rust `io-uring` توفر عمليات receive متعددة الرسائل، ويمكن لـ `RecvMsgMulti` إبقاء receive request واحدة فعالة وإصدار CQEs متعددة، كما يتوفر bundle-style receive في kernels حديثة.
+Limit  Rust `io-uring`   receive  Messages MAY  `RecvMsgMulti`  receive request    CQEs    bundle-style receive  kernels .
 
-يجب أن يكون backend قادراً على الاستفادة منها عند توفرها، مع fallback إلى recvmsg/recvfrom التقليدي.
-
----
-
-# 43. Monoio
-
-يعد Monoio backend/runtime مرجعاً مهماً لأن تصميمه thread-per-core، ويفصل العمليات بحيث يبقى state محلياً للـ thread في الحالات المناسبة.
-
-GTP لا يجب أن يعتمد عليه في core API، لكنه مناسب جداً لبناء performance runtime.
+MUST   backend        fallback  recvmsg/recvfrom .
 
 ---
 
-# 44. Tokio
+# 43. Monoio Integration
 
-يستخدم كـ:
+Monoio backend/runtime     thread-per-core     state   thread   .
+
+GTP  MUST     core API     performance runtime.
+
+---
+
+# 44. Tokio Async Runtime Integration
+
+:
 
 ```text
 reference / integration runtime
 ```
 
-وليس من الضروري أن يكون transport core مبنياً حول Tokio.
+transport core   Tokio.
 
-ذلك يسمح بمقارنة:
+:
 
 ```text
 Tokio
@@ -1257,13 +1257,13 @@ vs
 native io_uring loop
 ```
 
-مع نفس protocol core.
+protocol core.
 
 ---
 
 # 45. Thread-per-Core Architecture
 
-الهدف المرجعي:
+:
 
 ```text
 NIC RX queue
@@ -1275,15 +1275,15 @@ GTP worker
 Connection owner
 ```
 
-بعد إنشاء الاتصال:
+Connection:
 
 ```text
 Connection → worker affinity
 ```
 
-ما أمكن.
+.
 
-هذا يقلل:
+:
 
 - locks.
 - cache line bouncing.
@@ -1292,17 +1292,17 @@ Connection → worker affinity
 
 ---
 
-# 46. Rust Ownership as Performance Tool
+# 46. Rust Safe Ownership as a Performance Tool
 
-لا ينبغي أن تكون البنية الأساسية:
+:
 
 ```rust
 Arc<Mutex<Connection>>
 ```
 
-في hot path.
+hot path.
 
-يفضل:
+SHOULD:
 
 ```text
 single owner
@@ -1310,13 +1310,13 @@ single writer
 thread-local mutable state
 ```
 
-والتفاعل بين cores عبر channels أو queues مصممة بعناية عند الحاجة.
+cores  channels  queues    .
 
 ---
 
-# 47. Hot / Cold State
+# 47. Hot / Cold Cache-Line State Partitioning
 
-يجب تقسيم connection state:
+MUST  connection state:
 
 ```text
 ConnectionHot
@@ -1343,15 +1343,15 @@ ConnectionCold
 - rarely used extension state.
 - verbose security metadata.
 
-الهدف إبقاء hot state صغيرة وcache-friendly.
+hot state  cache-friendly.
 
 ---
 
-# 48. Memory Management
+# 48. Zero-Allocation Memory Management
 
-لا allocation لكل packet.
+allocation  packet.
 
-مكونات مقترحة:
+:
 
 ```text
 PacketPool
@@ -1361,17 +1361,17 @@ TransmissionPool
 ConnectionPool
 ```
 
-ويجب استخدام recycling.
+MUST  recycling.
 
-لكن لا يجب فرض pool واحد عالمي يخلق lock contention؛ الأفضل per-worker pools مع fallback محدود.
+MUST  pool    lock contention  per-worker pools  fallback .
 
 ---
 
-# 49. Slab / Arena Strategy
+# 49. Slab & Arena Allocation Strategy
 
-يمكن استخدام slabs محلية لكل worker.
+MAY  slabs   worker.
 
-مثال:
+Example:
 
 ```text
 worker 0
@@ -1383,13 +1383,13 @@ worker 1
   message slabs
 ```
 
-وعند نقل ownership بين workers يجب تقليل cross-core transfer.
+ownership  workers MUST  cross-core transfer.
 
 ---
 
-# 50. Zero-Copy Strategy
+# 50. Zero-Copy Data Path Strategy
 
-يجب أن يكون wire parsing تقريباً:
+MUST   wire parsing :
 
 ```text
 &[u8]
@@ -1401,17 +1401,17 @@ frame iterator
 message view
 ```
 
-بدلاً من deserialize كامل إلى heap objects.
+deserialize   heap objects.
 
-`zerocopy` مرشح مناسب لبناء typed byte views بشكل منخفض الكلفة مع الحفاظ على checks/validation المناسبة.
+`zerocopy`    typed byte views       checks/validation .
 
-لكن يجب عدم فرض zero-copy إذا كان سيعقد lifetime management أو يؤدي إلى retaining buffers ضخمة؛ في هذه الحالة ينسخ GTP فقط البيانات التي يجب أن تعيش بعد RX buffer.
+MUST   zero-copy    lifetime management    retaining buffers    State  GTP    MUST    RX buffer.
 
 ---
 
 # 51. Wire Codec
 
-الـ hot path يفضل أن يستخدم codec متخصصاً ومحدداً، مثل:
+hot path SHOULD   codec   :
 
 ```text
 fixed prefix parsing
@@ -1420,15 +1420,15 @@ zero-copy slices
 frame iterator
 ```
 
-ويجب ألا يعتمد path الحرج على serialization generic ثقيل.
+MUST   path   serialization generic .
 
-Ser/de frameworks يمكن أن تستخدم للـ configuration وcontrol-plane data، وليس شرطاً للـ packet codec.
+Ser/de frameworks MAY    configuration control-plane data    packet codec.
 
 ---
 
 # 52. Parser Requirements
 
-الـ parser يجب أن يكون:
+parser MUST  :
 
 - allocation-free.
 - bounds-checked.
@@ -1438,7 +1438,7 @@ Ser/de frameworks يمكن أن تستخدم للـ configuration وcontrol-plan
 - resistant to integer overflow.
 - capable of early rejection.
 
-الترتيب المقترح:
+:
 
 ```text
 minimum header check
@@ -1458,7 +1458,7 @@ full frame decode
 
 # 53. Authentication Ordering
 
-لا ينبغي تنفيذ expensive crypto قبل minimal packet sanity وconnection lookup عندما يمكن تجنب ذلك.
+expensive crypto  minimal packet sanity connection lookup  MAY  .
 
 RX:
 
@@ -1476,7 +1476,7 @@ AEAD
 full parse
 ```
 
-هذه البنية تقلل تكلفة packets عشوائية/ضارة.
+packets /.
 
 ---
 
@@ -1488,7 +1488,7 @@ Internet profile:
 authenticated + AEAD
 ```
 
-أما plain mode فيبقى فقط:
+plain mode  :
 
 ```text
 LAN
@@ -1497,13 +1497,13 @@ benchmark
 controlled environments
 ```
 
-ولا يوصى بتمكينه كـ Internet default.
+Internet default.
 
 ---
 
 # 55. AEAD
 
-يجب أن تكون packet protection مرتبطة بـ:
+MUST   packet protection Ordered :
 
 ```text
 Connection keys
@@ -1513,15 +1513,15 @@ AAD
 Authentication tag
 ```
 
-ويجب توفير replay resistance.
+MUST  replay resistance.
 
-crypto implementation يجب أن يسمح بالاستفادة من implementations عالية الأداء/hardware acceleration عند توفرها دون تغيير wire semantics.
+crypto implementation MUST     implementations  Performance/hardware acceleration     wire semantics.
 
 ---
 
 # 56. Handshake
 
-الحالة:
+Status:
 
 ```text
 CLIENT_INIT
@@ -1533,15 +1533,15 @@ CLIENT_CONFIRM
 ESTABLISHED
 ```
 
-ويجب أن تبقى handshake state مستقلة عن game state.
+MUST   handshake state   game state.
 
 ---
 
 # 57. Stateless Validation / Anti-DoS
 
-لا ينبغي إنشاء connection state مكلف فور وصول packet مجهول.
+connection state    packet .
 
-المسار:
+Path:
 
 ```text
 Unknown packet
@@ -1555,15 +1555,15 @@ validated client
 allocate connection state
 ```
 
-مع anti-amplification limit قبل إثبات قابلية الوصول.
+anti-amplification limit    .
 
 ---
 
 # 58. 0-RTT
 
-اختياري ومستقبلي.
+.
 
-لا تستخدمه لأفعال غير idempotent أو حساسة مثل:
+idempotent   :
 
 ```text
 purchase
@@ -1571,17 +1571,17 @@ inventory mutation
 ranked result
 ```
 
-إلا بعد تصميم replay protection على مستوى application semantics.
+replay protection   application semantics.
 
 ---
 
 # 59. NAT Traversal
 
-GTP يجب أن يكون صالحاً عبر NAT.
+GTP MUST   Valid  NAT.
 
-keepalive policy يجب ألا تكون aggressive بلا داعٍ.
+keepalive policy MUST   aggressive  .
 
-يمكن استخدام:
+MAY :
 
 ```text
 PING
@@ -1589,22 +1589,22 @@ PATH_CHALLENGE
 PATH_RESPONSE
 ```
 
-حسب حالة الاتصال.
+Connection.
 
 ---
 
 # 60. NAT Rebinding
 
-عند تغير:
+:
 
 ```text
 client IP
 client port
 ```
 
-لا تُنشأ session جديدة مباشرة.
+session  .
 
-المسار:
+Path:
 
 ```text
 new address
@@ -1622,7 +1622,7 @@ switch active path
 
 # 61. Connection Migration
 
-المفهوم:
+:
 
 ```text
 Path A
@@ -1630,15 +1630,15 @@ Path A
 Path B
 ```
 
-يجب الحفاظ على session/game state متى كان ذلك آمناً.
+MUST   session/game state    .
 
-migration يجب ألا يسمح لـ spoofed packet بفرض مسار جديد؛ التحقق mandatory.
+migration MUST    spoofed packet    Validation mandatory.
 
 ---
 
 # 62. Path State
 
-يجب أن يكون هناك path object منطقي:
+MUST    path object :
 
 ```text
 Path
@@ -1651,23 +1651,23 @@ Path
   last activity
 ```
 
-لكن connection يمكن أن يملك path واحداً active في v1، مع إمكانية إضافة multipath لاحقاً.
+connection MAY   path  active  v1    multipath .
 
 ---
 
 # 63. Versioning
 
-Long header/handshake يجب أن يدعم version negotiation.
+Long header/handshake MUST   version negotiation.
 
-Short packet overhead يجب أن يبقى منخفضاً.
+Short packet overhead MUST   .
 
-يجب أن تكون extensions قابلة للتعرف دون جعل parser هشاً أمام future frames.
+MUST   extensions     parser   future frames.
 
 ---
 
 # 64. Extension Model
 
-يمكن استخدام type/length framing:
+MAY  type/length framing:
 
 ```text
 TYPE
@@ -1691,7 +1691,7 @@ CONNECTION_CLOSE
 
 # 65. Error Codes
 
-تقسيم مقترح:
+:
 
 ```text
 0x0000–0x00FF  transport
@@ -1704,9 +1704,9 @@ CONNECTION_CLOSE
 
 # 66. Application API
 
-Rust API يجب أن تكون semantic وليس packet-centric.
+Rust API MUST   semantic  packet-centric.
 
-مقترح:
+:
 
 ```rust
 send_unreliable(data)
@@ -1715,7 +1715,7 @@ send_reliable_unordered(data)
 send_reliable_ordered(stream_or_group, data)
 ```
 
-والـ state API:
+state API:
 
 ```rust
 send_state(entity_id, generation, sequence, deadline, data)
@@ -1727,16 +1727,16 @@ send_rpc(rpc_id, data)
 
 # 67. Poll / Flush Model
 
-يمكن توفير نموذجين:
+MAY  :
 
 ```rust
 poll()
 flush()
 ```
 
-أو event-driven runtime adapter.
+event-driven runtime adapter.
 
-الـ core لا يجب أن يعرف هل التطبيق يستخدم:
+core  MUST    Application :
 
 ```text
 Tokio
@@ -1749,18 +1749,18 @@ custom event loop
 
 # 68. Tick Integration
 
-الـ transport لا يفرض game tick.
+transport   game tick.
 
-مثال:
+Example:
 
 ```text
 60 Hz simulation
 30–120 Hz network send
 ```
 
-حسب state وnetwork budget.
+state network budget.
 
-API مقترح:
+API :
 
 ```text
 game_tick()
@@ -1768,13 +1768,13 @@ process_network()
 flush()
 ```
 
-لكن يمكن تغيير الترتيب حسب engine.
+MAY    engine.
 
 ---
 
 # 69. Input Pipeline
 
-يفضل أن تدخل player input بسرعة:
+SHOULD   player input :
 
 ```text
 input
@@ -1786,13 +1786,13 @@ queue
 network send budget
 ```
 
-ويمكن إضافة redundant recent inputs ضمن حدود congestion budget.
+MAY  redundant recent inputs   congestion budget.
 
 ---
 
 # 70. Snapshot Pipeline
 
-يفضل:
+SHOULD:
 
 ```text
 world state
@@ -1808,25 +1808,25 @@ deadline
 scheduler
 ```
 
-GTP لا يفرض كيفية توليد delta compression.
+GTP     delta compression.
 
 ---
 
 # 71. Bulk / Cosmetic
 
-يمكن أن تكون هناك queue منخفضة الأولوية:
+MAY    queue  :
 
 ```text
 bulk/cosmetic
 ```
 
-يجب أن تكون أول من يتعرض للتخفيض عند ضغط queue.
+MUST         queue.
 
 ---
 
 # 72. Shared Congestion Controller
 
-كل logical traffic يشترك في:
+logical traffic  :
 
 ```text
 one connection
@@ -1835,13 +1835,13 @@ one congestion controller
 one pacing model
 ```
 
-إذا فُتحت عدة sockets/flows لجلسة واحدة دون حاجة، قد ينكسر fairness؛ لذلك يجب أن يكون aggregate congestion behavior واضحاً.
+sockets/flows       fairness  MUST   aggregate congestion behavior .
 
 ---
 
 # 73. Connection Affinity
 
-يجب أن يحاول الخادم:
+MUST   Server:
 
 ```text
 CID
@@ -1849,9 +1849,9 @@ CID
 worker
 ```
 
-ثم تبقى connection على worker نفسه قدر الإمكان.
+connection  worker   .
 
-يمكن إعادة توزيعها فقط لأسباب تشغيلية مثل:
+MAY      :
 
 - core imbalance.
 - overload.
@@ -1861,7 +1861,7 @@ worker
 
 # 74. Multi-Core Scaling
 
-نموذج:
+:
 
 ```text
 NIC queues
@@ -1873,13 +1873,13 @@ workers
 connection ownership
 ```
 
-التصميم يستهدف scaling قريباً من linear حتى نقطة اختناق أخرى، لكن لا تعتبر linearity نتيجة مضمونة قبل القياس.
+Design  scaling   linear        linearity    .
 
 ---
 
 # 75. Server Fan-Out
 
-في 256-player مثلاً:
+256-player :
 
 ```text
 world state
@@ -1891,13 +1891,13 @@ per-client relevance/delta
 batched packet construction
 ```
 
-ويجب تجنب serialization كامل من الصفر لكل client إذا كان يمكن مشاركة أجزاء قابلة لإعادة الاستخدام.
+MUST  serialization     client   MAY     .
 
 ---
 
 # 76. Packet Batching
 
-TX يجب أن يسمح:
+TX MUST  :
 
 ```text
 multiple logical packets
@@ -1905,7 +1905,7 @@ multiple logical packets
  → one backend operation
 ```
 
-ولكن batching must obey:
+batching must obey:
 
 - pacing.
 - MTU segmentation.
@@ -1916,7 +1916,7 @@ multiple logical packets
 
 # 77. Linux Backend Modes
 
-الطبقات المقترحة:
+:
 
 ```text
 L0  Portable UDP
@@ -1927,15 +1927,15 @@ L4  AF_XDP (future)
 L5  DPDK (future)
 ```
 
-ليست كل التطبيقات تحتاج L5.
+Application  L5.
 
 ---
 
-# 78. لماذا لا نبدأ بـ DPDK
+# 78.     DPDK
 
-لأن kernel/network stack قد لا يكون bottleneck الرئيسي.
+kernel/network stack    bottleneck .
 
-المنهج:
+:
 
 ```text
 correct core
@@ -1955,7 +1955,7 @@ only then consider kernel bypass
 
 # 79. Backend Capability Matrix
 
-كل backend يجب أن يعلن capabilities:
+backend MUST   capabilities:
 
 ```text
 batch_rx
@@ -1970,7 +1970,7 @@ fixed_buffers
 kernel_bypass
 ```
 
-ثم GTP يختار fast path دون تغيير protocol semantics.
+GTP  fast path   protocol semantics.
 
 ---
 
@@ -2010,13 +2010,13 @@ criterion
 perf/flamegraph externally
 ```
 
-يجب ألا تُقفل architecture على dependency واحدة إذا لم تكن ضرورية.
+MUST   architecture  dependency     .
 
 ---
 
 # 81. `zerocopy`
 
-نسخة حديثة من `zerocopy` توفر typed byte conversions وno_std-oriented design وtraits مثل:
+`zerocopy`  typed byte conversions no_std-oriented design traits :
 
 ```text
 TryFromBytes
@@ -2024,13 +2024,13 @@ FromBytes
 IntoBytes
 ```
 
-وهي مناسبة لبناء byte views، لكن كل data القادمة من الشبكة يجب التحقق منها قبل اعتبارها valid protocol structure.
+byte views   data   Network MUST Validation    valid protocol structure.
 
 ---
 
 # 82. `socket2`
 
-يسمح بالوصول إلى socket operations المتقدمة مثل:
+socket operations  :
 
 ```text
 sendmsg
@@ -2038,42 +2038,42 @@ vectored send
 socket options
 ```
 
-مع portability أفضل من استدعاء libc مباشرة في كل المشروع.
+portability    libc    .
 
 ---
 
 # 83. `io-uring`
 
-يجب استغلاله عندما:
+MUST  :
 
-- Linux kernel مناسب.
+- Linux kernel .
 - workload packet-heavy.
-- multishot receive فعلاً يقلل overhead.
-- buffer management تحت السيطرة.
+- multishot receive   overhead.
+- buffer management  .
 
-ويجب fallback gracefully عند غياب kernel features المطلوبة.
+MUST fallback gracefully   kernel features .
 
 ---
 
 # 84. `monoio`
 
-مرشح قوي لنسخة high-performance runtime لأن نموذجه thread-per-core يطابق connection affinity في GTP.
+high-performance runtime   thread-per-core  connection affinity  GTP.
 
-لكن `gtp-core` لا ينبغي أن يعتمد على Monoio مباشرة.
+`gtp-core`      Monoio .
 
 ---
 
 # 85. Tokio Adapter
 
-يجب توفير adapter رسمي لتسهيل integration في engines/services تستخدم Tokio.
+MUST  adapter   integration  engines/services  Tokio.
 
-قد يكون أبطأ من custom runtime في بعض packet-rate workloads؛ يجب قياس ذلك بدلاً من افتراضه.
+custom runtime   packet-rate workloads MUST     .
 
 ---
 
-# 86. `s2n-quic` كمرجع هندسي
+# 86. `s2n-quic`
 
-` s2n-quic` مهم كـ implementation reference لأنه يجمع عدة خصائص نحتاج إلى دراستها:
+` s2n-quic`   implementation reference       :
 
 - CUBIC.
 - pacing.
@@ -2082,28 +2082,28 @@ socket options
 - connection IDs.
 - extensive testing/fuzzing.
 
-لكن GTP لا يعتمد عليه كـ protocol engine.
+GTP     protocol engine.
 
 ---
 
-# 87. `quinn` كمرجع Rust QUIC
+# 87. `quinn`  Rust QUIC
 
-Quinn مرجع مفيد لفهم:
+Quinn   :
 
 - Rust API design.
 - QUIC datagrams.
 - asynchronous integration.
 - stream/datagram separation.
 
-لكن GTP يبقى message-semantics-first.
+GTP  message-semantics-first.
 
 ---
 
 # 88. Security Library Strategy
 
-لا يجب أن يصبح crypto API جزءاً من application semantics.
+MUST   crypto API   application semantics.
 
-يفضل abstraction:
+SHOULD abstraction:
 
 ```rust
 trait PacketProtector {
@@ -2112,45 +2112,45 @@ trait PacketProtector {
 }
 ```
 
-ويمكن تبديل backend وفق target/CPU/security policy.
+MAY  backend  target/CPU/security policy.
 
 ---
 
 # 89. Crypto Batching
 
-عند ارتفاع packet rate يجب دراسة:
+packet rate MUST :
 
 - batching.
 - hardware acceleration.
 - vectorized operations.
 - avoiding repeated key setup.
 
-لكن لا ينبغي التضحية بالـ protocol security من أجل micro-optimization.
+protocol security   micro-optimization.
 
 ---
 
 # 90. API Threading Contracts
 
-الاتجاه الافتراضي:
+Default:
 
 ```text
 one connection → one owner thread
 ```
 
-وعند الحاجة إلى multi-producer:
+multi-producer:
 
 ```text
 MP application queues
 → owner worker
 ```
 
-بدلاً من shared locking على كل message.
+shared locking   message.
 
 ---
 
 # 91. Telemetry
 
-كل connection يوفر counters/timestamps لـ:
+connection  counters/timestamps :
 
 ```text
 RTT
@@ -2173,9 +2173,9 @@ deadline misses
 
 # 92. Gameplay Telemetry
 
-أهم metrics ليست network throughput فقط.
+metrics  network throughput .
 
-يجب قياس:
+MUST :
 
 ```text
 input_to_server_latency
@@ -2188,7 +2188,7 @@ useful_delivery_ratio
 
 ## Useful Delivery Ratio
 
-مؤشر مقترح:
+:
 
 ```text
 useful delivered state
@@ -2196,15 +2196,15 @@ useful delivered state
 all delivered state
 ```
 
-لفهم ما إذا كان transport يستهلك bandwidth في state أصبحت قديمة.
+transport  bandwidth  state  .
 
 ---
 
 # 93. Logging
 
-Production يجب ألا يسجل كل packet.
+Production MUST    packet.
 
-بدلاً من ذلك:
+Instead:
 
 ```text
 sampling
@@ -2212,7 +2212,7 @@ aggregated metrics
 rare error traces
 ```
 
-Debug mode يمكن تفعيل:
+Debug mode MAY :
 
 ```text
 packet trace
@@ -2226,7 +2226,7 @@ path trace
 
 # 94. Error Handling
 
-الأخطاء تنقسم إلى:
+:
 
 ```text
 recoverable packet errors
@@ -2236,17 +2236,17 @@ security errors
 application errors
 ```
 
-packet malformed غالباً لا يستلزم close فوراً إذا كان قد يكون مجرد packet غير موثوق، بينما critical protocol violations قد تفعل close.
+packet malformed    close       packet Unreliable  critical protocol violations   close.
 
 ---
 
 # 95. Duplicate Handling
 
-UDP يسمح بالتكرار والتأخير.
+UDP   Delay.
 
-يجب أن يكون كل unreliable/reliable semantics robust ضد duplicates.
+MUST    unreliable/reliable semantics robust  duplicates.
 
-استخدم:
+:
 
 ```text
 packet number windows
@@ -2254,23 +2254,23 @@ message IDs
 state sequence
 ```
 
-حسب نوع الرسالة.
+.
 
 ---
 
 # 96. Reordering
 
-يجب أن يتحمل GTP reordering الطبيعي.
+MUST   GTP reordering .
 
-لكن reorder threshold يجب أن يكون قابلًا للضبط.
+reorder threshold MUST    .
 
-الهدف هو عدم إعلان packet lost مبكراً جداً في مسارات تعاني reorder.
+packet lost      reorder.
 
 ---
 
 # 97. Wireless Networks
 
-يجب اختبار:
+MUST :
 
 - burst loss.
 - jitter.
@@ -2278,33 +2278,33 @@ state sequence
 - transient outage.
 - path change.
 
-لا ينبغي افتراض أن كل loss congestion، ولا ينبغي أيضاً إخفاء loss عن CC بشكل مفرط.
+loss congestion     loss  CC  .
 
 ---
 
 # 98. Bufferbloat
 
-يجب اعتبار RTT inflation إشارة مهمة.
+MUST  RTT inflation  .
 
-عند:
+:
 
 ```text
 RTT >> min_rtt
 ```
 
-يجب أن يتعامل controller/scheduler مع احتمال queue buildup.
+MUST   controller/scheduler   queue buildup.
 
-Game state stale drop يمكن أن يعمل مع CC لتقليل application-induced queueing.
+Game state stale drop MAY    CC  application-induced queueing.
 
 ---
 
 # 99. Keepalive
 
-لا يجب إرسال keepalive aggressive.
+MUST  keepalive aggressive.
 
-يحدد deployment سياسة حسب NAT/middlebox behavior.
+deployment   NAT/middlebox behavior.
 
-الـ protocol يمكن أن يستخدم PING ضمن حدود معقولة، مع فصل:
+protocol MAY   PING     :
 
 ```text
 liveness probe
@@ -2312,23 +2312,23 @@ NAT maintenance
 path validation
 ```
 
-حتى لا تصبح كلها نفس الآلية.
+.
 
 ---
 
 # 100. Anti-Amplification
 
-قبل path validation يجب أن يطبق server حد amplification.
+path validation MUST   server  amplification.
 
-لا ينشئ server response ضخمة من packet صغيرة مجهولة.
+server response   packet  .
 
-هذه القاعدة مهمة خصوصاً على Internet.
+Rule    Internet.
 
 ---
 
 # 101. Rate Limiting
 
-يجب أن تدعم طبقة endpoint:
+MUST    endpoint:
 
 ```text
 per source IP
@@ -2337,13 +2337,13 @@ per CID
 per connection state
 ```
 
-limits مناسبة لمنع abuse دون ضرب اللاعبين الطبيعيين.
+limits   abuse    .
 
 ---
 
 # 102. Server Architecture
 
-المعمارية المرجعية:
+Architecture :
 
 ```text
                  GAME SERVER
@@ -2429,7 +2429,7 @@ NIC
 
 # 105. Hot Path Rule
 
-كل packet processing يجب أن يسعى إلى:
+packet processing MUST   :
 
 ```text
 no heap allocation
@@ -2440,13 +2440,13 @@ local state access
 batch processing
 ```
 
-لكن يجب ألا تصبح هذه القاعدة سبباً في code معقد غير قابل للاختبار.
+MUST    Rule   code    .
 
 ---
 
 # 106. Unsafe Rust Policy
 
-يجب أن يكون `unsafe` محصوراً في:
+MUST   `unsafe`  :
 
 ```text
 FFI
@@ -2455,23 +2455,23 @@ verified zero-copy primitives
 hardware/kernel integrations
 ```
 
-ويتم عزله في modules صغيرة ذات invariants موثقة.
+modules   invariants .
 
-الـ protocol logic الأساسي يجب أن يكون safe Rust قدر الإمكان.
+protocol logic  MUST   safe Rust  .
 
 ---
 
 # 107. Compile-Time Invariants
 
-Rust يجب أن يستعمل لضمان:
+Rust MUST   :
 
 - packet state transitions.
 - ownership.
 - lifetimes.
 - valid enum states.
-- separation بين validated/unvalidated buffers عندما يمكن.
+- separation  validated/unvalidated buffers  MAY.
 
-مثال مفاهيمي:
+:
 
 ```rust
 UnvalidatedPacket
@@ -2481,13 +2481,13 @@ AuthenticatedPacket
 ParsedPacket
 ```
 
-هذا أفضل من تمرير `Vec<u8>` في كل مكان.
+`Vec<u8>`   .
 
 ---
 
 # 108. Data Structures
 
-يفضل hot-path structures الصغيرة مثل:
+SHOULD hot-path structures  :
 
 ```text
 ring buffers
@@ -2497,15 +2497,15 @@ slabs
 intrusive queues where justified
 ```
 
-ولا تستخدم hash maps في كل عملية packet إذا كان يمكن استخدام indexing/routing table أكثر كفاءة.
+hash maps    packet   MAY  indexing/routing table  .
 
 ---
 
 # 109. Connection Lookup
 
-يجب أن يكون lookup سريعاً.
+MUST   lookup .
 
-الهدف:
+:
 
 ```text
 CID
@@ -2513,9 +2513,9 @@ CID
 worker-local lookup
 ```
 
-بدلاً من global lock.
+global lock.
 
-يمكن أن يكون:
+MAY  :
 
 ```text
 hash table
@@ -2523,13 +2523,13 @@ sharded table
 direct routing encoding
 ```
 
-حسب CID design والعدد المتوقع للاتصالات.
+CID design   .
 
 ---
 
 # 110. Session Table
 
-ينبغي أن تدعم:
+:
 
 ```text
 connection creation
@@ -2539,15 +2539,15 @@ timeout
 migration
 ```
 
-مع garbage collection تدريجي وليس pause كبيراً.
+garbage collection   pause .
 
 ---
 
 # 111. Timer Architecture
 
-لا ينصح بـ timer object مستقل لكل connection إذا كان العدد ضخماً.
+timer object   connection    .
 
-يفضل:
+SHOULD:
 
 ```text
 timing wheel
@@ -2555,7 +2555,7 @@ hierarchical wheel
 bucketed timers
 ```
 
-للأحداث مثل:
+:
 
 - ACK delay.
 - PTO.
@@ -2568,9 +2568,9 @@ bucketed timers
 
 # 112. Deadline Timer
 
-لا يجب أن تعني كل message deadline timer مستقل.
+MUST    message deadline timer .
 
-يفضل queue/bucket approach:
+SHOULD queue/bucket approach:
 
 ```text
 time bucket
@@ -2578,15 +2578,15 @@ time bucket
 messages expiring soon
 ```
 
-وهذا يمنع timer explosion.
+timer explosion.
 
 ---
 
 # 113. Receive Flow Control
 
-GTP لا يحتاج QUIC stream flow control في نفس الصورة، لكن يحتاج حماية RX queue من memory exhaustion.
+GTP   QUIC stream flow control       RX queue  memory exhaustion.
 
-يجب وجود:
+MUST :
 
 ```text
 per-connection RX cap
@@ -2598,14 +2598,14 @@ endpoint cap
 
 # 114. Send Flow Control
 
-هناك مستويان:
+:
 
 ```text
 application backpressure
 transport congestion control
 ```
 
-لا ينبغي الخلط بين:
+:
 
 ```text
 receiver memory pressure
@@ -2616,7 +2616,7 @@ network congestion
 
 # 115. Application Backpressure API
 
-يجب أن يعرف التطبيق عند رفض/تأخير message:
+MUST   Application  / message:
 
 ```text
 accepted
@@ -2625,13 +2625,13 @@ expired
 rejected due to pressure
 ```
 
-هذا مفيد خصوصاً في bulk/cosmetic queues.
+bulk/cosmetic queues.
 
 ---
 
 # 116. Message Admission Control
 
-قبل enqueue:
+enqueue:
 
 ```text
 if expired => reject
@@ -2639,15 +2639,15 @@ if queue over limit and low utility => reject
 if critical => admit subject to hard bounds
 ```
 
-وهذا أفضل من ملء queue ثم إسقاطها لاحقاً.
+queue   .
 
 ---
 
 # 117. Priority Must Not Become Starvation
 
-P0 control لا يعني تجاهل كل شيء إلى الأبد.
+P0 control       .
 
-لذلك scheduler يحتاج:
+scheduler :
 
 ```text
 hard priority
@@ -2659,9 +2659,9 @@ fairness budget
 
 # 118. Reliable Ordered Scoping
 
-لا يُفضل ordered stream واحد عالمي.
+ordered stream  .
 
-بدلاً من ذلك يمكن أن تكون هناك ordered groups مستقلة:
+MAY    ordered groups :
 
 ```text
 Group A
@@ -2669,31 +2669,31 @@ Group B
 Group C
 ```
 
-بحيث لا يمنع فقد event في Group A تقدم Group B.
+event  Group A  Group B.
 
-هذه نقطة جوهرية لتقليل HoL.
+HoL.
 
 ---
 
 # 119. Reliable Unordered Delivery
 
-لا يجب أن تنتظر message 100 من أجل 101.
+MUST   message 100   101.
 
-كل واحدة لها delivery state مستقلة.
+delivery state .
 
-إذا وصلت 101:
+101:
 
 ```text
 deliver 101
 ```
 
-حتى لو كانت 100 مفقودة، ثم تعاد 100 لاحقاً.
+100 Lost   100 .
 
 ---
 
 # 120. Ordered Group State
 
-كل ordered group يحتاج:
+ordered group :
 
 ```text
 next_expected
@@ -2701,21 +2701,21 @@ received out-of-order set
 pending reliable messages
 ```
 
-ويجب وضع cap يمنع attacker من إنشاء huge gap state.
+MUST  cap  attacker   huge gap state.
 
 ---
 
 # 121. Packet Number Spaces
 
-GTP يمكن أن يستخدم packet number space موحداً في v1 لتقليل التعقيد، ما لم تظهر حاجة أمنية/handshake واضحة للفصل.
+GTP MAY   packet number space   v1       /handshake  .
 
-أما loss detection فيتعامل مع handshake/control packets بحذر منفصل عند الحاجة.
+loss detection   handshake/control packets    .
 
 ---
 
 # 122. Control Frames
 
-Control frames يمكن أن تكون:
+Control frames MAY  :
 
 ```text
 ACK
@@ -2727,15 +2727,15 @@ MTU_PROBE
 ACK_FREQUENCY
 ```
 
-ويجب إعطاؤها priority مرتفعاً لكن مع rate limiting.
+MUST  priority    rate limiting.
 
 ---
 
 # 123. MTU Probe
 
-يجب ألا تُعتبر probe packet game data.
+MUST   probe packet game data.
 
-وتحتاج:
+:
 
 ```text
 probe identifier
@@ -2748,15 +2748,15 @@ ack evidence
 
 # 124. ACK-only Packet Policy
 
-لا يجب أن تصبح ACK-only packets نسبة كبيرة من traffic.
+MUST   ACK-only packets    traffic.
 
-يمكن piggyback ACK على outgoing data عندما يكون ذلك ممكناً.
+MAY piggyback ACK  outgoing data    .
 
 ---
 
 # 125. ACK Piggybacking
 
-يفضل:
+SHOULD:
 
 ```text
 outgoing DATA available
@@ -2764,29 +2764,29 @@ outgoing DATA available
 attach ACK
 ```
 
-بدلاً من إرسال ACK منفصل.
+ACK .
 
-لكن لا يجب تأخير ACK بما يضر loss detection/RTT estimation.
+MUST  ACK   loss detection/RTT estimation.
 
 ---
 
 # 126. Packet Coalescing
 
-يمكن وضع frames متعددة في packet واحد:
+MAY  frames   packet :
 
 ```text
 ACK + INPUT + STATE
 ```
 
-بحسب budget.
+budget.
 
-لكن ينبغي تجنب packetization التي تجعل loss في frame واحدة يؤثر على semantics غير مرتبطة بها.
+packetization   loss  frame    semantics Unordered .
 
 ---
 
 # 127. Small Packet Optimization
 
-لـ packets الصغيرة، الهدف تقليل:
+packets   :
 
 - syscall count.
 - allocations.
@@ -2794,85 +2794,85 @@ ACK + INPUT + STATE
 - crypto setup.
 - locks.
 
-هذا أهم من الوصول إلى zero-copy كامل في كل حالة.
+zero-copy    .
 
 ---
 
 # 128. Large Packet Optimization
 
-عند packets الكبيرة/البث batch:
+packets / batch:
 
 - GSO.
 - vectored I/O.
-- zero-copy عند جدواه.
+- zero-copy  .
 - batching.
 
-يمكن أن تكون أكثر فائدة.
+MAY    .
 
 ---
 
 # 129. Zero-Copy Tradeoff
 
-لا يجب افتراض:
+MUST :
 
 ```text
 zero copy == always faster
 ```
 
-للـ small game packets قد تكون تكلفة إدارة pages/buffers أو completion أعلى من تكلفة copy صغير.
+small game packets     pages/buffers  completion    copy .
 
-لذلك يجب تحديد strategy حسب workload measured.
+MUST  strategy  workload measured.
 
 ---
 
 # 130. CPU Cache Strategy
 
-يجب إبقاء hot connection state متجاورة قدر الإمكان.
+MUST  hot connection state   .
 
-لكن تجنب struct عملاق.
+struct .
 
-يفضل:
+SHOULD:
 
 ```text
 small hot struct
 pointers/indexes to cold state
 ```
 
-مع تجنب indirection المفرط أيضاً.
+indirection  .
 
 ---
 
 # 131. False Sharing
 
-يجب تجنب وضع counters التي يتم تعديلها على cores مختلفة في cache line واحدة.
+MUST   counters     cores   cache line .
 
-يمكن استخدام cache-line padding حيث يقاس أنه مفيد.
+MAY  cache-line padding    .
 
 ---
 
 # 132. Atomic Usage
 
-القاعدة:
+Rule:
 
 ```text
 prefer thread-local state
 ```
 
-والـ atomics تستخدم فقط عند الحاجة الفعلية:
+atomics     :
 
 - cross-core metrics.
 - lifecycle flags.
 - shared endpoint counters.
 
-وليس في كل packet.
+packet.
 
 ---
 
 # 133. Scheduler Complexity
 
-لا ينبغي أن يصبح scheduling O(log N) لكل micro event إذا كان ذلك مكلفاً في high packet-rate.
+scheduling O(log N)  micro event      high packet-rate.
 
-يمكن استخدام:
+MAY :
 
 ```text
 bucketed deadlines
@@ -2880,15 +2880,15 @@ priority rings
 small heaps
 ```
 
-حسب workload.
+workload.
 
 ---
 
 # 134. Benchmarking Philosophy
 
-يجب عدم قياس GTP فقط ضد throughput.
+MUST   GTP   throughput.
 
-القياسات الرئيسية:
+:
 
 ```text
 P50 latency
@@ -2910,7 +2910,7 @@ freshness utility
 
 # 135. Packet Size Matrix
 
-يجب اختبار:
+MUST :
 
 ```text
 64 B
@@ -2922,13 +2922,13 @@ freshness utility
 1400 B
 ```
 
-بحسب protocol overhead وMTU.
+protocol overhead MTU.
 
 ---
 
 # 136. Packet Rate Matrix
 
-اختبارات مثل:
+:
 
 ```text
 10 Kpps
@@ -2939,7 +2939,7 @@ freshness utility
 1 Mpps+
 ```
 
-مع اختلاف عدد الاتصالات.
+Connection.
 
 ---
 
@@ -2953,7 +2953,7 @@ freshness utility
 200 ms
 ```
 
-مع jitter.
+jitter.
 
 ---
 
@@ -2968,7 +2968,7 @@ freshness utility
 10%
 ```
 
-مع burst-loss scenario.
+burst-loss scenario.
 
 ---
 
@@ -2981,7 +2981,7 @@ freshness utility
 10%
 ```
 
-ومزيج reorder + loss.
+reorder + loss.
 
 ---
 
@@ -2996,7 +2996,7 @@ freshness utility
 100 Gbps lab
 ```
 
-لكن لا ينبغي اعتبار 100Gbps Internet realistic assumption؛ هو stress test للـ implementation path.
+100Gbps Internet realistic assumption  stress test  implementation path.
 
 ---
 
@@ -3032,7 +3032,7 @@ high concurrency
 
 # 142. Mixed Traffic Benchmark
 
-سيناريو أساسي:
+:
 
 ```text
 70% realtime state
@@ -3041,7 +3041,7 @@ high concurrency
 5% bulk/cosmetic
 ```
 
-ثم يتم تعريضه إلى:
+:
 
 ```text
 1% loss
@@ -3050,13 +3050,13 @@ jitter
 queue pressure
 ```
 
-هذا benchmark أهم من benchmark منفصل لكل class.
+benchmark   benchmark   class.
 
 ---
 
 # 143. Failure Scenarios
 
-يجب اختبار:
+MUST :
 
 ```text
 NAT rebinding
@@ -3076,7 +3076,7 @@ queue overflow
 
 # 144. Soak Tests
 
-يجب وجود tests لساعات/أيام:
+MUST  tests /:
 
 - long-lived connections.
 - memory stability.
@@ -3089,7 +3089,7 @@ queue overflow
 
 # 145. Fuzzing
 
-الهدف:
+:
 
 ```text
 wire parser
@@ -3101,13 +3101,13 @@ state machines
 crypto framing
 ```
 
-يجب ألا يصل malformed packet إلى panic.
+MUST   malformed packet  panic.
 
 ---
 
 # 146. Property Tests
 
-أمثلة:
+:
 
 ```text
 encode(decode(packet)) == canonical packet
@@ -3119,13 +3119,13 @@ expired state is never delivered
 packet duplicate never causes duplicate semantic delivery
 ```
 
-بحسب semantics.
+semantics.
 
 ---
 
 # 147. Model Testing
 
-حالات state machine:
+state machine:
 
 ```text
 Initial
@@ -3137,13 +3137,13 @@ Closing
 Closed
 ```
 
-يجب اختبار transitions غير القانونية.
+MUST  transitions  .
 
 ---
 
 # 148. Correctness Priority
 
-ترتيب التطوير:
+:
 
 ```text
 1 correctness
@@ -3155,28 +3155,28 @@ Closed
 7 DPDK/kernel bypass
 ```
 
-لا يجوز تحسين hot path قبل تثبيت semantics الأساسية.
+MUST NOT  hot path   semantics .
 
 ---
 
 # 149. Reference Implementations
 
-يجب وجود:
+MUST :
 
 ```text
 reference single-thread
 performance Linux
 ```
 
-بنفس protocol core.
+protocol core.
 
-reference implementation تسهل debugging والـ interoperability tests.
+reference implementation  debugging  interoperability tests.
 
 ---
 
 # 150. Versioned Test Vectors
 
-يجب تخزين:
+MUST :
 
 ```text
 handshake vectors
@@ -3187,13 +3187,13 @@ crypto vectors
 migration vectors
 ```
 
-وتشغيلها في CI.
+CI.
 
 ---
 
 # 151. CI Requirements
 
-كل merge مهم يجب أن يجتاز:
+merge  MUST  :
 
 ```text
 unit tests
@@ -3210,7 +3210,7 @@ miri/unsafe validation where appropriate
 
 # 152. Performance Regression Gates
 
-يجب منع regression مثل:
+MUST  regression :
 
 ```text
 +20% cycles/packet
@@ -3218,15 +3218,15 @@ miri/unsafe validation where appropriate
 +15% p99 latency
 ```
 
-لكن thresholds النهائية تحدد بعد baseline أولي.
+thresholds Final   baseline .
 
 ---
 
 # 153. Observability Cost
 
-telemetry نفسها لا يجب أن تضيف overhead كبيراً.
+telemetry   MUST   overhead .
 
-يجب استخدام:
+MUST :
 
 ```text
 sampling
@@ -3234,27 +3234,27 @@ per-core counters
 batched export
 ```
 
-بدلاً من lock عالمي في كل packet.
+lock    packet.
 
 ---
 
 # 154. Metrics Aggregation
 
-كل worker ينتج:
+worker :
 
 ```text
 local metrics
 ```
 
-ثم تجمع دورياً.
+.
 
-هذا يقلل atomic contention.
+atomic contention.
 
 ---
 
 # 155. Runtime Configuration
 
-الأشياء القابلة للضبط:
+:
 
 ```text
 ACK frequency
@@ -3267,13 +3267,13 @@ CC algorithm
 keepalive policy
 ```
 
-لكن يجب ألا تسمح dynamic configuration بتغيير state invariants الخطرة أثناء الاتصال بدون قواعد واضحة.
+MUST   dynamic configuration  state invariants   Connection   .
 
 ---
 
 # 156. Config Profiles
 
-مقترح:
+:
 
 ```text
 GAME_COMPETITIVE
@@ -3282,13 +3282,13 @@ LAN_LOW_LATENCY
 SERVER_HIGH_FANOUT
 ```
 
-كل profile يحدد defaults فقط؛ protocol semantics لا تتغير جذرياً.
+profile  defaults  protocol semantics   .
 
 ---
 
 # 157. Competitive Profile
 
-الأولوية:
+:
 
 ```text
 fresh input/state
@@ -3302,7 +3302,7 @@ strict stale-drop
 
 # 158. High Fan-Out Profile
 
-الأولوية:
+:
 
 ```text
 batching
@@ -3316,7 +3316,7 @@ GSO/GRO
 
 # 159. LAN Profile
 
-قد يسمح:
+:
 
 ```text
 higher MTU
@@ -3324,13 +3324,13 @@ less conservative probing
 optional plain/authenticated benchmark mode
 ```
 
-لكن لا يغيّر wire semantics الأساسية.
+wire semantics .
 
 ---
 
 # 160. Internet Profile
 
-يجب أن يدعم:
+MUST  :
 
 ```text
 AEAD
@@ -3345,9 +3345,9 @@ safe MTU
 
 # 161. Bulk Traffic
 
-في GTP v1 لا نعتمد عليه لنقل bulk ضخمة.
+GTP v1     bulk .
 
-إذا استُخدم:
+:
 
 ```text
 low priority
@@ -3356,15 +3356,15 @@ strict fairness
 reliable
 ```
 
-حتى لا يضرب gameplay traffic.
+gameplay traffic.
 
 ---
 
 # 162. Compression
 
-لا يفرض protocol compression.
+protocol compression.
 
-game/application layer هو الأنسب لـ:
+game/application layer   :
 
 ```text
 delta compression
@@ -3372,45 +3372,45 @@ quantization
 state encoding
 ```
 
-الـ transport يمكنه لاحقاً الإعلان عن compressed payload لكنه لا ينبغي أن يضيف compression تلقائياً لكل packet.
+transport MAY    compressed payload      compression   packet.
 
 ---
 
 # 163. Header Compression
 
-لا توجد حاجة إلى header compression معقدة في v1.
+header compression   v1.
 
-الهدف الأساسي هو short header صغير أصلاً.
+short header  .
 
 ---
 
 # 164. DSCP
 
-يمكن إتاحة DSCP كـ deployment feature، لكن يجب عدم افتراض أن network سيحترمه.
+MAY  DSCP  deployment feature  MUST    network .
 
-ولا يجب استخدامه كبديل للـ congestion control.
+MUST    congestion control.
 
 ---
 
 # 165. ECMP
 
-عند استخدام عدة flows/ports يجب الانتباه إلى إعادة الترتيب.
+flows/ports MUST    .
 
-GTP يفضل اتصالاً واحداً منطقيًا لكل session ما لم توجد حاجة واضحة.
+GTP SHOULD     session     .
 
 ---
 
 # 166. Multiple Sockets
 
-إذا احتاج server sockets متعددة لأسباب scaling، يجب الحفاظ على aggregate congestion semantics لكل connection/network flow model المناسب.
+server sockets   scaling MUST   aggregate congestion semantics  connection/network flow model .
 
-لا يجوز إنشاء عدة uncontrolled flows فقط للحصول على throughput أعلى.
+MUST NOT   uncontrolled flows    throughput .
 
 ---
 
 # 167. Worker Rebalancing
 
-في v1 يمكن إبقاء connection pinned.
+v1 MAY  connection pinned.
 
 Future:
 
@@ -3422,13 +3422,13 @@ controlled migration
 ownership transfer
 ```
 
-مع تجنب نقل hot state المتكرر.
+hot state .
 
 ---
 
 # 168. Memory Limits Under Attack
 
-كل peer غير موثوق يجب أن يكون له bounds على:
+peer Unreliable MUST    bounds :
 
 ```text
 handshake state
@@ -3443,21 +3443,21 @@ fragments
 
 # 169. ACK Range Limits
 
-يجب وضع cap على عدد ranges في ACK.
+MUST  cap   ranges  ACK.
 
-عند تجاوز الحد يمكن:
+Limit MAY:
 
 ```text
 truncate older ranges
 ```
 
-وفق سياسة لا تضر loss detection بشكل غير مقبول.
+loss detection   .
 
 ---
 
 # 170. Reliable Message Size Limits
 
-يجب أن توجد limits:
+MUST   limits:
 
 ```text
 max_message_size
@@ -3465,15 +3465,15 @@ max_fragments
 max_outstanding_bytes
 ```
 
-وتختلف حسب configuration.
+configuration.
 
 ---
 
 # 171. Reassembly Protection
 
-لا يجوز الاحتفاظ برسالة fragmented إلى أجل غير محدود.
+MUST NOT   fragmented    .
 
-كل reassembly له:
+reassembly :
 
 ```text
 deadline
@@ -3485,15 +3485,15 @@ fragment count cap
 
 # 172. Security and Performance Balance
 
-الأمان ليس مرحلة منفصلة عن performance.
+Security     performance.
 
-الهدف:
+:
 
 ```text
 secure fast path
 ```
 
-وليس:
+:
 
 ```text
 security off => performance on
@@ -3503,23 +3503,23 @@ security off => performance on
 
 # 173. Fast Authentication Failure
 
-يجب أن يكون فشل authentication cheap نسبياً بعد minimal filtering.
+MUST    authentication cheap   minimal filtering.
 
-يجب منع attacker من تحويل connection table إلى crypto workload غير محدود.
+MUST  attacker   connection table  crypto workload  .
 
 ---
 
 # 174. Key Rotation
 
-يمكن دعم مفاهيم key phase/rotation مستقبلاً.
+MAY   key phase/rotation .
 
-يجب تصميم packet protection بحيث لا يفترض أن connection key واحدة تبقى للأبد.
+MUST  packet protection     connection key   .
 
 ---
 
 # 175. Replay Protection
 
-يجب أن يملك receiver نافذة packet-number/replay مناسبة، مع مراعاة reordering الطبيعي.
+MUST   receiver  packet-number/replay    reordering .
 
 ---
 
@@ -3531,13 +3531,13 @@ CLOSE
   optional reason
 ```
 
-reason النصي غير ضروري في hot path.
+reason     hot path.
 
 ---
 
 # 177. Graceful Close
 
-يوفر:
+:
 
 ```text
 application close
@@ -3546,13 +3546,13 @@ idle timeout
 security close
 ```
 
-مع حد زمني واضح وعدم الانتظار إلى ما لا نهاية.
+.
 
 ---
 
 # 178. Idle Timeout
 
-لكل connection:
+connection:
 
 ```text
 last_rx
@@ -3560,7 +3560,7 @@ last_tx
 idle_deadline
 ```
 
-وعند expiry:
+expiry:
 
 ```text
 close/reclaim
@@ -3570,62 +3570,62 @@ close/reclaim
 
 # 179. Reconnection
 
-GTP protocol core لا يفرض reconnect semantics، لكن API يجب أن تجعل reconnect سريعاً ولا تخلط session identity الجديدة مع القديمة.
+GTP protocol core   reconnect semantics  API MUST   reconnect    session identity   .
 
 ---
 
 # 180. Game Session vs Network Session
 
-يجب فصل:
+The protocol strictly decouples:
 
 ```text
 Game Session ID
 Network Connection ID
 ```
 
-يمكن أن يستمر game session فوق connection replacement عند design application مناسب، لكن لا يعني ذلك أن transport يحتفظ تلقائياً بحالة اللعبة.
+MAY   game session  connection replacement  design application       transport    .
 
 ---
 
 # 181. Server Restart
 
-v1 transport لا يضمن transparent server restart.
+v1 transport   transparent server restart.
 
-يمكن لاحقاً بناء:
+MAY  :
 
 ```text
 session resumption
 ```
 
-لكنها ليست جزءاً mandatory من transport core.
+mandatory  transport core.
 
 ---
 
 # 182. Reliability Semantics vs Game Authority
 
-GTP لا يقرر صحة game state.
+GTP    game state.
 
-مثلاً reliable event:
+reliable event:
 
 ```text
 DamageEvent
 ```
 
-transport guarantees delivery semantics، not game correctness.
+transport guarantees delivery semantics not game correctness.
 
 ---
 
 # 183. Security Boundary vs Trust Boundary
 
-GTP transport authenticity means packet came from authenticated peer/context. لا يعني أن application payload موثوق منطقياً.
+GTP transport authenticity means packet came from authenticated peer/context.    application payload Reliable .
 
-Game server يجب أن يطبق validation مستقلاً.
+Game server MUST   validation .
 
 ---
 
 # 184. Protocol Invariants
 
-أهم invariants:
+invariants:
 
 ```text
 packet number uniqueness within required space
@@ -3642,104 +3642,104 @@ path switch requires validation
 
 # 185. Packet Number Wrap
 
-يجب أن يحدد wire format حجم packet number بحيث يوفر مجالاً عملياً كافياً، مع سياسة واضحة قبل wrap.
+MUST   wire format  packet number          wrap.
 
-لا يجب أن يصبح wrap event مفاجئاً للـ application.
+MUST   wrap event   application.
 
 ---
 
 # 186. Sequence Number Comparison
 
-state sequence numbers تحتاج comparison modulo-safe إذا استخدمت مساحة محدودة.
+state sequence numbers  comparison modulo-safe    .
 
-كل implementation يجب أن يملك utility موحدة بدلاً من تكرار logic في كل message class.
+implementation MUST   utility     logic   message class.
 
 ---
 
 # 187. Clock Model
 
-الـ transport يحتاج clock monotonic للـ:
+transport  clock monotonic :
 
 - RTT.
 - pacing.
 - deadline.
 - timeout.
 
-ولا يستخدم wall clock في حسابات network timing الحساسة.
+wall clock   network timing .
 
 ---
 
 # 188. Timestamp Width
 
-الـ wire timestamp يجب ألا يكون مرتبطاً مباشرة بـ system wall-clock.
+wire timestamp MUST   Ordered   system wall-clock.
 
-الأفضل استخدام relative/compact timing encoding حيث تكون الدقة والـ wrap واضحة.
+relative/compact timing encoding     wrap .
 
 ---
 
 # 189. Timestamp Usage
 
-لا ينبغي الاعتماد على sender timestamp وحده لقياس RTT؛ يجب أن تستخرج RTT samples من packet/ACK events وفق state المعروفة للطرفين.
+sender timestamp   RTT MUST   RTT samples  packet/ACK events  state  .
 
 ---
 
 # 190. Time Precision
 
-في الـ implementation يجب أن تكون monotonic timestamps عالية الدقة بما يكفي للـ local profiling.
+implementation MUST   monotonic timestamps      local profiling.
 
-لكن لا يجب إرسال nanoseconds كاملة على wire دون فائدة واضحة.
+MUST  nanoseconds   wire   .
 
 ---
 
 # 191. Scheduler Prediction
 
-يمكن للـ scheduler مستقبلاً تقدير:
+MAY  scheduler  :
 
 ```text
 expected_delivery = now + RTT/2 + queue_delay
 ```
 
-ثم مقارنة ذلك بالـ deadline.
+deadline.
 
-إذا لم يعد delivery المتوقع مفيداً، يتم إسقاط الرسالة قبل إرسالها.
+delivery       .
 
-هذه وظيفة Game-aware أساسية.
+Game-aware .
 
 ---
 
 # 192. Deadline Admission
 
-عند enqueue:
+enqueue:
 
 ```text
 if expected transmission + expected path delay > deadline:
     reject/drop if semantics permit
 ```
 
-يجب عدم حساب ذلك بدقة زائفة؛ هو heuristic مبني على estimates.
+MUST       heuristic   estimates.
 
 ---
 
 # 193. Reliable Message Deadline
 
-حتى reliable message يمكن أن تملك deadline.
+reliable message MAY   deadline.
 
-مثال:
+Example:
 
 ```text
 reliable = true
 deadline = now + 500ms
 ```
 
-إذا انتهى deadline قبل delivery، يجوز إسقاط retransmissions بدلاً من إنشاء traffic عبثي.
+deadline  delivery   retransmissions    traffic .
 
 ---
 
 # 194. Ordered Group Expiration
 
-إذا انتهت رسالة ordered predecessor، لا ينبغي أن تتوقف المجموعة إلى الأبد.
+ordered predecessor       .
 
-يحتاج protocol/application إلى policy:
+protocol/application  policy:
 
 ```text
 skip
@@ -3747,7 +3747,7 @@ reset group
 close group
 ```
 
-بحسب semantics.
+semantics.
 
 ---
 
@@ -3759,52 +3759,52 @@ future extension:
 ORDER_RESET(group_id, new_sequence)
 ```
 
-يمكن أن يسمح بإلغاء gap قديم دون إغلاق الاتصال كله.
+MAY    gap    Connection .
 
 ---
 
 # 196. Message Cancellation
 
-يجب توفير API داخلي/تطبيقي:
+MUST  API /:
 
 ```text
 cancel(message_id)
 ```
 
-مفيد إذا تغيرت اللعبة ولم تعد الرسالة مطلوبة قبل إرسالها.
+.
 
 ---
 
 # 197. Retransmission Cancellation
 
-إذا أرسل application state أحدث، قد تلغى retransmission لstate قديمة:
+application state    retransmission state :
 
 ```text
 state generation 55
 replaces generation 54
 ```
 
-فتصبح retransmission للـ54 غير مفيدة ويمكن إلغاؤها.
+retransmission 54   MAY .
 
 ---
 
 # 198. Reliable Event Supersession
 
-ليست كل reliable events قابلة للاستبدال.
+reliable events  .
 
-لذلك يجب أن تحدد application:
+MUST   application:
 
 ```text
 supersedable = yes/no
 ```
 
-حتى لا تسقط event لها semantics لا تسمح بذلك.
+event  semantics   .
 
 ---
 
 # 199. Transport Semantics Contract
 
-كل API send يجب أن توضح:
+API send MUST  :
 
 ```text
 reliability
@@ -3816,13 +3816,13 @@ supersession
 priority
 ```
 
-هذا يقلل سوء استخدام transport من game code.
+transport  game code.
 
 ---
 
 # 200. Final Message API Model
 
-نموذج موحد مفاهيمياً:
+:
 
 ```rust
 MessageOptions {
@@ -3836,15 +3836,15 @@ MessageOptions {
 }
 ```
 
-والـ transport يترجم options إلى queue/recovery policy المناسبة.
+transport  options  queue/recovery policy .
 
 ---
 
 # 201. Data-Oriented Design
 
-لا يجب أن يكون Connection object محور كل العمل بصورة object-heavy.
+MUST   Connection object     object-heavy.
 
-الأفضل تنظيم state حسب الوصول:
+state  :
 
 ```text
 RX hot arrays
@@ -3854,23 +3854,23 @@ scheduler records
 cold metadata
 ```
 
-هذا قد يكون أكثر cache-efficient في server كبير.
+cache-efficient  server .
 
 ---
 
 # 202. Struct of Arrays vs Array of Structs
 
-لا يوجد قرار واحد mandatory.
+mandatory.
 
-يستخدم SoA عندما تتم معالجة نفس الحقل عبر عدد كبير من records، وAoS عندما يتم التعامل مع record كاملة كوحدة.
+SoA          records AoS     record  .
 
-يجب الحسم profiling-driven.
+MUST  profiling-driven.
 
 ---
 
 # 203. Branch Prediction
 
-الـ fast path يجب أن يجعل common cases common:
+fast path MUST   common cases common:
 
 ```text
 valid packet
@@ -3881,13 +3881,13 @@ fresh message
 no loss
 ```
 
-أما malformed/rare path فتعزل قدر الإمكان.
+malformed/rare path   .
 
 ---
 
 # 204. Slow Path Isolation
 
-يجب فصل:
+The protocol strictly decouples:
 
 ```text
 HOT PATH
@@ -3902,15 +3902,15 @@ SLOW PATH
   handshake
 ```
 
-بحيث لا تزيد rare branches من كلفة packet العادي دون سبب.
+rare branches   packet   .
 
 ---
 
 # 205. Parser Fast Path
 
-يمكن اعتماد fixed prefix للـ common packet.
+MAY  fixed prefix  common packet.
 
-إذا لم توجد:
+:
 
 ```text
 ACK
@@ -3918,52 +3918,52 @@ extension
 fragment metadata
 ```
 
-فلا يجب أن يمر packet خلال parser ثقيل بلا داعٍ.
+MUST   packet  parser   .
 
 ---
 
 # 206. Header Variants
 
-يمكن وجود:
+MAY :
 
 ```text
 Short header
 Long header
 ```
 
-مع optional sections.
+optional sections.
 
-لكن يجب ألا تنفجر عدد variants إلى عشرات الحالات؛ كل variant يزيد testing burden.
+MUST    variants     variant  testing burden.
 
 ---
 
 # 207. Varint Policy
 
-استخدم varints فقط حيث توفر savings حقيقية.
+varints    savings .
 
-الأرقام التي تحتاج غالباً إلى fixed width في hot path يمكن أن تبقى fixed width لتبسيط parsing.
+fixed width  hot path MAY   fixed width  parsing.
 
 ---
 
 # 208. ACK Range Encoding
 
-يمكن استخدام compact gap/range representation قريباً من QUIC، لكن دون نسخ كافة semantics غير اللازمة.
+MAY  compact gap/range representation   QUIC     semantics  .
 
-الهدف:
+:
 
 ```text
 small ACK for sparse losses
 ```
 
-مع cap على عدد ranges.
+cap   ranges.
 
 ---
 
 # 209. ACK Compression Defense
 
-لا يجب السماح لpeer بإرسال ACK structures ضخمة بشكل غير محدود.
+MUST  peer  ACK structures    .
 
-receiver يجب أن يطبق:
+receiver MUST  :
 
 ```text
 max_ack_ranges
@@ -3974,15 +3974,15 @@ max_ack_bytes
 
 # 210. ACK Delay Signaling
 
-عند استخدام adaptive ACK frequency يجب أن تكون هناك إشارة واضحة للـ sender عن delay policy.
+adaptive ACK frequency MUST       sender  delay policy.
 
-هذا يساعد RTT estimator على عدم تفسير delayed ACK كـ network latency كاملة.
+RTT estimator    delayed ACK  network latency .
 
 ---
 
 # 211. Immediate ACK Triggers
 
-قد يحدث immediate ACK عند:
+immediate ACK :
 
 ```text
 loss suspicion
@@ -3992,17 +3992,17 @@ path validation
 MTU probe
 ```
 
-لكن يجب ألا تُطلق هذه الحالات بلا limits.
+MUST      limits.
 
 ---
 
 # 212. ACK Frequency Safety
 
-رفع ACK spacing كثيراً قد يؤخر loss detection.
+ACK spacing    loss detection.
 
-خفضها كثيراً يزيد CPU/network overhead.
+CPU/network overhead.
 
-لذلك يجب أن توجد bounds:
+MUST   bounds:
 
 ```text
 min_ack_interval
@@ -4014,42 +4014,42 @@ max_ack_eliciting_packets
 
 # 213. Loss Threshold Tuning
 
-Packet threshold لا يجب أن يكون ثابتاً إلى الأبد.
+Packet threshold  MUST     .
 
-يمكن أن يكون:
+MAY  :
 
 ```text
 base threshold
 plus reordering observation
 ```
 
-ولكن لا بد من منع oscillation أو تأخير detection بشكل مفرط.
+oscillation   detection  .
 
 ---
 
 # 214. Spurious Loss
 
-عندما يصل packet بعد إعلان loss، يجب أن يسجل:
+packet   loss MUST  :
 
 ```text
 spurious_loss
 ```
 
-وتستخدم الإشارة لضبط reordering thresholds عند الإمكان.
+reordering thresholds  .
 
 ---
 
 # 215. RTO/PTO Safety Net
 
-حتى مع ACK-based loss detection يجب وجود timeout safety mechanism.
+ACK-based loss detection MUST  timeout safety mechanism.
 
-لا يجوز انتظار ACK gap إلى الأبد عندما يصبح الطرف غير مستجيب.
+MUST NOT  ACK gap     Peer  .
 
 ---
 
 # 216. Timeout Behavior
 
-عند timeout:
+timeout:
 
 ```text
 probe/limited retransmission
@@ -4057,63 +4057,63 @@ reduce congestion state as configured
 re-arm timer
 ```
 
-ولا يعاد إرسال كل queued realtime state.
+queued realtime state.
 
 ---
 
 # 217. Timeout for Realtime Data
 
-unreliable fresh state ليس targetاً لـ timeout retransmission.
+unreliable fresh state  target  timeout retransmission.
 
-عند timeout:
+timeout:
 
 ```text
 send new state
 ```
 
-إن كانت هناك بيانات أحدث، لا تحاول إنقاذ القديمة.
+.
 
 ---
 
 # 218. Recovery Priority
 
-إذا كان هناك lost reliable message وfresh state:
+lost reliable message fresh state:
 
 ```text
 scheduler evaluates both
 ```
 
-لكن retransmission لا تعطى automatic monopoly.
+retransmission   automatic monopoly.
 
-هذا يمنع reliable backlog من خنق realtime traffic.
+reliable backlog   realtime traffic.
 
 ---
 
 # 219. Recovery Budget
 
-يمكن تحديد:
+MAY :
 
 ```text
 retransmission_budget
 ```
 
-كنسبة/حد من send budget خلال فترة معينة، مع استثناءات للـ control.
+/  send budget       control.
 
-هذا يقلل recovery storms.
+recovery storms.
 
 ---
 
 # 220. Recovery Storm Protection
 
-بعد burst loss:
+burst loss:
 
 ```text
 many lost packets
 ```
 
-لا يجب أن يحاول sender إعادة كل شيء فوراً إذا كانت بعض messages قد أصبحت stale.
+MUST   sender        messages   stale.
 
-يجب ترتيب retransmissions وفق:
+MUST  retransmissions :
 
 ```text
 deadline
@@ -4126,22 +4126,22 @@ age
 
 # 221. Loss Burst Detection
 
-يمكن تسجيل:
+MAY :
 
 ```text
 loss_run_length
 loss_burst_rate
 ```
 
-لكن لا يجب افتراض أن burst loss دائماً congestion.
+MUST   burst loss  congestion.
 
-هذه telemetry تساعد policy، ولا تستبدل CC evidence.
+telemetry  policy   CC evidence.
 
 ---
 
 # 222. Congestion vs Wireless
 
-يمكن للـ CC أن يأخذ في الحسبان:
+MAY  CC    :
 
 ```text
 RTT inflation
@@ -4150,92 +4150,92 @@ delivery rate
 loss pattern
 ```
 
-لكن لا يملك GTP ضماناً لمعرفة سبب loss بدقة على Internet.
+GTP    loss   Internet.
 
-لذلك يجب تجنب heuristics شديدة الثقة.
+MUST  heuristics  .
 
 ---
 
 # 223. BBR-like Controller Boundary
 
-إذا أُنشئ GTP-BBR مستقبلاً، يجب أن يكون module مستقل:
+GTP-BBR  MUST   module :
 
 ```text
 gtp-cc-bbr
 ```
 
-ويرث فقط interface العام.
+interface General.
 
-لا يجب أن تنتشر BBR-specific fields في protocol core.
+MUST   BBR-specific fields  protocol core.
 
 ---
 
 # 224. CUBIC Baseline
 
-CUBIC-compatible behavior يوفر baseline مهم لـ:
+CUBIC-compatible behavior  baseline  :
 
 - fairness.
 - interoperability expectations.
 - regression comparisons.
 
-ولا يعني أنه الأفضل لكل game workload.
+game workload.
 
 ---
 
 # 225. Initial Congestion Window
 
-يجب اختيار initial cwnd بعناية وفق path conditions وUDP guidance وقياس handshake/game startup.
+MUST  initial cwnd   path conditions UDP guidance  handshake/game startup.
 
-لا ينبغي تثبيت رقم نهائي دون benchmark وreference analysis.
+benchmark reference analysis.
 
 ---
 
 # 226. Slow Start
 
-يجب أن يكون موجوداً أو يتم استبداله بمكافئ controller واضح.
+MUST        controller .
 
-الـ startup السريع أكثر من اللازم قد يسبب burst وloss على paths ضعيفة.
+startup       burst loss  paths .
 
 ---
 
 # 227. Pacing During Startup
 
-Pacing يجب أن يعمل أثناء startup عندما يمكن ذلك، وليس فقط بعد congestion steady state.
+Pacing MUST    startup  MAY     congestion steady state.
 
 ---
 
 # 228. Pacing Granularity
 
-إذا كانت timer granularity منخفضة، قد تظهر bursts صناعية.
+timer granularity    bursts .
 
-يجب أن يدعم implementation:
+MUST   implementation:
 
 ```text
 high resolution monotonic clock
 batch deadline scheduling
 ```
 
-مع تكاليف CPU معقولة.
+CPU .
 
 ---
 
 # 229. Busy Polling
 
-Linux deployments قد تدرس busy polling عندما يكون low latency أهم من CPU efficiency، لكن يجب أن يكون feature deployment-specific وليس default.
+Linux deployments   busy polling   low latency   CPU efficiency  MUST   feature deployment-specific  default.
 
 ---
 
 # 230. CPU Pinning
 
-يمكن pin workers إلى CPU cores معينة في high-performance deployment.
+MAY pin workers  CPU cores   high-performance deployment.
 
-لكن protocol لا يجب أن يعتمد على هذا لكي يعمل.
+protocol  MUST      .
 
 ---
 
 # 231. NUMA
 
-على خوادم متعددة NUMA nodes:
+NUMA nodes:
 
 ```text
 NIC queue
@@ -4243,39 +4243,39 @@ NIC queue
 → NUMA-local memory
 ```
 
-يجب تجنب الوصول المتكرر لذاكرة NUMA أخرى.
+MUST     NUMA .
 
 ---
 
 # 232. Memory Locality
 
-Packet/message pools يجب ideally أن تكون NUMA-aware في deployments الكبيرة.
+Packet/message pools MUST ideally   NUMA-aware  deployments .
 
 ---
 
 # 233. NIC RSS
 
-GTP deployment يجب أن يضبط RSS بحيث لا يوزع packets لنفس connection بصورة سيئة.
+GTP deployment MUST   RSS    packets  connection  .
 
-إذا احتاج النظام mapping أدق من RSS، يمكن استخدام software steering بعد receive.
+mapping   RSS MAY  software steering  receive.
 
 ---
 
 # 234. Receive Steering
 
-عندما تصل packets إلى worker غير مالك للـ connection:
+packets  worker    connection:
 
 ```text
 fast handoff
 ```
 
-يجب أن يكون الاستثناء، لا الحالة الافتراضية.
+MUST     State Default.
 
 ---
 
 # 235. Worker Messaging
 
-cross-worker queue يجب أن تكون:
+cross-worker queue MUST  :
 
 ```text
 bounded
@@ -4283,13 +4283,13 @@ batchable
 low contention
 ```
 
-ولا تستخدم synchronous locks على hot path.
+synchronous locks  hot path.
 
 ---
 
 # 236. Endpoint Sharding
 
-يمكن تقسيم endpoint إلى:
+MAY  endpoint :
 
 ```text
 worker 0 socket/context
@@ -4297,29 +4297,29 @@ worker 1 socket/context
 ...
 ```
 
-بحسب backend/platform capabilities.
+backend/platform capabilities.
 
 ---
 
 # 237. UDP Port Strategy
 
-يمكن استخدام port واحد مع connection IDs أو عدة ports في deployments خاصة.
+MAY  port   connection IDs   ports  deployments .
 
-لكن application يجب أن يفهم آثار ECMP وreordering وfirewalls.
+application MUST    ECMP reordering firewalls.
 
 ---
 
 # 238. Stateless Load Balancer Compatibility
 
-وجود CID opaque وطويل مناسب للـ routing/load balancing.
+CID opaque    routing/load balancing.
 
-يمكن أن يكون هناك front-end يختار backend دون إنهاء game session.
+MAY    front-end  backend   game session.
 
 ---
 
 # 239. Server Sharding
 
-النموذج:
+Model:
 
 ```text
 client
@@ -4333,13 +4333,13 @@ worker/shard
 game server
 ```
 
-يجب أن يدعم route stability.
+MUST   route stability.
 
 ---
 
 # 240. Observability at Edge
 
-Edge لا يحتاج إلى decrypt game payload ليقيس:
+Edge    decrypt game payload :
 
 ```text
 packet count
@@ -4349,31 +4349,31 @@ path liveness
 loss/ACK metadata when exposed by architecture
 ```
 
-لكن security/privacy يجب أن تحدد ما يمكن كشفه.
+security/privacy MUST    MAY .
 
 ---
 
 # 241. Protocol Privacy
 
-CID لا يجب أن يكشف معلومات حساسة.
+CID  MUST    .
 
-أي routing token داخلي لا ينبغي أن يكون plaintext قابلًا للتخمين بسهولة إذا كان يمكن أن يساعد abuse.
+routing token      plaintext      MAY   abuse.
 
 ---
 
 # 242. NAT Mapping Preservation
 
-keepalive strategy يجب أن تكون endpoint-specific وقابلة للضبط.
+keepalive strategy MUST   endpoint-specific  .
 
-الاتصال idle لفترات طويلة قد يحتاج PING، بينما active traffic يغني عنه.
+Connection idle     PING  active traffic  .
 
 ---
 
 # 243. Path Challenge Rate Limit
 
-لا يجب إرسال PATH_CHALLENGE بلا حدود استجابة لكل packet غير موثوق.
+MUST  PATH_CHALLENGE     packet Unreliable.
 
-يجب أن يكون challenge:
+MUST   challenge:
 
 ```text
 bounded
@@ -4385,48 +4385,48 @@ rate-limited
 
 # 244. Migration Attack Defense
 
-يجب منع attacker من:
+MUST  attacker :
 
 ```text
 forcing path migration
 ```
 
-بإجبار server على إرسال traffic إلى عنوان مزور.
+server   traffic   .
 
-لذلك لا يصبح new path active قبل validation.
+new path active  validation.
 
 ---
 
 # 245. Stateless Reset / Equivalent
 
-يمكن إضافة آلية مستقبلية لإنهاء connection عندما تكون state غير متاحة، لكن يجب تصميمها بعناية لمنع abuse.
+MAY     connection   state    MUST    abuse.
 
 ---
 
 # 246. Handshake Amplification
 
-الـ server قبل validation يجب أن يحافظ على response budget.
+server  validation MUST    response budget.
 
-قد يستخدم cookie/token لإثبات مصدر قابل للوصول.
+cookie/token    .
 
 ---
 
 # 247. Cookie Design
 
-cookie يجب أن تكون:
+cookie MUST  :
 
-- stateless أو منخفضة state.
-- مرتبطة بعناوين/path وفق policy.
-- قصيرة زمنياً.
-- قابلة للدوران key rotation.
+- stateless   state.
+- Ordered /path  policy.
+-  .
+-   key rotation.
 
-لا ينبغي وضع معلومات حساسة فيها بلا حاجة.
+.
 
 ---
 
 # 248. Connection Admission
 
-قبل allocation كامل:
+allocation :
 
 ```text
 packet sanity
@@ -4442,7 +4442,7 @@ connection allocation
 
 # 249. DoS Resource Model
 
-يجب حساب موارد peer في:
+MUST   peer :
 
 ```text
 CPU
@@ -4452,13 +4452,13 @@ queued packets
 handshake state
 ```
 
-وعدم السماح لمورد واحد مخفي مثل ACK ranges بفرض allocation غير محدود.
+ACK ranges  allocation  .
 
 ---
 
 # 250. Resource Accounting
 
-كل connection يجب أن يملك counters:
+connection MUST   counters:
 
 ```text
 rx_bytes
@@ -4471,13 +4471,13 @@ crypto_failures
 protocol_errors
 ```
 
-لتطبيق quotas.
+quotas.
 
 ---
 
 # 251. Reliability State Limits
 
-هناك limits واضحة على:
+limits  :
 
 ```text
 max unacked messages
@@ -4490,9 +4490,9 @@ max reorder entries
 
 # 252. Retry Policy
 
-لا يجب أن توجد retransmission loop لا نهائية.
+MUST   retransmission loop  .
 
-إذا كانت message ذات lifetime منتهية:
+message  lifetime Expired:
 
 ```text
 stop retry
@@ -4502,9 +4502,9 @@ stop retry
 
 # 253. Application Relevance
 
-أفضل transport decision يعتمد أحياناً على metadata يوفرها game engine.
+transport decision    metadata  game engine.
 
-مثلاً:
+:
 
 ```text
 entity relevance
@@ -4512,73 +4512,73 @@ player visibility
 combat criticality
 ```
 
-GTP يمكن أن يقبل priority/deadline/relevance hints، لكنه لا يحاول فهم game world نفسه.
+GTP MAY   priority/deadline/relevance hints     game world .
 
 ---
 
 # 254. API Ownership
 
-لمنع lifetime bugs:
+lifetime bugs:
 
 ```text
 application owns source until enqueue accepted
 transport owns internal buffer if accepted
 ```
 
-ويجب أن يكون هذا واضحاً في Rust API.
+MUST      Rust API.
 
 ---
 
 # 255. Borrowed vs Owned Send API
 
-يمكن توفير:
+MAY :
 
 ```rust
 send_borrowed(&[u8], options)
 send_owned(Bytes, options)
 ```
 
-مع توضيح متى يتم النسخ ومتى تنتقل ownership.
+ownership.
 
 ---
 
 # 256. Buffer Lifetime
 
-Borrowed zero-copy send يجب ألا يوهم التطبيق بأن transport سيحفظ reference بعد انتهاء call إذا لم يكن ذلك مدعومًا.
+Borrowed zero-copy send MUST   Application  transport  reference   call     .
 
-يمكن أن تكون API asynchronous واضحة في ownership.
+MAY   API asynchronous   ownership.
 
 ---
 
 # 257. Receive API
 
-RX يمكن أن يعيد:
+RX MAY  :
 
 ```text
 BorrowedMessage<'a>
 ```
 
-داخل callback/processing scope، أو:
+callback/processing scope :
 
 ```text
 OwnedMessage
 ```
 
-لمن يحتاج retention.
+retention.
 
 ---
 
 # 258. No Hidden Copy
 
-يجب أن تكون API semantics واضحة بشأن copy count.
+MUST   API semantics   copy count.
 
-لا نريد abstraction يبدو zero-copy لكنه ينسخ packet داخلياً بلا علم المستخدم.
+abstraction  zero-copy   packet    .
 
 ---
 
 # 259. Packet Builder
 
-يجب أن يكون builder قادرًا على:
+MUST   builder  :
 
 ```text
 reserve header
@@ -4589,45 +4589,45 @@ encrypt
 finalize
 ```
 
-مع buffer reuse.
+buffer reuse.
 
 ---
 
 # 260. Deferred Encryption
 
-لا يجب تشفير packet قبل أن يصبح content نهائياً.
+MUST  packet    content .
 
-يمكن تجميع frames ثم seal مرة واحدة.
+MAY  frames  seal  .
 
 ---
 
 # 261. AEAD AAD
 
-header fields التي يجب أن تكون authenticated يجب أن تدخل في AAD وفق تصميم ثابت.
+header fields  MUST   authenticated MUST    AAD   .
 
-أي تعديل بعد seal يجب أن يجعل packet invalid.
+seal MUST   packet invalid.
 
 ---
 
 # 262. Packet Number and Nonce
 
-nonce derivation يجب أن يكون deterministic من connection key/packet number وفق algorithm ثابت يمنع reuse.
+nonce derivation MUST   deterministic  connection key/packet number  algorithm   reuse.
 
 ---
 
 # 263. Key Phase
 
-future versions قد تحتاج key update.
+future versions   key update.
 
-يجب ترك مساحة في flags/header دون توسيع common header بشكل مبالغ فيه.
+MUST    flags/header   common header   .
 
 ---
 
 # 264. Extension Registry
 
-يجب تعريف registry داخلي لأنواع frames والـ transport parameters.
+MUST  registry   frames  transport parameters.
 
-أرقام محجوزة لـ:
+:
 
 ```text
 core
@@ -4639,25 +4639,25 @@ private use
 
 # 265. Experimental Extensions
 
-لا يجوز أن تستخدم experimental feature أرقاماً تتعارض مع future standardized features دون namespace واضح.
+MUST NOT   experimental feature    future standardized features  namespace .
 
 ---
 
 # 266. Wire Compatibility Policy
 
-v1.x يجب أن يحافظ على:
+v1.x MUST   :
 
 ```text
 backward-compatible extensions where practical
 ```
 
-أما تغيير semantics جوهري فيحتاج version جديد.
+semantics   version .
 
 ---
 
 # 267. Feature Negotiation
 
-الـ handshake يمكن أن يتضمن capabilities:
+handshake MAY   capabilities:
 
 ```text
 ACK frequency
@@ -4667,13 +4667,13 @@ FEC
 0-RTT
 ```
 
-لكن capability negotiation لا يعني أن endpoint يملك نفس kernel capabilities؛ تلك local implementation detail.
+capability negotiation    endpoint   kernel capabilities  local implementation detail.
 
 ---
 
 # 268. Local Backend Capability
 
-مثال:
+Example:
 
 ```text
 peer supports GTP v1
@@ -4681,13 +4681,13 @@ local supports GSO
 peer does not need to know GSO
 ```
 
-GSO ليس protocol feature بين peerين.
+GSO  protocol feature  peer.
 
 ---
 
 # 269. Protocol Parameters vs Runtime Parameters
 
-يجب فصل:
+The protocol strictly decouples:
 
 ```text
 wire-negotiated parameters
@@ -4695,15 +4695,15 @@ local-only parameters
 operator configuration
 ```
 
-حتى لا تنتقل تفاصيل Linux إلى protocol.
+Linux  protocol.
 
 ---
 
 # 270. Configuration Safety
 
-configuration invalid combination يجب رفضها قبل بدء endpoint.
+configuration invalid combination MUST    endpoint.
 
-مثلاً:
+:
 
 ```text
 max_message_size < minimum fragment overhead
@@ -4713,7 +4713,7 @@ max_message_size < minimum fragment overhead
 
 # 271. Default Policy
 
-Default production profile يجب أن يكون:
+Default production profile MUST  :
 
 ```text
 secure
@@ -4728,19 +4728,19 @@ freshness-aware
 
 # 272. Secure-by-Default
 
-plain transport لا يكون enabled في public production profile.
+plain transport   enabled  public production profile.
 
 ---
 
 # 273. Performance-by-Default
 
-لكن security default يجب ألا يؤدي إلى architecture تمنع batching أو zero-copy أو hardware acceleration.
+security default MUST    architecture  batching  zero-copy  hardware acceleration.
 
 ---
 
 # 274. Performance Envelope
 
-الهدف design targets، وليس نتائج مثبتة:
+design targets   :
 
 ```text
 steady-state packet allocation: 0
@@ -4749,13 +4749,13 @@ small hot state: cache-friendly
 P99 transport overhead: low single-digit microseconds target in local lab where architecture permits
 ```
 
-القيمة الأخيرة ليست guarantee ويجب إثباتها عبر benchmark.
+guarantee MUST   benchmark.
 
 ---
 
 # 275. Benchmark Baselines
 
-تجب مقارنة:
+:
 
 ```text
 UDP custom baseline
@@ -4773,7 +4773,7 @@ GTP kernel-bypass experimental
 
 # 276. Benchmark Fairness
 
-كل protocol يجب أن يحصل على:
+protocol MUST   :
 
 ```text
 same payloads
@@ -4784,13 +4784,13 @@ same MTU
 same crypto conditions where comparable
 ```
 
-وإلا تصبح المقارنة غير عادلة.
+.
 
 ---
 
 # 277. Crypto Benchmark
 
-يجب توفير:
+MUST :
 
 ```text
 crypto off
@@ -4798,13 +4798,13 @@ crypto on
 crypto batched
 ```
 
-مع عدم استخدام insecure mode كنتيجة production، بل كـ performance reference فقط.
+insecure mode  production   performance reference .
 
 ---
 
 # 278. Scheduler Benchmark
 
-اختبارات:
+:
 
 ```text
 all fresh
@@ -4815,7 +4815,7 @@ deadline collisions
 large reliable backlog
 ```
 
-يجب قياس:
+MUST :
 
 ```text
 CPU
@@ -4827,7 +4827,7 @@ useful delivery
 
 # 279. Loss Recovery Benchmark
 
-قياس:
+:
 
 ```text
 loss declaration delay
@@ -4840,7 +4840,7 @@ stale recovery suppression
 
 # 280. ACK Benchmark
 
-مقارنة:
+:
 
 ```text
 ACK every 1
@@ -4850,7 +4850,7 @@ ACK every 8
 adaptive
 ```
 
-مع:
+:
 
 ```text
 CPU
@@ -4863,7 +4863,7 @@ RTT accuracy
 
 # 281. GSO/GRO Benchmark
 
-مقارنة:
+:
 
 ```text
 single send/recv
@@ -4871,13 +4871,13 @@ batch send/recv
 GSO/GRO
 ```
 
-مع packet sizes مختلفة.
+packet sizes .
 
 ---
 
 # 282. io_uring Benchmark
 
-يجب مقارنة:
+MUST :
 
 ```text
 recvfrom loop
@@ -4886,13 +4886,13 @@ io_uring recv
 io_uring multishot recv
 ```
 
-والنتائج تقاس end-to-end، لا syscall microbenchmark فقط.
+end-to-end  syscall microbenchmark .
 
 ---
 
 # 283. Runtime Benchmark
 
-نقارن:
+:
 
 ```text
 manual poll loop
@@ -4901,15 +4901,15 @@ Monoio
 native io_uring
 ```
 
-بنفس protocol workload.
+protocol workload.
 
 ---
 
 # 284. DPDK Benchmark
 
-DPDK لا يقاس فقط Gbps.
+DPDK    Gbps.
 
-يجب قياس:
+MUST :
 
 ```text
 latency
@@ -4923,13 +4923,13 @@ application integration cost
 
 # 285. Kernel Bypass Decision Rule
 
-لا نعتمد DPDK/AF_XDP إلا إذا أثبت profiling أن:
+DPDK/AF_XDP    profiling :
 
 ```text
 kernel UDP path
 ```
 
-هو bottleneck المسيطر بعد:
+bottleneck  :
 
 ```text
 batching
@@ -4944,7 +4944,7 @@ memory tuning
 
 # 286. Linux Socket Tuning
 
-backend يجب أن يدعم configuration لمقاييس مثل:
+backend MUST   configuration  :
 
 ```text
 SO_RCVBUF
@@ -4954,17 +4954,17 @@ socket reuse policy
 ECN/DSCP options
 ```
 
-لكن القيم يجب أن تكون benchmark-driven.
+MUST   benchmark-driven.
 
 ---
 
 # 287. Buffer Sizing
 
-buffer كبير جداً قد يزيد latency تحت congestion.
+buffer     latency  congestion.
 
-buffer صغير جداً قد يزيد drops.
+buffer     drops.
 
-لذلك tuning يجب أن يراعي:
+tuning MUST  :
 
 ```text
 cwnd
@@ -4977,71 +4977,71 @@ application queue
 
 # 288. BDP Awareness
 
-التخطيط الأساسي:
+:
 
 ```text
 BDP = bandwidth × RTT
 ```
 
-والمخزون الشبكي لا يجب أن يكون أقل كثيراً من المتطلبات اللازمة لمسار عالي BDP عندما تكون throughput مهمة، لكن game state قد يفضل freshness على ملء BDP بالكامل.
+MUST          BDP   throughput   game state  SHOULD freshness   BDP .
 
 ---
 
 # 289. Throughput vs Freshness
 
-GTP لا يحاول دائماً maximize throughput.
+GTP    maximize throughput.
 
-هدفه:
+:
 
 ```text
 maximize useful game information delivered on time
 ```
 
-وهذا معيار مختلف عن bulk transport.
+bulk transport.
 
 ---
 
 # 290. Useful Throughput
 
-نقترح KPI:
+KPI:
 
 ```text
 useful_goodput
 ```
 
-ويحسب فقط bytes التي وصلت ضمن freshness/deadline semantics.
+bytes    freshness/deadline semantics.
 
 ---
 
 # 291. Stale Byte Ratio
 
-مؤشر:
+:
 
 ```text
 stale_bytes_delivered / total_state_bytes_delivered
 ```
 
-هدفه أن يكون منخفضاً.
+.
 
 ---
 
 # 292. Deadline Miss Ratio
 
-مؤشر:
+:
 
 ```text
 deadline_missed / deadline_bound_messages
 ```
 
-ويجب عرضه حسب message class.
+MUST   message class.
 
 ---
 
 # 293. Tail Latency by Class
 
-لا يكفي P99 العام.
+P99 General.
 
-يجب أن نرى:
+MUST  :
 
 ```text
 P99 input
@@ -5054,7 +5054,7 @@ P99 control
 
 # 294. End-to-End Game Latency
 
-يجب الفصل بين:
+MUST  :
 
 ```text
 input capture
@@ -5065,13 +5065,13 @@ network downlink
 client render/input application
 ```
 
-GTP يقيس transport components وليس كامل player-perceived latency وحده.
+GTP  transport components   player-perceived latency .
 
 ---
 
 # 295. Benchmark Reproducibility
 
-كل benchmark يجب تسجيل:
+benchmark MUST :
 
 ```text
 CPU model
@@ -5085,13 +5085,13 @@ packet sizes
 traffic profile
 ```
 
-حتى يمكن إعادة التجربة.
+MAY  .
 
 ---
 
 # 296. Rust Build Profile
 
-Performance build يجب أن يستخدم optimization مناسبة، وأن تقاس النتائج على:
+Performance build MUST   optimization     :
 
 ```text
 release
@@ -5100,21 +5100,21 @@ panic policy
 CPU target features
 ```
 
-لكن لا يجوز استخدام build-specific hacks تمنع deployment compatibility بلا سبب.
+MUST NOT  build-specific hacks  deployment compatibility  .
 
 ---
 
 # 297. CPU Feature Detection
 
-crypto/codec fast paths يمكن أن تعتمد على runtime or compile-time CPU feature detection.
+crypto/codec fast paths MAY    runtime or compile-time CPU feature detection.
 
-core semantics لا تعتمد عليها.
+core semantics   .
 
 ---
 
 # 298. SIMD
 
-يمكن استخدام SIMD في:
+MAY  SIMD :
 
 ```text
 crypto
@@ -5124,21 +5124,21 @@ FEC
 compression
 ```
 
-ولكن فقط إذا كانت gains مثبتة.
+gains .
 
 ---
 
 # 299. Branchless Code
 
-لا يجب تحويل كل logic إلى branchless code بلا قياس.
+MUST   logic  branchless code  .
 
-في Rust، readability + correct branch prediction قد تكون أفضل من clever bit hacks.
+Rust readability + correct branch prediction     clever bit hacks.
 
 ---
 
 # 300. Unsafe Isolation
 
-كل unsafe block يجب أن يكون:
+unsafe block MUST  :
 
 ```text
 small
@@ -5147,21 +5147,21 @@ invariant-documented
 tested
 ```
 
-والـ protocol state machine نفسها safe قدر الإمكان.
+protocol state machine  safe  .
 
 ---
 
 # 301. API Stability
 
-الإصدار الأول يجب أن يحافظ على API واضحة حتى لو تطورت internal implementations.
+MUST    API     internal implementations.
 
-لا تربط public API بالـ kernel-specific types.
+public API  kernel-specific types.
 
 ---
 
 # 302. Crate Layering
 
-المقترح النهائي:
+Final:
 
 ```text
 gtp-wire
@@ -5180,32 +5180,32 @@ gtp-bench
 gtp-fuzz
 ```
 
-يمكن دمج بعض crates أثناء prototype ثم فصلها عندما يستقر التصميم.
+MAY   crates  prototype     Design.
 
 ---
 
 # 303. Dependency Policy
 
-يجب تقليل dependencies في core حتى:
+MUST  dependencies  core :
 
-- يظل audit أسهل.
-- build time منخفض.
-- binary size معقول.
+-  audit .
+- build time .
+- binary size .
 - behavior deterministic.
 
 ---
 
 # 304. Core `no_std` Consideration
 
-يمكن تصميم `gtp-wire` وprimitive types لتكون no_std-compatible حيث يكون ذلك عملياً.
+MAY  `gtp-wire` primitive types  no_std-compatible    .
 
-لكن endpoint/server الكامل يحتاج std/OS.
+endpoint/server   std/OS.
 
 ---
 
 # 305. Error Type Design
 
-Rust errors يجب أن تكون structured:
+Rust errors MUST   structured:
 
 ```rust
 enum TransportError {
@@ -5219,13 +5219,13 @@ enum TransportError {
 }
 ```
 
-مع عدم إنشاء strings allocations على hot path.
+strings allocations  hot path.
 
 ---
 
 # 306. Logging API
 
-يفضل structured events:
+SHOULD structured events:
 
 ```text
 connection_created
@@ -5235,35 +5235,35 @@ message_expired
 connection_closed
 ```
 
-بدون format strings مكلفة في كل packet.
+format strings    packet.
 
 ---
 
 # 307. Metrics API
 
-يمكن استخدام per-worker counters ثم aggregate periodically.
+MAY  per-worker counters  aggregate periodically.
 
-هذا أفضل من global atomic increments في كل packet حيث يكون contention ملموساً.
+global atomic increments   packet   contention .
 
 ---
 
 # 308. Debug Trace
 
-يجب أن يكون trace sampling controlled.
+MUST   trace sampling controlled.
 
-مثلاً:
+:
 
 ```text
 1/1000 packets
 ```
 
-أو trace per connection/episode.
+trace per connection/episode.
 
 ---
 
 # 309. Production Safety
 
-debug features يجب ألا تكون accidentally enabled في production.
+debug features MUST   accidentally enabled  production.
 
 ---
 
@@ -5277,13 +5277,13 @@ Production
 Benchmark
 ```
 
-ولكل profile defaults مناسبة.
+profile defaults .
 
 ---
 
 # 311. Network Emulator
 
-يجب بناء harness يعتمد على Linux `tc/netem` لتوليد:
+MUST  harness   Linux `tc/netem` :
 
 ```text
 delay
@@ -5294,13 +5294,13 @@ duplicate
 rate limit
 ```
 
-وهذا يتماشى مع test methodology الأصلية للورقة.
+test methodology  .
 
 ---
 
 # 312. Network Topology Tests
 
-اختبارات:
+:
 
 ```text
 client ↔ server
@@ -5315,15 +5315,15 @@ cross region
 
 # 313. Cross-Region
 
-RTT 100–250 ms يجب أن يبقى supported، لكن message deadline policies يجب أن تتكيف بدلاً من محاولة ضمان نفس behavior كـ1ms LAN.
+RTT 100–250 ms MUST   supported  message deadline policies MUST        behavior 1ms LAN.
 
 ---
 
 # 314. High RTT Reliability
 
-عند RTT مرتفع، retransmission قد تكون غالية.
+RTT  retransmission   .
 
-لهذا:
+:
 
 ```text
 freshness
@@ -5331,27 +5331,27 @@ redundancy
 selective retransmission
 ```
 
-قد تكون أكثر فعالية من aggressive retry.
+aggressive retry.
 
 ---
 
 # 315. High Loss Policy
 
-عند loss ~5–10%، يجب عدم الحفاظ على نفس realtime send rate بشكل أعمى.
+loss ~5–10% MUST     realtime send rate  .
 
-CC يحدد network budget، بينما scheduler يحذف stale traffic.
+CC  network budget  scheduler  stale traffic.
 
 ---
 
 # 316. Burst Loss Policy
 
-يمكن استخدام redundancy مؤقتة أو إرسال latest state only، لكن تحت congestion budget.
+MAY  redundancy    latest state only   congestion budget.
 
 ---
 
 # 317. Mobile Transition
 
-عند تبدل الشبكة:
+Network:
 
 ```text
 old path
@@ -5363,13 +5363,13 @@ validate
 new active path
 ```
 
-ثم يعاد ضبط بعض path-specific estimators حسب policy.
+path-specific estimators  policy.
 
 ---
 
 # 318. Wi-Fi Roaming
 
-قد يحدث:
+:
 
 ```text
 same device
@@ -5377,74 +5377,74 @@ new AP
 new NAT/path
 ```
 
-يجب ألا يعني ذلك game reconnect فوراً إذا نجحت path validation.
+MUST    game reconnect    path validation.
 
 ---
 
 # 319. NAT Timeout
 
-لا توجد قيمة عالمية مضمونة لكل middleboxes؛ keepalive interval configurable.
+middleboxes keepalive interval configurable.
 
-لا تجعل protocol يرسل heartbeat كثيفاً افتراضياً فقط لأن بعض NATs قصيرة العمر.
+protocol  heartbeat      NATs  .
 
 ---
 
 # 320. Path Idle
 
-في connection active لا حاجة لـ PING إضافي إذا كانت data traffic كافية للحفاظ على path/liveness.
+connection active    PING    data traffic    path/liveness.
 
 ---
 
 # 321. Control Traffic Priority
 
-Control frames يجب أن تكون high priority ولكن bounded، لأن attacker قد يحاول خلق control amplification.
+Control frames MUST   high priority  bounded  attacker    control amplification.
 
 ---
 
 # 322. Ping Suppression
 
-إذا كان outgoing traffic موجوداً بالفعل، يمكن piggyback keepalive/liveness evidence بدلاً من packet إضافي.
+outgoing traffic   MAY piggyback keepalive/liveness evidence   packet .
 
 ---
 
 # 323. Application Heartbeat
 
-لا يخلط بين:
+:
 
 ```text
 transport liveness
 application heartbeat
 ```
 
-كلاهما قد يحتاج فترات مختلفة.
+.
 
 ---
 
 # 324. Session Ownership
 
-Connection ID identifies transport connection، وليس ملكية اللعبة أو الحساب.
+Connection ID identifies transport connection     .
 
-game layer يحتفظ بهوية اللاعب.
+game layer   .
 
 ---
 
 # 325. Authentication Identity
 
-قد يرتبط handshake بهوية application，但 transport يجب أن يظل modularاً.
+handshake  application，但 transport MUST   modular.
 
 ---
 
 # 326. Network Owner / Game Server
 
-في deployments الخاصة يمكن أن يكون server هو root of trust للاتصال.
+deployments Special MAY   server  root of trust .
 
-لكن GTP نفسه لا يفرض membership model؛ هذا يقع في handshake/application authorization.
+GTP    membership model    handshake/application authorization.
 
 ---
 
 # 327. Authorization
 
-بعد authentication يمكن application أن يحدد:
+authentication MAY application  :
 
 ```text
 allowed player
@@ -5452,13 +5452,13 @@ allowed game room
 allowed shard
 ```
 
-transport لا يحول ذلك إلى packet routing semantics.
+transport     packet routing semantics.
 
 ---
 
 # 328. Session Admission
 
-يمكن للخادم ألا يقبل game connection إلا بعد:
+MAY    game connection  :
 
 ```text
 stateless validation
@@ -5466,15 +5466,15 @@ crypto establishment
 application authorization
 ```
 
-حسب deployment.
+deployment.
 
 ---
 
 # 329. Abuse vs Congestion
 
-لا يجب استخدام congestion controller كـ abuse limiter الوحيد.
+MUST  congestion controller  abuse limiter .
 
-DoS protection يحتاج:
+DoS protection :
 
 ```text
 rate limit
@@ -5487,7 +5487,7 @@ crypto budgets
 
 # 330. Protocol State Machine
 
-حالات مقترحة:
+:
 
 ```text
 INITIAL
@@ -5498,25 +5498,25 @@ DRAINING
 CLOSED
 ```
 
-Migration state يمكن أن يكون sub-state بدلاً من حالة عليا مستقلة.
+Migration state MAY   sub-state     .
 
 ---
 
 # 331. Handshake Failure
 
-عند فشل crypto/protocol negotiation يجب إنهاء handshake state فقط، وعدم ترك memory allocations معلقة.
+crypto/protocol negotiation MUST  handshake state    memory allocations .
 
 ---
 
 # 332. Close Draining
 
-بعد close قد يحتفظ endpoint بقدر صغير من state لمنع retry/stale packets من إعادة إنعاش session القديمة.
+close   endpoint    state  retry/stale packets    session .
 
 ---
 
 # 333. CID Retirement
 
-يجب أن يكون هناك lifecycle واضح للـ CID:
+MUST    lifecycle   CID:
 
 ```text
 allocated
@@ -5529,58 +5529,58 @@ retired
 
 # 334. CID Collision
 
-يجب أن يكون احتمال collision غير عملي مع random opaque IDs، ويجب أن يكون هناك server-side defense.
+MUST    collision    random opaque IDs MUST    server-side defense.
 
 ---
 
 # 335. Stateless Lookup
 
-في server front-end يمكن أن يكون CID كافياً لتحديد shard/worker routing، لكن لا يجب أن يكشف mapping بصورة مباشرة للمهاجم.
+server front-end MAY   CID   shard/worker routing   MUST   mapping   .
 
 ---
 
 # 336. Load Balancer
 
-يمكن أن يستخدم load balancer نسخة من CID/cryptographic routing token دون فهم game payload.
+MAY   load balancer   CID/cryptographic routing token   game payload.
 
 ---
 
 # 337. Connection Migration Through LB
 
-عند migration، load balancer يجب أن يوجه CID إلى نفس session owner، إلا إذا حدث explicit rebalance.
+migration load balancer MUST   CID   session owner    explicit rebalance.
 
 ---
 
 # 338. Failure Recovery
 
-إذا مات worker، connection state قد تضيع في v1.
+worker connection state    v1.
 
-future design قد تستخدم session replication لكن ذلك ليس هدف low-latency core.
+future design   session replication     low-latency core.
 
 ---
 
 # 339. State Replication Cost
 
-لا ينبغي نسخ hot connection state بين cores لمجرد high availability؛ التكلفة قد تكون أعلى من فائدتها.
+hot connection state  cores  high availability      .
 
 ---
 
 # 340. Game-Level Recovery
 
-عند server failure:
+server failure:
 
 ```text
 new transport connection
 → game session resume
 ```
 
-إذا احتاج application ذلك، وليس شرطاً أن يحتفظ GTP بالـ game state.
+application      GTP  game state.
 
 ---
 
 # 341. Protocol Layer Boundaries
 
-الحدود الرسمية:
+Limit :
 
 ```text
 Game API
@@ -5600,7 +5600,7 @@ I/O
 
 # 342. Security != IO
 
-crypto لا يعرف هل backend يستخدم:
+crypto    backend :
 
 ```text
 UDP socket
@@ -5612,7 +5612,7 @@ DPDK
 
 # 343. Protocol Core != Runtime
 
-core timing/state machine لا يعتمد على:
+core timing/state machine   :
 
 ```text
 Tokio task
@@ -5624,7 +5624,7 @@ io_uring CQE
 
 # 344. Runtime Adapter Responsibilities
 
-runtime adapter يدير:
+runtime adapter :
 
 - readiness.
 - event polling.
@@ -5632,13 +5632,13 @@ runtime adapter يدير:
 - buffer lifetime.
 - wakeups.
 
-ولا يدير game semantics.
+game semantics.
 
 ---
 
 # 345. I/O Backend Responsibilities
 
-backend يملك:
+backend :
 
 ```text
 socket creation
@@ -5648,7 +5648,7 @@ gso/gro
 os options
 ```
 
-وليس:
+:
 
 ```text
 cwnd
@@ -5660,7 +5660,7 @@ ordered delivery
 
 # 346. Protocol Engine Responsibilities
 
-engine يملك:
+engine :
 
 ```text
 packet parsing
@@ -5677,7 +5677,7 @@ message semantics
 
 # 347. Game Engine Responsibilities
 
-game layer يملك:
+game layer :
 
 ```text
 world simulation
@@ -5692,15 +5692,15 @@ authority
 
 # 348. Serialization Boundary
 
-GTP لا يفرض protobuf/serde/custom serializer.
+GTP   protobuf/serde/custom serializer.
 
-يستقبل byte payloads أو zero-copy application frames.
+byte payloads  zero-copy application frames.
 
 ---
 
 # 349. Delta Compression Boundary
 
-game layer هو المسؤول عن تحديد:
+game layer    :
 
 ```text
 full snapshot
@@ -5709,60 +5709,60 @@ quantized state
 compressed state
 ```
 
-transport فقط ينقلها بالدلالة المناسبة.
+transport    .
 
 ---
 
 # 350. Interest Management
 
-game server قد يقرر أن client A لا يحتاج entity B.
+game server    client A   entity B.
 
-GTP لا يجب أن يعرف هذه القاعدة، لكنه يجب أن يوفر priority/deadline hooks ليستفيد منها.
+GTP  MUST    Rule  MUST   priority/deadline hooks  .
 
 ---
 
 # 351. Entity State Keys
 
-يمكن أن يكون:
+MAY  :
 
 ```text
 state_key = entity_id + state_type
 ```
 
-مثلاً:
+:
 
 ```text
 entity 183 / transform
 entity 183 / aim
 ```
 
-حتى يمكن تحديث كل واحدة مستقلاً.
+MAY    .
 
 ---
 
 # 352. Snapshot Generation
 
-كل game tick يمكن أن يولد:
+game tick MAY  :
 
 ```text
 generation N
 ```
 
-والـ transport يستعملها لإدارة supersession.
+transport   supersession.
 
 ---
 
 # 353. Cross-Tick State
 
-لا يجوز أن يحتفظ transport تلقائياً بكل snapshot للأبد.
+MUST NOT   transport   snapshot .
 
-Game layer يحدد ما إذا كانت redundancy/recovery مطلوبة.
+Game layer     redundancy/recovery .
 
 ---
 
 # 354. State Coalescing
 
-إذا queued:
+queued:
 
 ```text
 position 100
@@ -5770,33 +5770,33 @@ position 101
 position 102
 ```
 
-يمكن coalesce إلى:
+MAY coalesce :
 
 ```text
 position 102
 ```
 
-إذا كان state key وsemantics تسمح.
+state key semantics .
 
-هذه optimization مهمة جداً.
+optimization  .
 
 ---
 
 # 355. Event Coalescing
 
-بعض الأحداث يمكن دمجها:
+MAY :
 
 ```text
 multiple cosmetic updates
 ```
 
-لكن events ذات semantics مستقلة لا يجوز دمجها تلقائياً.
+events  semantics  MUST NOT  .
 
 ---
 
 # 356. Transport-side Coalescing Rules
 
-يجب أن تكون explicit عبر message metadata:
+MUST   explicit  message metadata:
 
 ```text
 coalescible
@@ -5808,11 +5808,11 @@ ordered
 
 # 357. Packetization Policy
 
-لا يجب أن يحمل packet خليطاً يجعل أي failure يعطل unrelated recovery state.
+MUST   packet    failure  unrelated recovery state.
 
-ومع ذلك يمكن batching multiple independent frames لتقليل overhead.
+MAY batching multiple independent frames  overhead.
 
-الحل هو:
+:
 
 ```text
 shared packet
@@ -5823,96 +5823,96 @@ independent frame state
 
 # 358. Frame-level Recovery
 
-كل reliable frame يجب أن يكون recoverable بشكل مستقل حتى لو شارك packet مع غيره.
+reliable frame MUST   recoverable      packet  .
 
 ---
 
 # 359. ACK Frame Semantics
 
-ACK يقر packet reception، وليس semantic message delivery بالضرورة.
+ACK  packet reception  semantic message delivery .
 
-قد يحتاج sender إلى message-level confirmation فقط في حالات خاصة، ولا يجب افتراض ذلك لكل message.
+sender  message-level confirmation      MUST    message.
 
 ---
 
 # 360. Delivery Confirmation
 
-إذا كان application يحتاج proof أن event processed، فهذا application ACK منفصل عن transport ACK.
+application  proof  event processed  application ACK   transport ACK.
 
 ---
 
 # 361. Application ACK
 
-مثال:
+Example:
 
 ```text
 transaction_id
 processed=true
 ```
 
-لا ينبغي الخلط بينه وبين packet ACK.
+packet ACK.
 
 ---
 
 # 362. Idempotency
 
-reliable event handlers في game/application ينبغي أن تكون idempotent قدر الإمكان لأن transport recovery قد يواجه duplicates قبل suppression النهائي في حالات edge.
+reliable event handlers  game/application    idempotent    transport recovery   duplicates  suppression Final   edge.
 
 ---
 
 # 363. Duplicate Suppression Window
 
-يجب أن توجد window كافية لاكتشاف duplicate packets القديمة ضمن limits memory.
+MUST   window   duplicate packets   limits memory.
 
 ---
 
 # 364. Stale Duplicate
 
-حتى لو duplicate اجتازت packet-level window، message semantics مثل sequence/generation يمكنها إسقاطها.
+duplicate  packet-level window message semantics  sequence/generation MAY .
 
 ---
 
 # 365. Security Replay
 
-الـ replay protection يجب أن تكون مستقلة عن application duplicate handling.
+replay protection MUST     application duplicate handling.
 
 ---
 
 # 366. Control Replay
 
-PATH_RESPONSE وclose/control frames تحتاج validation مناسب حتى لا يمكن packet قديم تغيير state الحالي.
+PATH_RESPONSE close/control frames  validation    MAY packet   state .
 
 ---
 
 # 367. Close Replay
 
-يجب ألا يؤدي close packet قديم إلى إغلاق connection جديدة بسبب CID reuse.
+MUST   close packet    connection   CID reuse.
 
-CID lifecycle يجب أن يمنع ذلك.
+CID lifecycle MUST   .
 
 ---
 
 # 368. Version Negotiation Security
 
-version negotiation يجب أن تكون مقاومة بقدر معقول لمحاولات downgrade/spoofing، مع binding إلى handshake transcript حيث يلزم.
+version negotiation MUST       downgrade/spoofing  binding  handshake transcript  .
 
 ---
 
 # 369. Handshake Cryptography
 
-التفاصيل النهائية للـ cryptographic handshake يجب أن تكون formalized لاحقاً كجزء من security specification مستقل.
+Final  cryptographic handshake MUST   formalized    security specification .
 
 ---
 
 # 370. Security Specification Separation
 
-هذه الورقة تعرف boundary فقط؛ لا تعتبر بديلاً عن cryptographic protocol review.
+boundary      cryptographic protocol review.
 
 ---
 
 # 371. Formal Verification Candidates
 
-الأجزاء المرشحة:
+:
 
 ```text
 sequence comparison
@@ -5923,13 +5923,13 @@ reassembly
 path validation state
 ```
 
-يمكن لاحقاً استخدام model checking أو property-based testing.
+MAY   model checking  property-based testing.
 
 ---
 
 # 372. Parser Fuzzing Targets
 
-خصوصاً:
+:
 
 ```text
 varint
@@ -5944,7 +5944,7 @@ header flags
 
 # 373. Memory Safety Targets
 
-Rust يقلل أخطاء memory safety، لكن يجب اختبار:
+Rust   memory safety  MUST :
 
 ```text
 buffer lifetime
@@ -5957,27 +5957,27 @@ DMA/buffer ownership
 
 # 374. Async Cancellation
 
-يجب أن تكون cancelation semantics واضحة عند shutdown أو worker migration.
+MUST   cancelation semantics   shutdown  worker migration.
 
-لا يجوز أن يبقى borrowed buffer بعد إلغاء operation.
+MUST NOT   borrowed buffer   operation.
 
 ---
 
 # 375. Completion Ownership
 
-في io_uring يجب أن يحدد كل operation owner للbuffer حتى completion.
+io_uring MUST    operation owner buffer  completion.
 
 ---
 
 # 376. Fixed Buffers
 
-يمكن استخدام registered/provided buffers عندما تقدم benefit مثبتة، لكن يجب ألا تعقد memory management بلا داعٍ.
+MAY  registered/provided buffers   benefit   MUST   memory management  .
 
 ---
 
 # 377. Buffer Pools
 
-يجب أن تكون pools:
+MUST   pools:
 
 ```text
 bounded
@@ -5990,7 +5990,7 @@ NUMA-aware when useful
 
 # 378. Pool Exhaustion
 
-عند exhaustion:
+exhaustion:
 
 ```text
 drop low-value incoming state
@@ -5998,13 +5998,13 @@ apply backpressure
 preserve control
 ```
 
-ولا يجب panic.
+MUST panic.
 
 ---
 
 # 379. Backpressure Signaling
 
-Game API يمكن أن تتلقى:
+Game API MAY  :
 
 ```text
 QueueFull
@@ -6012,15 +6012,15 @@ Expired
 ResourceLimited
 ```
 
-بدلاً من silently accepting message لا يمكن تنفيذها.
+silently accepting message  MAY .
 
 ---
 
 # 380. Reliability and Queue Limits
 
-إذا امتلأت reliable queue، لا ينبغي أن تسقط reliability silently.
+reliable queue     reliability silently.
 
-إما:
+:
 
 ```text
 reject send
@@ -6028,27 +6028,27 @@ block asynchronously by policy
 or fail connection/application operation
 ```
 
-حسب API.
+API.
 
 ---
 
 # 381. Realtime Queue Limits
 
-realtime يمكن إسقاط stale entries، ولذلك يملك degradation graceful أفضل من reliable queues.
+realtime MAY  stale entries   degradation graceful   reliable queues.
 
 ---
 
 # 382. Bulk Queue Limits
 
-bulk يجب أن يكون bounded بشدة، لأنه أقل أولوية.
+bulk MUST   bounded    .
 
 ---
 
 # 383. Memory DoS Through Fragmentation
 
-attacker يمكن أن يبدأ fragmented message ثم يرسل أجزاء قليلة فقط.
+attacker MAY   fragmented message     .
 
-الحماية:
+Protection:
 
 ```text
 reassembly timeout
@@ -6060,9 +6060,9 @@ bytes cap
 
 # 384. Memory DoS Through Ordering Gaps
 
-ordered reliable messages يمكن أن تسبب huge pending gaps.
+ordered reliable messages MAY   huge pending gaps.
 
-الحماية:
+Protection:
 
 ```text
 max gap size
@@ -6073,9 +6073,9 @@ max buffered ordered bytes
 
 # 385. ACK CPU DoS
 
-peer قد يرسل ACKs كثيرة أو ranges معقدة.
+peer   ACKs   ranges .
 
-الحماية:
+Protection:
 
 ```text
 parse budget
@@ -6087,19 +6087,19 @@ rate limit
 
 # 386. Crypto CPU DoS
 
-الـ server يجب أن يطبق admission قبل crypto expensive processing عندما يمكن ذلك.
+server MUST   admission  crypto expensive processing  MAY .
 
 ---
 
 # 387. Scheduler CPU DoS
 
-لا تسمح peer message metadata بخلق ملايين queue entries بلا حدود.
+peer message metadata   queue entries  .
 
 ---
 
 # 388. Message Metadata Limits
 
-كل peer له limits على:
+peer  limits :
 
 ```text
 pending messages
@@ -6118,39 +6118,39 @@ control frames rate-limited per connection and source.
 
 # 390. Endpoint Isolation
 
-endpoint-level resource exhaustion يجب ألا يقتل جميع connections بسبب peer واحد.
+endpoint-level resource exhaustion MUST    connections  peer .
 
 ---
 
 # 391. Failure Domains
 
-يفضل أن يكون:
+SHOULD  :
 
 ```text
 worker crash
 ```
 
-معزولاً عن workers أخرى إن أمكن، خصوصاً في multi-process deployment.
+workers      multi-process deployment.
 
 ---
 
 # 392. Process vs Thread
 
-GTP يعمل جيداً داخل process متعدد threads، لكن يمكن تشغيل workers في processes منفصلة إذا كان isolation مطلوباً.
+GTP    process  threads  MAY  workers  processes    isolation .
 
 ---
 
 # 393. Shared Memory
 
-لا تحتاج v1 إلى shared-memory data plane بين processes.
+v1  shared-memory data plane  processes.
 
-يمكن استخدام socket/IPC control plane عند الحاجة.
+MAY  socket/IPC control plane  .
 
 ---
 
 # 394. NIC Queue to Worker Mapping
 
-يجب توثيق deployment guidance لضمان affinity ثابت.
+MUST  deployment guidance  affinity .
 
 ---
 
@@ -6168,7 +6168,7 @@ worker
 game process
 ```
 
-أو:
+:
 
 ```text
 load balancer
@@ -6180,21 +6180,21 @@ server shard
 
 # 396. Geographic Routing
 
-game matchmaking يقرر region؛ GTP لا يقرر region.
+game matchmaking  region GTP   region.
 
 ---
 
 # 397. Session Migration Across Servers
 
-ليس mandatory v1.
+mandatory v1.
 
-يمكن لاحقاً اعتماد application session handoff.
+MAY   application session handoff.
 
 ---
 
 # 398. Benchmark Target Matrix Summary
 
-| البعد | القيم الأساسية |
+|  |   |
 |---|---|
 | RTT | 5/20/50/100/200 ms |
 | Loss | 0/0.1/1/2/5/10% |
@@ -6211,7 +6211,7 @@ game matchmaking يقرر region؛ GTP لا يقرر region.
 
 # 399. Baseline Acceptance Criteria
 
-لا تعتبر implementation candidate مرشحاً لـ v1 إذا فشل في:
+implementation candidate   v1   :
 
 ```text
 correctness
@@ -6221,13 +6221,13 @@ resource bounds
 security baseline
 ```
 
-حتى لو كان أسرع في microbenchmark.
+microbenchmark.
 
 ---
 
 # 400. Performance Acceptance Criteria
 
-بعد prototype، يجب تحديد targets كمية لـ:
+prototype MUST  targets  :
 
 ```text
 P99 latency
@@ -6239,13 +6239,13 @@ packets/sec/core
 stale delivery ratio
 ```
 
-الأرقام في النسخة الحالية design targets وليست نتائج مثبتة.
+design targets   .
 
 ---
 
 # 401. Initial Suggested Targets
 
-للتخطيط فقط:
+:
 
 ```text
 0 heap allocations / packet in steady state
@@ -6254,13 +6254,13 @@ stale delivery ratio
 P99 local transport processing in low-single-digit microseconds as a stretch target
 ```
 
-يجب عدم تحويلها إلى promises تسويقية.
+MUST    promises .
 
 ---
 
 # 402. Important Benchmark Rule
 
-قارن latency end-to-end وليس فقط function-level:
+latency end-to-end   function-level:
 
 ```text
 application
@@ -6275,7 +6275,7 @@ application
 
 # 403. Instrumentation Points
 
-ضع timestamps في:
+timestamps :
 
 ```text
 app enqueue
@@ -6288,13 +6288,13 @@ peer receive
 message dispatch
 ```
 
-حتى نعرف أين تضيع microseconds.
+microseconds.
 
 ---
 
 # 404. Latency Budget
 
-يمكن في server LAN وضع budget تقريبي للتحليل:
+MAY  server LAN  budget  :
 
 ```text
 application enqueue
@@ -6305,33 +6305,33 @@ application enqueue
 + wire
 ```
 
-لكن القيم الفعلية تعتمد على hardware.
+hardware.
 
 ---
 
 # 405. P99.9 Requirement
 
-يجب أن يكون جزءاً من production acceptance لأن الألعاب التنافسية تتأثر بالtail latency حتى لو كان P50 ممتازاً.
+MUST     production acceptance     tail latency    P50 .
 
 ---
 
 # 406. Soak Memory Criterion
 
-بعد ساعات من traffic المختلط:
+traffic :
 
 ```text
 memory trend must stabilize
 ```
 
-ولا ينبغي وجود monotonically growing queues/pools.
+monotonically growing queues/pools.
 
 ---
 
 # 407. Connection Churn Criterion
 
-اختبر آلاف/مئات آلاف connection create-close cycles حسب deployment.
+/  connection create-close cycles  deployment.
 
-يجب ألا تسبب:
+MUST  :
 
 ```text
 fragmentation
@@ -6344,7 +6344,7 @@ CID table leaks
 
 # 408. High-Concurrency Criterion
 
-اختبار:
+:
 
 ```text
 many mostly-idle connections
@@ -6352,25 +6352,25 @@ few high-rate connections
 mixed workload
 ```
 
-للتأكد من أن scheduler/timers لا تكلف كثيراً للـ idle peers.
+scheduler/timers     idle peers.
 
 ---
 
 # 409. Timer Scalability
 
-يجب أن تكون تكلفة timers تقريبية sublinear أو bounded per active deadline bucket بدلاً من object لكل connection لكل event.
+MUST    timers  sublinear  bounded per active deadline bucket   object  connection  event.
 
 ---
 
 # 410. Idle Connection Cost
 
-يجب أن تكون connection idle رخيصة جداً CPU-wise.
+MUST   connection idle   CPU-wise.
 
 ---
 
 # 411. Active Connection Cost
 
-الكلفة يجب أن تتدرج أساساً مع:
+MUST    :
 
 ```text
 packets/sec
@@ -6378,25 +6378,25 @@ queued work
 retransmission activity
 ```
 
-لا مع مجرد وجود connection.
+connection.
 
 ---
 
 # 412. Error Path Cost
 
-invalid packet يجب أن يكون cheap reject ولا يصل إلى game layer.
+invalid packet MUST   cheap reject    game layer.
 
 ---
 
 # 413. Packet Capture
 
-يجب توفير internal packet capture format لغرض debugging، مع القدرة على redaction/disable في production.
+MUST  internal packet capture format  debugging    redaction/disable  production.
 
 ---
 
 # 414. Wire Decoder Tool
 
-project يجب أن يتضمن CLI مثل:
+project MUST   CLI :
 
 ```text
 gtp-dissect packet.pcap
@@ -6404,13 +6404,13 @@ gtp-trace session-id
 gtp-stats capture.pcap
 ```
 
-في المستقبل.
+.
 
 ---
 
 # 415. Wireshark Integration
 
-يفضل تطوير dissector مخصص لـ GTP لتمكين:
+SHOULD  dissector   GTP :
 
 - packet inspection.
 - ACK visualization.
@@ -6421,7 +6421,7 @@ gtp-stats capture.pcap
 
 # 416. Deterministic Simulation
 
-يجب بناء simulator مستقل يستطيع تشغيل:
+MUST  simulator   :
 
 ```text
 packet loss
@@ -6432,19 +6432,19 @@ CC
 scheduler
 ```
 
-بدون kernel/network.
+kernel/network.
 
 ---
 
 # 417. Simulation Benefits
 
-يسمح بعمل آلاف/ملايين السيناريوهات أسرع من network tests الحقيقية.
+/    network tests .
 
 ---
 
 # 418. Property-Based Network Simulation
 
-يمكن توليد:
+MAY :
 
 ```text
 random loss
@@ -6454,13 +6454,13 @@ reordering
 path changes
 ```
 
-وفحص invariants.
+invariants.
 
 ---
 
 # 419. Fuzz + Model Combination
 
-أفضل coverage تأتي من:
+coverage  :
 
 ```text
 byte fuzzing
@@ -6472,7 +6472,7 @@ stateful simulation
 
 # 420. Protocol Documentation
 
-المواصفة النهائية يجب أن تحتوي على:
+Final MUST   :
 
 ```text
 normative protocol
@@ -6486,7 +6486,7 @@ performance profile
 
 # 421. Normative Language
 
-استخدم:
+:
 
 ```text
 MUST
@@ -6496,25 +6496,25 @@ SHOULD NOT
 MAY
 ```
 
-بحسب الاستخدام المعياري لهذه الكلمات.
+.
 
 ---
 
 # 422. Experimental Language
 
-أي algorithm لم يثبت يجب أن يسمى:
+algorithm   MUST  :
 
 ```text
 EXPERIMENTAL
 ```
 
-ولا يوصف كأفضل خوارزمية نهائية.
+.
 
 ---
 
 # 423. Reference Profile
 
-GTP/1 reference profile يجب أن يكون محدداً بالكامل:
+GTP/1 reference profile MUST    :
 
 ```text
 AEAD on
@@ -6530,7 +6530,7 @@ stale-drop enabled
 
 # 424. Minimal Profile
 
-يمكن توفير profile للـ embedded/small systems:
+MAY  profile  embedded/small systems:
 
 ```text
 simple UDP
@@ -6539,7 +6539,7 @@ no migration
 minimal telemetry
 ```
 
-لكن Internet profile يبقى أكثر صرامة.
+Internet profile   .
 
 ---
 
@@ -6566,13 +6566,13 @@ AF_XDP
 user-space NIC processing
 ```
 
-ولا يكون v1 baseline.
+v1 baseline.
 
 ---
 
 # 427. Why Rust
 
-Rust مناسبة لأن GTP يحتاج توازناً بين:
+Rust   GTP   :
 
 ```text
 memory safety
@@ -6583,35 +6583,35 @@ FFI
 systems programming
 ```
 
-لكن Rust وحدها لا تضمن performance؛ architecture هي العامل الأساسي.
+Rust    performance architecture  General .
 
 ---
 
 # 428. Rust Performance Principle
 
-لا تستخدم abstraction إذا لم تستطع compiler والـ generated code جعله قريباً من cost المباشر.
+abstraction    compiler  generated code    cost .
 
-لكن لا تفترض أن abstraction سيء قبل profiling.
+abstraction   profiling.
 
 ---
 
 # 429. Generic Programming
 
-يمكن استخدام generics/traits في boundaries مثل CC وI/O.
+MAY  generics/traits  boundaries  CC I/O.
 
-يجب أن تكون hot path قابلة لـ monomorphization أو dispatch منخفض الكلفة عندما يكون ذلك مناسباً.
+MUST   hot path   monomorphization  dispatch      .
 
 ---
 
 # 430. Dynamic Dispatch Policy
 
-لا مانع من `dyn Trait` في control plane، لكن لا يجب وضع virtual dispatch في packet-per-packet inner loop دون قياس.
+`dyn Trait`  control plane   MUST  virtual dispatch  packet-per-packet inner loop  .
 
 ---
 
 # 431. Compile-Time Backend Selection
 
-يمكن أن يكون:
+MAY  :
 
 ```text
 feature = "tokio"
@@ -6620,43 +6620,43 @@ feature = "io-uring"
 feature = "dpdk"
 ```
 
-بحسب build.
+build.
 
-لكن wire/protocol semantics تبقى نفسها.
+wire/protocol semantics  .
 
 ---
 
 # 432. Runtime Backend Selection
 
-ممكن أيضاً إذا كان code size/deployment يسمح، خصوصاً في endpoint abstraction.
+code size/deployment    endpoint abstraction.
 
 ---
 
 # 433. Feature Flags
 
-لا ينبغي أن تتسبب feature flags في combinatorial explosion غير قابل للاختبار.
+feature flags  combinatorial explosion   .
 
-يجب الحفاظ على profiles رسمية محدودة.
+MUST   profiles  .
 
 ---
 
 # 434. Dependency-Free Core
 
-الـ packet/state machine core يجب أن يكون قليل dependencies جداً.
+packet/state machine core MUST    dependencies .
 
 ---
 
 # 435. Testing Dependency Isolation
 
-يمكن تشغيل protocol simulator دون OS أو socket.
+MAY  protocol simulator  OS  socket.
 
-وهذا يساعد fuzzing وmodel tests.
+fuzzing model tests.
 
 ---
 
 # 436. Public API Documentation
 
-كل public function يجب أن توضح:
+public function MUST  :
 
 ```text
 latency/copy semantics
@@ -6669,7 +6669,7 @@ errors
 
 # 437. Threading Contract
 
-يجب أن تعرف كل object:
+MUST    object:
 
 ```text
 Send + Sync?
@@ -6677,83 +6677,83 @@ owning worker?
 borrow-only?
 ```
 
-ولا تعتمد على assumptions غير موثقة.
+assumptions  .
 
 ---
 
 # 438. Connection Handle
 
-يفضل أن يكون handle خفيفاً:
+SHOULD   handle :
 
 ```text
 ConnectionHandle
 ```
 
-يشير إلى worker-owned connection، بدلاً من نقل connection object كاملاً بين threads.
+worker-owned connection    connection object   threads.
 
 ---
 
 # 439. Cross-Thread Send
 
-إذا احتاجت game threads متعددة إرسال messages إلى connection worker:
+game threads   messages  connection worker:
 
 ```text
 bounded MPSC
 ```
 
-ويجب batch requests.
+MUST batch requests.
 
 ---
 
 # 440. Game Thread Integration
 
-لا يجب أن ينتظر game thread network syscall.
+MUST   game thread network syscall.
 
-الـ send API enqueue/nonblocking ضمن التصميم المعتاد.
+send API enqueue/nonblocking  Design .
 
 ---
 
 # 441. Receive Integration
 
-game simulation يحصل على network messages عبر queue/channel مناسبة، مع إمكانية polling مباشر في engines منخفضة latency.
+game simulation   network messages  queue/channel    polling   engines  latency.
 
 ---
 
 # 442. Shared Memory In-Process
 
-في game server single-process، يمكن أن تكون الرسائل بين game systems وGTP views zero-copy حيث lifetime يسمح.
+game server single-process MAY   Messages  game systems GTP views zero-copy  lifetime .
 
 ---
 
 # 443. Async Message Ownership
 
-message قد تتعايش مع packet buffer حتى نهاية callback، وبعدها تنتقل ownership فقط إذا احتاج التطبيق.
+message    packet buffer   callback   ownership    Application.
 
 ---
 
 # 444. Backpressure to Game
 
-عندما يصبح network queue saturated، يجب أن يستطيع transport إبلاغ game system ليخفض update rate أو coalesces state.
+network queue saturated MUST   transport  game system  update rate  coalesces state.
 
 ---
 
 # 445. Adaptive Send Frequency
 
-game layer يمكن أن تغير:
+game layer MAY  :
 
 ```text
 120Hz → 60Hz → 30Hz
 ```
 
-عندما تكون state rate أعلى من network budget.
+state rate   network budget.
 
-GTP يوفر telemetry اللازمة لاتخاذ القرار، ولا يفرض معدل tick.
+GTP  telemetry   Decision    tick.
 
 ---
 
 # 446. Adaptive Snapshot Rate
 
-إذا كان:
+:
 
 ```text
 loss high
@@ -6761,15 +6761,15 @@ RTT high
 queue high
 ```
 
-يمكن للgame layer خفض snapshot rate أو payload detail.
+MAY game layer  snapshot rate  payload detail.
 
-هذا cooperation بين transport وgame layer.
+cooperation  transport game layer.
 
 ---
 
 # 447. Adaptive Quality
 
-مثلاً:
+:
 
 ```text
 normal:
@@ -6787,7 +6787,7 @@ input + important events
 
 # 448. Transport Feedback API
 
-يمكن توفير:
+MAY :
 
 ```rust
 NetworkFeedback {
@@ -6800,34 +6800,34 @@ NetworkFeedback {
 }
 ```
 
-لـ game adaptation.
+game adaptation.
 
 ---
 
 # 449. Feedback Rate
 
-لا ترسل telemetry إلى game logic لكل packet.
+telemetry  game logic  packet.
 
-تقدم snapshot/updates كل tick أو على interval صغير.
+snapshot/updates  tick   interval .
 
 ---
 
 # 450. Control/Data Separation
 
-في codebase:
+codebase:
 
 ```text
 data plane
 control plane
 ```
 
-بشكل واضح.
+.
 
 ---
 
 # 451. Data Plane Objective
 
-أعلى packet efficiency وأقل latency.
+packet efficiency  latency.
 
 ---
 
@@ -6835,51 +6835,51 @@ control plane
 
 Configuration, handshake, migration, extension negotiation, lifecycle.
 
-يمكن أن يكون أقل حساسية للـ microseconds.
+MAY      microseconds.
 
 ---
 
 # 453. Control Plane Scheduling
 
-لكن control frames لا يجب أن تكون starvation victims عند congestion شديد؛ لها reserved budget صغير.
+control frames  MUST   starvation victims  congestion   reserved budget .
 
 ---
 
 # 454. Reserved Control Budget
 
-مثلاً conceptual:
+conceptual:
 
 ```text
 reserved_control_budget
 ```
 
-بحيث يستطيع ACK/path/close العمل تحت queue pressure.
+ACK/path/close   queue pressure.
 
-القيمة تحدد بالbenchmark.
+benchmark.
 
 ---
 
 # 455. Reliable Data Budget
 
-باقي budget يشارك بين reliable/realtime وفق scheduler.
+budget   reliable/realtime  scheduler.
 
 ---
 
 # 456. Realtime Reservation
 
-في competitive profile يمكن حجز جزء من budget لـ fresh state/input، مع عدم تجاوز cwnd/pacing.
+competitive profile MAY    budget  fresh state/input    cwnd/pacing.
 
 ---
 
 # 457. Fairness Within Connection
 
-لا تسمح reliable queue كبيرة بابتلاع كل connection bandwidth.
+reliable queue    connection bandwidth.
 
 ---
 
 # 458. Class Weights
 
-يمكن تمثيل:
+MAY :
 
 ```text
 control = reserved
@@ -6889,13 +6889,13 @@ reliable = medium
 bulk = low
 ```
 
-مع deadline overrides.
+deadline overrides.
 
 ---
 
 # 459. Utility Scheduling
 
-النظام النهائي يمكن أن يستخدم:
+Final MAY  :
 
 ```text
 hard constraints
@@ -6905,7 +6905,7 @@ score-based ranking
 weighted fairness
 ```
 
-بدلاً من pure priority.
+pure priority.
 
 ---
 
@@ -6925,7 +6925,7 @@ class weight
 
 # 461. Scheduler Explainability
 
-للتشخيص، يجب أن يسجل سبب الاختيار/الإسقاط في debug mode:
+MUST    /  debug mode:
 
 ```text
 expired
@@ -6939,7 +6939,7 @@ queue pressure
 
 # 462. Transport Drop Reasons
 
-على الأقل:
+:
 
 ```text
 expired
@@ -6955,7 +6955,7 @@ protocol_reject
 
 # 463. Drop Metrics
 
-هذه metrics مهمة جداً لتحديد ما إذا كانت المشكلة:
+metrics       :
 
 ```text
 network loss
@@ -6967,38 +6967,38 @@ scheduler pressure
 
 # 464. Overproduction Detection
 
-إذا game layer تنتج:
+game layer :
 
 ```text
 500 KB/tick
 ```
 
-بينما network budget يسمح:
+network budget :
 
 ```text
 100 KB/tick
 ```
 
-GTP يجب أن يظهر ذلك بوضوح في telemetry.
+GTP MUST      telemetry.
 
 ---
 
 # 465. Application/Transport Contract
 
-الهدف أن يعرف الفريق:
+:
 
 ```text
 network isn't slow;
 application is overproducing stale state
 ```
 
-عندما تكون هذه هي المشكلة.
+.
 
 ---
 
 # 466. End-to-End Queue Analysis
 
-يجب تتبع:
+MUST :
 
 ```text
 application queue
@@ -7008,25 +7008,25 @@ network bottleneck queue
 peer receive queue
 ```
 
-حتى لا يتم تحسين طبقة خاطئة.
+.
 
 ---
 
 # 467. Socket Queue Visibility
 
-Linux backend يمكنه جمع بعض kernel socket metrics إن كان deployment يحتاج ذلك، لكن ليس على كل packet.
+Linux backend MAY   kernel socket metrics   deployment       packet.
 
 ---
 
 # 468. Network Emulator Correlation
 
-الـ benchmark harness يجب أن يسجل actual configured delay/loss مقابل observed RTT/loss.
+benchmark harness MUST   actual configured delay/loss  observed RTT/loss.
 
 ---
 
 # 469. Tail Latency Attribution
 
-كل test run يجب أن يعطي breakdown إن أمكن:
+test run MUST   breakdown  :
 
 ```text
 transport CPU
@@ -7039,7 +7039,7 @@ peer processing
 
 # 470. Reference Target Hardware
 
-reference benchmark server يفضل توثيق:
+reference benchmark server SHOULD :
 
 ```text
 modern x86-64 multi-core CPU
@@ -7047,90 +7047,90 @@ modern x86-64 multi-core CPU
 Linux recent kernel
 ```
 
-لكن النتائج لا تعمم بدون benchmark على target hardware.
+benchmark  target hardware.
 
 ---
 
 # 471. ARM Consideration
 
-Rust protocol core يجب أن يبقى portable إلى ARM64 عندما لا تعتمد backend على x86-specific features.
+Rust protocol core MUST   portable  ARM64    backend  x86-specific features.
 
 ---
 
 # 472. Hardware Crypto Variability
 
-crypto backend يجب أن يختار implementation مناسباً للـ CPU.
+crypto backend MUST   implementation   CPU.
 
 ---
 
 # 473. Kernel Version Feature Detection
 
-GSO/GRO/io_uring advanced operations يجب feature-detect أو fallback، ولا تفترض أن كل Linux environment يملك نفس capabilities.
+GSO/GRO/io_uring advanced operations MUST feature-detect  fallback     Linux environment   capabilities.
 
-مثلاً، توثيق Rust `io-uring` الحالي يبين multishot `recvmsg` على kernels مناسبة، وبعض bundle receive support مرتبط بـ kernel حديث؛ لذلك implementation يجب أن يتحقق من الدعم runtime بدلاً من افتراضه.
+Rust `io-uring`   multishot `recvmsg`  kernels   bundle receive support Ordered  kernel   implementation MUST     runtime   .
 
 ---
 
 # 474. GSO Limits
 
-Linux UDP GSO موثق بحدود segmentation وعدد datagrams في call، ويجب على backend احترام قيود kernel/NIC مع إبقاء كل segmented datagram صالحاً بالنسبة إلى MTU.
+Linux UDP GSO   segmentation  datagrams  call MUST  backend   kernel/NIC    segmented datagram Valid   MTU.
 
 ---
 
 # 475. GRO Semantics
 
-GRO لا يعني أن wire packet أصبح أكبر.
+GRO    wire packet  .
 
-هو فقط تجميع receive-side buffers، ويجب إعادة تفسير segment boundaries قبل GTP packet parsing.
+receive-side buffers MUST   segment boundaries  GTP packet parsing.
 
 ---
 
 # 476. GSO/GRO and Timing
 
-لا يجب أن تجعل batching يخفي timing الفردي إذا كان congestion controller يحتاج per-packet send timestamps.
+MUST   batching  timing    congestion controller  per-packet send timestamps.
 
-يجب الاحتفاظ بمعلومات كل logical packet داخل batch.
+MUST    logical packet  batch.
 
 ---
 
 # 477. Batching and RTT
 
-ACK/loss logic يستمر packet-oriented حتى إذا كانت I/O operation batch-oriented.
+ACK/loss logic  packet-oriented    I/O operation batch-oriented.
 
-هذه نقطة معمارية مهمة.
+.
 
 ---
 
 # 478. Batching and Pacing
 
-batch creation يجب أن يكون محدوداً بالـ pacing budget، وليس "كل شيء جاهز الآن".
+batch creation MUST     pacing budget  "   ".
 
 ---
 
 # 479. Batching and Deadlines
 
-لا يؤخر packet ذو deadline قريب فقط كي يكتمل batch كبير.
+packet  deadline     batch .
 
-deadline sensitivity يجب أن تتغلب على batching عندما تكون الكلفة الزمنية أعلى من مكسب syscall.
+deadline sensitivity MUST    batching        syscall.
 
 ---
 
 # 480. Adaptive Batch Size
 
-قد يختار backend:
+backend:
 
 ```text
 small batch at low traffic
 larger batch at high packet rate
 ```
 
-بحسب measured cost.
+measured cost.
 
 ---
 
 # 481. Polling Strategy
 
-endpoint loop يمكن أن يكون:
+endpoint loop MAY  :
 
 ```text
 event-driven
@@ -7138,13 +7138,13 @@ busy-poll
 hybrid
 ```
 
-حسب profile.
+profile.
 
 ---
 
 # 482. Hybrid Loop
 
-مثلاً:
+:
 
 ```text
 spin briefly
@@ -7154,21 +7154,21 @@ poll CQ/socket
 sleep only when idle
 ```
 
-لكن يجب قياس power/CPU trade-off.
+MUST  power/CPU trade-off.
 
 ---
 
 # 483. Power vs Latency
 
-mobile/client profile قد يفضل power efficiency، server profile يفضل latency.
+mobile/client profile  SHOULD power efficiency server profile SHOULD latency.
 
-نفس protocol core يجب أن يدعم الاثنين.
+protocol core MUST   .
 
 ---
 
 # 484. Client vs Server
 
-GTP يمكن أن يكون asymmetric في implementation:
+GTP MAY   asymmetric  implementation:
 
 ```text
 server:
@@ -7182,13 +7182,13 @@ less CPU
 power-aware
 ```
 
-wire semantics واحدة.
+wire semantics .
 
 ---
 
 # 485. Client Network Conditions
 
-client قد يكون خلف:
+client   :
 
 ```text
 NAT
@@ -7197,13 +7197,13 @@ mobile
 VPN
 ```
 
-لذلك conservative path startup مهم.
+conservative path startup .
 
 ---
 
 # 486. Server Network Conditions
 
-server قد يملك:
+server  :
 
 ```text
 10/25/100GbE
@@ -7211,27 +7211,27 @@ low RTT intra-region
 large fan-out
 ```
 
-وهنا batching becomes critical.
+batching becomes critical.
 
 ---
 
 # 487. Datacenter Path
 
-Homa-inspired scheduling useful أكثر في low-RTT data center-like scenarios، لكن Internet deployment يحتاج loss/path/NAT handling مختلفاً.
+Homa-inspired scheduling useful   low-RTT data center-like scenarios  Internet deployment  loss/path/NAT handling .
 
 ---
 
 # 488. Internet Safety
 
-GTP يجب أن يبقى fair ومتحكم بالازدحام حتى عندما لا يستخدم transport standards العامة مثل QUIC.
+GTP MUST   fair  Congestion     transport standards General  QUIC.
 
-RFC 8085 يؤكد أن UDP applications عبر Internet تحتاج congestion control أو rate adaptation مناسبة وأن traffic aggregate يجب أن يكون controlled.
+RFC 8085   UDP applications  Internet  congestion control  rate adaptation   traffic aggregate MUST   controlled.
 
 ---
 
 # 489. Why Custom UDP Remains Justified
 
-فقط إذا كانت:
+:
 
 ```text
 game semantics
@@ -7240,21 +7240,21 @@ deadline
 low HoL
 ```
 
-تنتج فوائد لا يمكن الحصول عليها بكلفة مناسبة من generic QUIC.
+MAY      generic QUIC.
 
 ---
 
 # 490. Why QUIC Remains a Baseline
 
-QUIC يظل baseline مهم لأنه يوفر Internet-hardened transport concepts.
+QUIC  baseline    Internet-hardened transport concepts.
 
-GTP يجب أن يتفوق في game-specific efficiency، لا أن يعيد اختراع Internet transport correctness دون داعٍ.
+GTP MUST    game-specific efficiency     Internet transport correctness  .
 
 ---
 
 # 491. Why KCP Remains a Baseline
 
-KCP يوفر comparison مفيد في:
+KCP  comparison  :
 
 ```text
 ARQ
@@ -7265,13 +7265,13 @@ pacing
 CC experimentation
 ```
 
-KCP v2.1.1 تحديداً أضاف telemetry/pacing improvements تستحق المقارنة.
+KCP v2.1.1   telemetry/pacing improvements  .
 
 ---
 
 # 492. Why Homa Remains a Reference
 
-Homa مفيد لفهم:
+Homa  :
 
 ```text
 message scheduling
@@ -7279,25 +7279,25 @@ receiver-driven service
 latency vs throughput tradeoffs
 ```
 
-لكن لا يترجم مباشرة إلى Internet protocol بسبب اختلاف environment.
+Internet protocol   environment.
 
 ---
 
 # 493. Protocol Positioning
 
-GTP يقع بين:
+GTP  :
 
 ```text
 raw custom UDP
 ```
 
-و:
+:
 
 ```text
 full generic QUIC
 ```
 
-ويهدف إلى أخذ correctness patterns من الثاني وspecialization efficiency من الأول.
+correctness patterns   specialization efficiency  .
 
 ---
 
@@ -7379,13 +7379,13 @@ gtp/
 └── wireshark-gtp
 ```
 
-يمكن أن يبدأ prototype بعدد crates أقل، لكن هذا يمثل الفصل المعماري المستهدف.
+MAY   prototype  crates       .
 
 ---
 
 # 496. Recommended Rust Stack
 
-| الطبقة | الاختيار المفضل | البديل/الملاحظة |
+| Layer |   | / |
 |---|---|---|
 | Wire views | zerocopy + custom codec | manual parsing |
 | buffers | bytes / custom pools | benchmark-driven |
@@ -7401,7 +7401,7 @@ gtp/
 
 # 497. Current Ecosystem Verification
 
-في وقت إعداد هذه الوثيقة، `zerocopy` و`s2n-quic` و`socket2` و`rustls` و`criterion` لديها إصدارات/توثيق حديثة في 2026، ويدعم `s2n-quic` خصائص مثل CUBIC وpacing وGSO وPMTU وconnection IDs؛ كما أن Rust `io-uring` الحالي يوفر multishot receive APIs. هذه الأدوات لا تعني أنها يجب أن تكون dependencies إجبارية؛ هي reference candidates يجب أن تخضع للـ benchmark والتدقيق.
+`zerocopy` `s2n-quic` `socket2` `rustls` `criterion`  /   2026  `s2n-quic`   CUBIC pacing GSO PMTU connection IDs   Rust `io-uring`   multishot receive APIs.      MUST   dependencies   reference candidates MUST    benchmark .
 
 ---
 
@@ -7423,7 +7423,7 @@ io_uring documentation also exposes multishot receive and buffer-group mechanism
 
 # 500. Version 1.1 Final Design Decision
 
-GTP/1.1 يعتمد المعمارية التالية كخط أساس:
+GTP/1.1  Architecture   :
 
 ```text
 UDP-based
@@ -7469,7 +7469,7 @@ Extensive simulation/fuzz/benchmarking
 
 ---
 
-# 501. ما الذي لا يدخل v1.1 كـ mandatory feature؟
+# 501.     v1.1  mandatory feature
 
 ```text
 DPDK
@@ -7483,11 +7483,11 @@ custom BBR
 transparent server failover
 ```
 
-هذه كلها يمكن إضافتها بعد إثبات الحاجة.
+MAY    .
 
 ---
 
-# 502. ترتيب التنفيذ العملي
+# 502.  Implementation
 
 ## Phase A — Specification
 
@@ -7570,11 +7570,11 @@ hardware experiments
 
 ---
 
-# 503. Gate قبل الانتقال من Phase إلى Phase
+# 503. Gate    Phase  Phase
 
-لا ينتقل المشروع إلى المرحلة التالية لأن الكود "يعمل" فقط.
+"" .
 
-يجب أن ينجح في:
+MUST   :
 
 ```text
 correctness
@@ -7586,9 +7586,9 @@ resource limits
 
 ---
 
-# 504. Gate قبل اعتماد CC جديد
+# 504. Gate   CC
 
-أي CC جديد يجب أن يقارن مع baseline من حيث:
+CC  MUST    baseline  :
 
 ```text
 fairness
@@ -7600,9 +7600,9 @@ P99 gameplay latency
 
 ---
 
-# 505. Gate قبل اعتماد GSO/GRO
+# 505. Gate   GSO/GRO
 
-يجب إثبات أنه يحسن:
+MUST   :
 
 ```text
 CPU/packet
@@ -7610,7 +7610,7 @@ syscalls
 packets/sec/core
 ```
 
-دون الإضرار بـ:
+:
 
 ```text
 pacing
@@ -7620,43 +7620,43 @@ packet accounting
 
 ---
 
-# 506. Gate قبل اعتماد io_uring
+# 506. Gate   io_uring
 
-يجب إثبات end-to-end improvement، لا فقط benchmark syscall.
+MUST  end-to-end improvement   benchmark syscall.
 
 ---
 
-# 507. Gate قبل DPDK
+# 507. Gate  DPDK
 
-لا يعتمد إلا بعد profile يظهر أن kernel/UDP path bottleneck حقيقي.
+profile   kernel/UDP path bottleneck .
 
 ---
 
 # 508. Design Risks
 
-أكبر المخاطر:
+Risks:
 
-1. **تعقيد scheduler.** إذا أصبح scheduler معقداً جداً، قد يفقد GTP ميزة البساطة.
-2. **Congestion algorithm غير ناضج.** throughput العالي لا يعني fairness أو game quality.
-3. **Security/handshake scope creep.** قد يتحول transport إلى QUIC جديد بالكامل.
-4. **Kernel optimization premature.** قد نحل bottleneck غير موجود.
-5. **Excessive metadata.** deadlines/priorities/generations يجب ألا تجعل كل packet ثقيلًا.
-6. **Cross-thread sharing.** قد يقتل cache locality.
-7. **Feature explosion.** كل optional feature يزيد correctness/test burden.
+1. ** scheduler.**   scheduler     GTP  .
+2. **Congestion algorithm  .** throughput    fairness  game quality.
+3. **Security/handshake scope creep.**   transport  QUIC  .
+4. **Kernel optimization premature.**   bottleneck  .
+5. **Excessive metadata.** deadlines/priorities/generations MUST    packet .
+6. **Cross-thread sharing.**   cache locality.
+7. **Feature explosion.**  optional feature  correctness/test burden.
 
 ---
 
-# 509. أكبر مخاطرة تصميمية
+# 509.
 
-أكبر خطأ هو محاولة جعل GTP:
+GTP:
 
 ```text
 QUIC + KCP + Homa + BBR + FEC + DPDK + 0-RTT
 ```
 
-في بروتوكول واحد من الإصدار الأول.
+.
 
-المنتج الصحيح يجب أن يكون أصغر:
+MUST   :
 
 ```text
 semantics
@@ -7668,21 +7668,21 @@ security
 fast I/O
 ```
 
-ثم تزيد features بناءً على benchmarks.
+features   benchmarks.
 
 ---
 
-# 510. أهم ابتكار يجب الحفاظ عليه
+# 510.   MUST
 
-الابتكار ليس header صغيراً.
+header .
 
-وليس مجرد reliable UDP.
+reliable UDP.
 
-بل:
+:
 
-> **نقل يعرف القيمة الزمنية للمعلومة.**
+> **    .**
 
-أي أن transport يستطيع التمييز بين:
+transport   :
 
 ```text
 must arrive
@@ -7695,9 +7695,9 @@ already obsolete
 
 ---
 
-# 511. تعريف النجاح الحقيقي
+# 511.  Success
 
-GTP ناجح عندما يستطيع في ظروف congestion/loss أن يحافظ على:
+GTP      congestion/loss   :
 
 ```text
 fresh input delivery
@@ -7708,15 +7708,15 @@ fair congestion behavior
 stable CPU cost
 ```
 
-حتى لو لم يحقق أعلى raw throughput مقارنة بــ bulk-optimized transports.
+raw throughput   bulk-optimized transports.
 
 ---
 
-# 512. الخلاصة النهائية
+# 512. Conclusion Final
 
-التصميم المقترح لـ GTP/1.1 ليس clone من KCP أو QUIC.
+Design   GTP/1.1  clone  KCP  QUIC.
 
-هو transport متخصص للألعاب مبني فوق UDP ويجمع بين:
+transport     UDP  :
 
 ```text
 QUIC-style Internet correctness patterns
@@ -7736,7 +7736,7 @@ Rust-native data-oriented implementation
 Linux batched UDP fast paths
 ```
 
-التركيز الأساسي ليس على إضافة أكبر عدد من features، وإنما على بناء pipeline قصير ومتوقع:
+features    pipeline  :
 
 ```text
 receive batch
@@ -7747,7 +7747,7 @@ receive batch
 → dispatch
 ```
 
-و:
+:
 
 ```text
 game enqueue
@@ -7760,11 +7760,11 @@ game enqueue
 → batch send
 ```
 
-وهذه هي البنية التي يجب أن تكون نقطة الانطلاق الرسمية للـ implementation.
+MUST       implementation.
 
 ---
 
-# 513. المراجع التقنية الخارجية الأساسية
+# 513. References
 
 1. IETF RFC 9000 — QUIC: A UDP-Based Multiplexed and Secure Transport.
 2. IETF RFC 9001 — Using TLS to Secure QUIC.
@@ -7785,15 +7785,15 @@ game enqueue
 
 ---
 
-# 514. المصادر التي تم التحقق منها أثناء إعداد هذه النسخة
+# 514.    Validation
 
-- KCP v2.1.1 release notes: إضافة `acked_bytes`, `xmit`, actual-send callback location، pacing اختياري وتحسينات ssthresh/cwnd.
+- KCP v2.1.1 release notes:  `acked_bytes`, `xmit`, actual-send callback location pacing   ssthresh/cwnd.
 - QUIC loss/recovery RFC 9002.
 - QUIC DATAGRAM RFC 9221.
 - QUIC v2 RFC 9369.
 - QUIC ACK Frequency Internet-Draft 2026.
 - RFC 8085 UDP Usage Guidelines.
-- Linux `udp(7)` عن UDP_SEGMENT وUDP_GRO.
+- Linux `udp(7)`  UDP_SEGMENT UDP_GRO.
 - Rust `io-uring` multishot receive APIs.
 - Monoio thread-per-core design.
 - zerocopy current documentation.
@@ -7806,9 +7806,9 @@ game enqueue
 
 # 515. Final Recommendation
 
-**لا يبدأ التنفيذ بكتابة packet header النهائي.**
+**  Implementation  packet header Final.**
 
-يجب أولاً تثبيت المواصفات التالية كوثائق فرعية مستقلة:
+MUST       :
 
 ```text
 GTP-ARCH-01   Architecture
@@ -7823,15 +7823,15 @@ GTP-LINUX-01  Linux Fast I/O Backend
 GTP-TEST-01   Verification & Benchmark Plan
 ```
 
-بعد تثبيتها يمكن استخراج implementation tasks وRust traits والـ packet diagrams والـ state machines بصورة دقيقة.
+MAY  implementation tasks Rust traits  packet diagrams  state machines  .
 
 ---
 
-# 516. القرار الهندسي النهائي
+# 516. Decision Engineering Final
 
-**GTP/1.1 = Game-aware UDP Transport، Rust-native، Internet-safe، performance-first، وليس generic QUIC clone.**
+**GTP/1.1 = Game-aware UDP Transport Rust-native Internet-safe performance-first  generic QUIC clone.**
 
-القواعد الأساسية:
+:
 
 ```text
 Reliable when necessary.
@@ -7850,9 +7850,9 @@ Secure the Internet profile by default.
 Optimize only after profiling.
 ```
 
-**هذه النسخة هي baseline المقترح قبل الانتقال إلى تصميم الـ wire protocol والتنفيذ الفعلي بلغة Rust.**
+**   baseline       wire protocol Implementation   Rust.**
 
-## Appendix A — روابط المراجع
+## Appendix A —  References
 
 - QUIC RFC 9002: https://www.rfc-editor.org/rfc/rfc9002.html
 - QUIC DATAGRAM RFC 9221: https://www.rfc-editor.org/rfc/rfc9221.html
