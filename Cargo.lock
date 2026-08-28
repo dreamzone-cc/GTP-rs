@@ -136,6 +136,7 @@ dependencies = [
  "gtp-sim",
  "gtp-types",
  "gtp-wire",
+ "tokio",
 ]
 
 [[package]]

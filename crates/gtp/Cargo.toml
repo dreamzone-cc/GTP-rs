@@ -21,6 +21,9 @@ gtp-io = { workspace = true }
 gtp-runtime-tokio = { workspace = true, optional = true }
 gtp-sim = { workspace = true, optional = true }
 
+[dev-dependencies]
+tokio = { workspace = true }
+
 [features]
 default = ["tokio"]
 tokio = ["dep:gtp-runtime-tokio"]
