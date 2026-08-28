@@ -44,6 +44,7 @@
 
 | Crate | Directory | Purpose |
 | :--- | :--- | :--- |
+| **`gtp`** | `crates/gtp` | **Primary Unified Rust SDK & Transport Library facade for game engine integration.** |
 | **`gtp-types`** | `crates/gtp-types` | Fundamental types, identifiers, monotonic time, RFC 1982 modulo sequence, errors. |
 | **`gtp-wire`** | `crates/gtp-wire` | Zero-copy binary framing, Long/Short headers, 14 TLV frames, VarInt, PacketBuilder. |
 | **`gtp-recovery`** | `crates/gtp-recovery` | ACK tracking, RTT estimation, packet & time loss detector, PTO sweeps. |
@@ -55,7 +56,7 @@
 | **`gtp-io`** | `crates/gtp-io` | Low-level socket2 UDP socket abstraction with batching (PacketIo). |
 | **`gtp-runtime-tokio`** | `crates/gtp-runtime-tokio` | Async Tokio endpoint, background worker tasks, AsyncGtpConnection. |
 | **`gtp-sim`** | `crates/gtp-sim` | Deterministic stepping simulation testbed with configurable network impairments. |
-| **`gtp-cli`** | `crates/gtp-cli` | Command-line dissector, benchmark runner, and Control API demo executable (`gtp`). |
+| **`gtp-cli`** | `crates/gtp-cli` | Command-line dissector, benchmark runner, and Control API demo executable (`gtp-cli`). |
 
 ---
 
@@ -63,23 +64,31 @@
 
 ### 1. Build and Run Workspace Tests
 ```bash
-# Compile and test all 12 crates
+# Compile and test all 13 crates & integration suites
 cargo test --workspace
 ```
 
-### 2. Run Deterministic Simulation Benchmark
+### 2. Run Synchronous 60 FPS Game Loop Example
 ```bash
-# Execute benchmark across LAN, Good Internet, Bad Cellular, and Extreme 20% Loss scenarios
+cargo run -p gtp --example sync_game_loop
+```
+
+### 3. Run Asynchronous Tokio Server Example
+```bash
+cargo run -p gtp --example async_tokio_server
+```
+
+### 4. Run Deterministic Simulation Benchmark
+```bash
 cargo run -p gtp-cli -- sim-benchmark --ticks 500
 ```
 
-### 3. Run Dedicated Control API Demonstration
+### 5. Run Dedicated Control API Demonstration
 ```bash
-# Demonstrates runtime ACK frequency adjustment, MTU probing, ping keepalive, and metrics
 cargo run -p gtp-cli -- control-demo
 ```
 
-### 4. Dissect Raw GTP Hex Packets
+### 6. Dissect Raw GTP Hex Packets
 ```bash
 cargo run -p gtp-cli -- dissect 80000100011811223344556677880000000000000001000F4240000E05DEADBEEFCAFEBABE
 ```
