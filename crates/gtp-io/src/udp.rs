@@ -1,8 +1,8 @@
-use std::io::ErrorKind;
-use std::net::{SocketAddr, UdpSocket};
-use socket2::{Domain, Protocol, Socket, Type};
 use crate::packet_io::{PacketIo, RecvDatagram};
 use gtp_types::{Result, TransportError};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::io::ErrorKind;
+use std::net::{SocketAddr, UdpSocket};
 
 pub const DEFAULT_SOCKET_BUFFER_SIZE: usize = 2 * 1024 * 1024; // 2 MB OS buffers
 
@@ -95,7 +95,9 @@ mod tests {
         let msg1 = b"hello_gtp_1";
         let msg2 = b"hello_gtp_2";
 
-        let sent = client.send_batch(&[(msg1, server_addr), (msg2, server_addr)]).unwrap();
+        let sent = client
+            .send_batch(&[(msg1, server_addr), (msg2, server_addr)])
+            .unwrap();
         assert_eq!(sent, 2);
 
         // Sleep briefly to let OS socket receive datagrams

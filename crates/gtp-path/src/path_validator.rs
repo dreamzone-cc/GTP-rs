@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
 use gtp_types::{Duration, MonotonicTime};
+use std::net::SocketAddr;
 
 pub const PATH_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -72,7 +72,11 @@ mod tests {
         assert_eq!(validator.active_path(), initial_addr);
 
         // Correct response data -> active path switched to new_addr
-        assert!(validator.validate_response(new_addr, &challenge_nonce, now + Duration::from_millis(50)));
+        assert!(validator.validate_response(
+            new_addr,
+            &challenge_nonce,
+            now + Duration::from_millis(50)
+        ));
         assert_eq!(validator.active_path(), new_addr);
         assert!(validator.is_active_path(new_addr));
     }

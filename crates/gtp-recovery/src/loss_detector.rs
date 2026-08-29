@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
 use crate::rtt::RttStats;
 use crate::sent_packet::{RetransmissionRecord, SentPacketRecord};
 use gtp_types::{Duration, MonotonicTime, PacketNumber};
 use gtp_wire::AckRange;
+use std::collections::BTreeMap;
 
 pub const PACKET_THRESHOLD: u64 = 3;
 pub const TIME_THRESHOLD_FACTOR_NUM: u64 = 9;
@@ -69,7 +69,8 @@ impl LossDetector {
             self.time_of_last_ack_eliciting_packet = record.send_time;
         }
         self.total_bytes_sent += record.bytes as u64;
-        self.sent_packets.insert(record.packet_number.as_u64(), record);
+        self.sent_packets
+            .insert(record.packet_number.as_u64(), record);
     }
 
     pub fn inflight_bytes(&self) -> u64 {
@@ -126,7 +127,10 @@ impl LossDetector {
 
         self.total_bytes_acked += bytes_acked as u64;
 
-        if self.largest_acked_packet.is_none_or(|l| largest_pn > l.as_u64()) {
+        if self
+            .largest_acked_packet
+            .is_none_or(|l| largest_pn > l.as_u64())
+        {
             self.largest_acked_packet = Some(largest_acked);
         }
 
@@ -140,7 +144,9 @@ impl LossDetector {
         if self.last_delivery_rate_time != MonotonicTime::ZERO {
             let interval = now.duration_since(self.last_delivery_rate_time);
             if interval.as_micros() > 1000 {
-                let delivered = self.total_bytes_acked.saturating_sub(self.last_delivery_rate_bytes);
+                let delivered = self
+                    .total_bytes_acked
+                    .saturating_sub(self.last_delivery_rate_bytes);
                 let rate = (delivered as f64 / interval.as_secs_f64()) as u64;
                 delivery_sample = Some(DeliveryRateSample {
                     delivered_bytes: delivered,
@@ -161,7 +167,11 @@ impl LossDetector {
         let mut retransmittable = Vec::new();
 
         let time_threshold = Duration::from_micros(
-            (self.rtt_stats.smoothed_rtt.max(self.rtt_stats.latest_rtt).as_micros()
+            (self
+                .rtt_stats
+                .smoothed_rtt
+                .max(self.rtt_stats.latest_rtt)
+                .as_micros()
                 * TIME_THRESHOLD_FACTOR_NUM)
                 / TIME_THRESHOLD_FACTOR_DEN,
         );

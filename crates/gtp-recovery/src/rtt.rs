@@ -55,9 +55,8 @@ impl RttStats {
             };
 
             // rttvar = (3/4)*rttvar + (1/4)*|smoothed_rtt - adjusted_rtt|
-            self.rttvar = Duration::from_micros(
-                (self.rttvar.as_micros() * 3 + rtt_diff.as_micros()) / 4,
-            );
+            self.rttvar =
+                Duration::from_micros((self.rttvar.as_micros() * 3 + rtt_diff.as_micros()) / 4);
 
             // smoothed_rtt = (7/8)*smoothed_rtt + (1/8)*adjusted_rtt
             self.smoothed_rtt = Duration::from_micros(

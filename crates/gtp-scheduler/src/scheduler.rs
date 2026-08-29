@@ -1,7 +1,7 @@
-use std::collections::VecDeque;
 use crate::item::SchedulableItem;
 use crate::state_table::StateTable;
 use gtp_types::{MessageClass, MonotonicTime, PriorityTier, Result, TransportError};
+use std::collections::VecDeque;
 
 pub const NUM_PRIORITY_TIERS: usize = 5;
 
@@ -58,13 +58,17 @@ impl GameScheduler {
             generation,
         } = item.class
         {
-            if !self.state_table.should_admit(state_key, generation, sequence) {
+            if !self
+                .state_table
+                .should_admit(state_key, generation, sequence)
+            {
                 // Outdated state packet, drop early
                 return Ok(());
             }
 
             if let Some(superseded_id) =
-                self.state_table.update(state_key, generation, sequence, item.message_id)
+                self.state_table
+                    .update(state_key, generation, sequence, item.message_id)
             {
                 // Evict the older superseded message from queue
                 self.queues[tier_idx].retain(|i| i.message_id != superseded_id);

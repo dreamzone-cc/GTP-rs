@@ -87,13 +87,25 @@ fn main() {
 
         Commands::SimBenchmark { ticks } => {
             println!("=== GTP/1.1 Deterministic Simulation Matrix Benchmark ===");
-            println!("Executing {} steps across multiple network profiles...\n", ticks);
+            println!(
+                "Executing {} steps across multiple network profiles...\n",
+                ticks
+            );
 
             let profiles = [
                 ("LAN (0% Loss, 1ms RTT)", NetworkProfile::lan()),
-                ("Good Internet (0.5% Loss, 40ms RTT)", NetworkProfile::good_internet()),
-                ("Bad Cellular / WiFi (8% Loss, 120ms RTT, Jitter)", NetworkProfile::bad_cellular_wifi()),
-                ("Extreme Loss (20% Loss, 80ms RTT, Reordering)", NetworkProfile::extreme_loss()),
+                (
+                    "Good Internet (0.5% Loss, 40ms RTT)",
+                    NetworkProfile::good_internet(),
+                ),
+                (
+                    "Bad Cellular / WiFi (8% Loss, 120ms RTT, Jitter)",
+                    NetworkProfile::bad_cellular_wifi(),
+                ),
+                (
+                    "Extreme Loss (20% Loss, 80ms RTT, Reordering)",
+                    NetworkProfile::extreme_loss(),
+                ),
             ];
 
             for (name, profile) in profiles {
@@ -112,13 +124,19 @@ fn main() {
                     );
                 }
 
-                let (_c, s) = runner.run_for(Duration::from_millis(ticks as u64), Duration::from_millis(1));
-                println!("  -> Received {} / 50 reliable ordered messages", s.len());
-                println!("  -> Client TX Packets: {}, Retransmissions: {}",
-                    runner.client.cold.total_tx_packets,
-                    runner.client.cold.total_retransmissions
+                let (_c, s) = runner.run_for(
+                    Duration::from_millis(ticks as u64),
+                    Duration::from_millis(1),
                 );
-                println!("  -> Server RX Packets: {}\n", runner.server.cold.total_rx_packets);
+                println!("  -> Received {} / 50 reliable ordered messages", s.len());
+                println!(
+                    "  -> Client TX Packets: {}, Retransmissions: {}",
+                    runner.client.cold.total_tx_packets, runner.client.cold.total_retransmissions
+                );
+                println!(
+                    "  -> Server RX Packets: {}\n",
+                    runner.server.cold.total_rx_packets
+                );
             }
 
             println!("Benchmark finished successfully.");
@@ -137,8 +155,19 @@ fn main() {
             let now = MonotonicTime::from_micros(1_000_000);
 
             // 1. Send initial messages
-            let _ = conn.send_unreliable(b"player_input_vector".to_vec(), PriorityTier::P1Input, None, now);
-            let _ = conn.send_reliable_ordered(OrderedGroupId(1), b"inventory_equip_weapon".to_vec(), PriorityTier::P3ReliableGameplay, None, now);
+            let _ = conn.send_unreliable(
+                b"player_input_vector".to_vec(),
+                PriorityTier::P1Input,
+                None,
+                now,
+            );
+            let _ = conn.send_reliable_ordered(
+                OrderedGroupId(1),
+                b"inventory_equip_weapon".to_vec(),
+                PriorityTier::P3ReliableGameplay,
+                None,
+                now,
+            );
 
             // 2. Dynamically adjust ACK frequency at runtime
             println!("[Control API] Adjusting remote peer ACK frequency (every 1 packet, max delay 5ms)...");
@@ -164,7 +193,9 @@ fn main() {
 
             // 6. Gracefully close connection and inspect emitted events
             println!("\n[Control API] Initiating graceful connection draining...");
-            conn.control().graceful_close(0x0000, "Normal game exit", now).unwrap();
+            conn.control()
+                .graceful_close(0x0000, "Normal game exit", now)
+                .unwrap();
 
             let events = conn.drain_events();
             println!("Drained {} Control Events:", events.len());
@@ -179,7 +210,7 @@ fn main() {
 
 mod hex {
     pub fn decode(hex_str: &str) -> Result<Vec<u8>, &'static str> {
-        if !hex_str.len().is_multiple_of(2) {
+        if hex_str.len() % 2 != 0 {
             return Err("Odd length hex string");
         }
         (0..hex_str.len())

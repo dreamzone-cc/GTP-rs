@@ -3,6 +3,9 @@ use gtp_types::{
     StateKey, StateSequence, TransmissionId, TransportError,
 };
 
+pub const MAX_ACK_RANGES: usize = 32;
+
+pub const FRAME_TYPE_PADDING: u8 = 0x00;
 pub const FRAME_TYPE_ACK: u8 = 0x01;
 pub const FRAME_TYPE_DATA: u8 = 0x02;
 pub const FRAME_TYPE_RELIABLE_DATA: u8 = 0x03;
@@ -16,12 +19,9 @@ pub const FRAME_TYPE_ACK_FREQUENCY: u8 = 0x0A;
 pub const FRAME_TYPE_HANDSHAKE_INIT: u8 = 0x0B;
 pub const FRAME_TYPE_HANDSHAKE_RESPONSE: u8 = 0x0C;
 pub const FRAME_TYPE_HANDSHAKE_FINISH: u8 = 0x0D;
-pub const FRAME_TYPE_PADDING: u8 = 0x0E;
 
-pub const MAX_ACK_RANGES: usize = 32;
-
-/// A contiguous range of acknowledged packets: [start, end].
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+/// Compact ACK Range representation.
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Default)]
 pub struct AckRange {
     pub gap: u32,
     pub length: u32,
@@ -102,6 +102,74 @@ pub enum Frame<'a> {
     },
 }
 
+#[inline(always)]
+fn read_u8(buf: &[u8], offset: &mut usize) -> Result<u8> {
+    if buf.len() < *offset + 1 {
+        return Err(TransportError::TruncatedFrame {
+            needed: 1,
+            available: buf.len().saturating_sub(*offset),
+        });
+    }
+    let b = buf[*offset];
+    *offset += 1;
+    Ok(b)
+}
+
+#[inline(always)]
+fn read_u16(buf: &[u8], offset: &mut usize) -> Result<u16> {
+    if buf.len() < *offset + 2 {
+        return Err(TransportError::TruncatedFrame {
+            needed: 2,
+            available: buf.len().saturating_sub(*offset),
+        });
+    }
+    let mut bytes = [0u8; 2];
+    bytes.copy_from_slice(&buf[*offset..*offset + 2]);
+    *offset += 2;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+#[inline(always)]
+fn read_u32(buf: &[u8], offset: &mut usize) -> Result<u32> {
+    if buf.len() < *offset + 4 {
+        return Err(TransportError::TruncatedFrame {
+            needed: 4,
+            available: buf.len().saturating_sub(*offset),
+        });
+    }
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&buf[*offset..*offset + 4]);
+    *offset += 4;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+#[inline(always)]
+fn read_u64(buf: &[u8], offset: &mut usize) -> Result<u64> {
+    if buf.len() < *offset + 8 {
+        return Err(TransportError::TruncatedFrame {
+            needed: 8,
+            available: buf.len().saturating_sub(*offset),
+        });
+    }
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&buf[*offset..*offset + 8]);
+    *offset += 8;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+#[inline(always)]
+fn read_bytes<'a>(buf: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
+    if buf.len() < *offset + len {
+        return Err(TransportError::TruncatedFrame {
+            needed: len,
+            available: buf.len().saturating_sub(*offset),
+        });
+    }
+    let slice = &buf[*offset..*offset + len];
+    *offset += len;
+    Ok(slice)
+}
+
 impl<'a> Frame<'a> {
     pub fn frame_type(&self) -> u8 {
         match self {
@@ -128,7 +196,7 @@ impl<'a> Frame<'a> {
 
     pub fn encode(&self, buf: &mut [u8]) -> Result<usize> {
         if buf.is_empty() {
-            return Err(TransportError::BufferTooShort);
+            return Err(TransportError::BufferOverflow);
         }
 
         buf[0] = self.frame_type();
@@ -144,9 +212,10 @@ impl<'a> Frame<'a> {
                 ect1_count,
                 ce_count,
             } => {
-                let required = 1 + 8 + 4 + 1 + (*range_count as usize * 8) + 12;
-                if buf.len() < required {
-                    return Err(TransportError::BufferTooShort);
+                let count = (*range_count as usize).min(MAX_ACK_RANGES);
+                let needed = 1 + 8 + 4 + 1 + (count * 8) + 4 + 4 + 4;
+                if buf.len() < needed {
+                    return Err(TransportError::BufferOverflow);
                 }
 
                 buf[offset..offset + 8].copy_from_slice(&largest_acked.as_u64().to_be_bytes());
@@ -158,7 +227,6 @@ impl<'a> Frame<'a> {
                 buf[offset] = *range_count;
                 offset += 1;
 
-                let count = (*range_count as usize).min(MAX_ACK_RANGES);
                 for range in ranges.iter().take(count) {
                     buf[offset..offset + 4].copy_from_slice(&range.gap.to_be_bytes());
                     offset += 4;
@@ -182,15 +250,16 @@ impl<'a> Frame<'a> {
                 deadline_ms,
                 payload,
             } => {
-                let required = 1 + 8 + 6 + 4 + 4 + 2 + 2 + payload.len();
-                if buf.len() < required {
-                    return Err(TransportError::BufferTooShort);
+                let needed = 1 + 8 + 6 + 4 + 4 + 2 + 2 + payload.len();
+                if buf.len() < needed || payload.len() > u16::MAX as usize {
+                    return Err(TransportError::BufferOverflow);
                 }
 
                 buf[offset..offset + 8].copy_from_slice(&message_id.as_u64().to_be_bytes());
                 offset += 8;
 
-                buf[offset..offset + 6].copy_from_slice(&state_key.to_u48().to_be_bytes()[2..8]);
+                let key_bytes = state_key.to_u48().to_be_bytes();
+                buf[offset..offset + 6].copy_from_slice(&key_bytes[2..8]);
                 offset += 6;
 
                 buf[offset..offset + 4].copy_from_slice(&sequence.as_u32().to_be_bytes());
@@ -218,15 +287,15 @@ impl<'a> Frame<'a> {
                 order_seq,
                 payload,
             } => {
-                let required = 1 + 8 + 2 + 2 + 2 + 4 + 2 + payload.len();
-                if buf.len() < required {
-                    return Err(TransportError::BufferTooShort);
+                let needed = 1 + 8 + 2 + 2 + 2 + 4 + 2 + payload.len();
+                if buf.len() < needed || payload.len() > u16::MAX as usize {
+                    return Err(TransportError::BufferOverflow);
                 }
 
                 buf[offset..offset + 8].copy_from_slice(&message_id.as_u64().to_be_bytes());
                 offset += 8;
 
-                buf[offset..offset + 2].copy_from_slice(&fragment_id.as_u16().to_be_bytes());
+                buf[offset..offset + 2].copy_from_slice(&fragment_id.0.to_be_bytes());
                 offset += 2;
 
                 buf[offset..offset + 2].copy_from_slice(&total_fragments.to_be_bytes());
@@ -252,18 +321,18 @@ impl<'a> Frame<'a> {
                 transmission_id,
                 payload,
             } => {
-                let required = 1 + 8 + 2 + 1 + 2 + payload.len();
-                if buf.len() < required {
-                    return Err(TransportError::BufferTooShort);
+                let needed = 1 + 8 + 2 + 1 + 2 + payload.len();
+                if buf.len() < needed || payload.len() > u16::MAX as usize {
+                    return Err(TransportError::BufferOverflow);
                 }
 
                 buf[offset..offset + 8].copy_from_slice(&message_id.as_u64().to_be_bytes());
                 offset += 8;
 
-                buf[offset..offset + 2].copy_from_slice(&fragment_id.as_u16().to_be_bytes());
+                buf[offset..offset + 2].copy_from_slice(&fragment_id.0.to_be_bytes());
                 offset += 2;
 
-                buf[offset] = transmission_id.as_u8();
+                buf[offset] = transmission_id.0;
                 offset += 1;
 
                 let len_u16 = payload.len() as u16;
@@ -276,15 +345,23 @@ impl<'a> Frame<'a> {
 
             Self::Ping { nonce } => {
                 if buf.len() < offset + 8 {
-                    return Err(TransportError::BufferTooShort);
+                    return Err(TransportError::BufferOverflow);
                 }
                 buf[offset..offset + 8].copy_from_slice(&nonce.to_be_bytes());
                 offset += 8;
             }
 
-            Self::PathChallenge { data } | Self::PathResponse { data } => {
+            Self::PathChallenge { data } => {
                 if buf.len() < offset + 8 {
-                    return Err(TransportError::BufferTooShort);
+                    return Err(TransportError::BufferOverflow);
+                }
+                buf[offset..offset + 8].copy_from_slice(data);
+                offset += 8;
+            }
+
+            Self::PathResponse { data } => {
+                if buf.len() < offset + 8 {
+                    return Err(TransportError::BufferOverflow);
                 }
                 buf[offset..offset + 8].copy_from_slice(data);
                 offset += 8;
@@ -295,7 +372,7 @@ impl<'a> Frame<'a> {
                 padding_len,
             } => {
                 if buf.len() < offset + 4 + *padding_len {
-                    return Err(TransportError::BufferTooShort);
+                    return Err(TransportError::BufferOverflow);
                 }
                 buf[offset..offset + 4].copy_from_slice(&probe_id.to_be_bytes());
                 offset += 4;
@@ -307,7 +384,7 @@ impl<'a> Frame<'a> {
                 let reason_bytes = reason.as_bytes();
                 let reason_len = reason_bytes.len().min(255) as u8;
                 if buf.len() < offset + 2 + 1 + (reason_len as usize) {
-                    return Err(TransportError::BufferTooShort);
+                    return Err(TransportError::BufferOverflow);
                 }
                 buf[offset..offset + 2].copy_from_slice(&error_code.to_be_bytes());
                 offset += 2;
@@ -324,7 +401,7 @@ impl<'a> Frame<'a> {
                 reorder_threshold,
             } => {
                 if buf.len() < offset + 1 + 2 + 1 {
-                    return Err(TransportError::BufferTooShort);
+                    return Err(TransportError::BufferOverflow);
                 }
                 buf[offset] = *ack_frequency_packets;
                 offset += 1;
@@ -339,7 +416,7 @@ impl<'a> Frame<'a> {
                 version,
             } => {
                 if buf.len() < offset + 16 + 4 {
-                    return Err(TransportError::BufferTooShort);
+                    return Err(TransportError::BufferOverflow);
                 }
                 buf[offset..offset + 16].copy_from_slice(client_nonce);
                 offset += 16;
@@ -353,7 +430,7 @@ impl<'a> Frame<'a> {
                 assigned_cid,
             } => {
                 if buf.len() < offset + 16 + 32 + 8 {
-                    return Err(TransportError::BufferTooShort);
+                    return Err(TransportError::BufferOverflow);
                 }
                 buf[offset..offset + 16].copy_from_slice(server_nonce);
                 offset += 16;
@@ -368,7 +445,7 @@ impl<'a> Frame<'a> {
                 client_proof,
             } => {
                 if buf.len() < offset + 32 + 16 {
-                    return Err(TransportError::BufferTooShort);
+                    return Err(TransportError::BufferOverflow);
                 }
                 buf[offset..offset + 32].copy_from_slice(cookie_echo);
                 offset += 32;
@@ -378,7 +455,7 @@ impl<'a> Frame<'a> {
 
             Self::Padding { len } => {
                 if buf.len() < offset + *len {
-                    return Err(TransportError::BufferTooShort);
+                    return Err(TransportError::BufferOverflow);
                 }
                 buf[offset..offset + *len].fill(0);
                 offset += *len;
@@ -389,54 +466,29 @@ impl<'a> Frame<'a> {
     }
 
     pub fn decode(buf: &'a [u8]) -> Result<(Self, usize)> {
-        if buf.is_empty() {
-            return Err(TransportError::BufferTooShort);
-        }
-
-        let frame_type = buf[0];
-        let mut offset = 1;
+        let mut offset = 0;
+        let frame_type = read_u8(buf, &mut offset)?;
 
         match frame_type {
             FRAME_TYPE_ACK => {
-                if buf.len() < offset + 8 + 4 + 1 + 12 {
-                    return Err(TransportError::BufferTooShort);
-                }
-
-                let largest = PacketNumber::from_u64(u64::from_be_bytes(
-                    buf[offset..offset + 8].try_into().unwrap(),
-                ));
-                offset += 8;
-
-                let ack_delay = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-                offset += 4;
-
-                let range_count = buf[offset];
-                offset += 1;
+                let largest = PacketNumber::from_u64(read_u64(buf, &mut offset)?);
+                let ack_delay = read_u32(buf, &mut offset)?;
+                let range_count = read_u8(buf, &mut offset)?;
 
                 if (range_count as usize) > MAX_ACK_RANGES {
                     return Err(TransportError::ResourceLimitExceeded("Too many ACK ranges"));
                 }
 
-                let total_ranges_bytes = (range_count as usize) * 8;
-                if buf.len() < offset + total_ranges_bytes + 12 {
-                    return Err(TransportError::BufferTooShort);
-                }
-
                 let mut ranges = [AckRange::default(); MAX_ACK_RANGES];
                 for range in ranges.iter_mut().take(range_count as usize) {
-                    let gap = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-                    offset += 4;
-                    let length = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-                    offset += 4;
+                    let gap = read_u32(buf, &mut offset)?;
+                    let length = read_u32(buf, &mut offset)?;
                     *range = AckRange { gap, length };
                 }
 
-                let ect0 = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-                offset += 4;
-                let ect1 = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-                offset += 4;
-                let ce = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-                offset += 4;
+                let ect0 = read_u32(buf, &mut offset)?;
+                let ect1 = read_u32(buf, &mut offset)?;
+                let ce = read_u32(buf, &mut offset)?;
 
                 Ok((
                     Frame::Ack {
@@ -453,43 +505,17 @@ impl<'a> Frame<'a> {
             }
 
             FRAME_TYPE_DATA => {
-                if buf.len() < offset + 8 + 6 + 4 + 4 + 2 + 2 {
-                    return Err(TransportError::BufferTooShort);
-                }
-
-                let msg_id = MessageId::from_u64(u64::from_be_bytes(
-                    buf[offset..offset + 8].try_into().unwrap(),
-                ));
-                offset += 8;
-
+                let msg_id = MessageId::from_u64(read_u64(buf, &mut offset)?);
+                let key_slice = read_bytes(buf, &mut offset, 6)?;
                 let mut key_bytes = [0u8; 8];
-                key_bytes[2..8].copy_from_slice(&buf[offset..offset + 6]);
+                key_bytes[2..8].copy_from_slice(key_slice);
                 let state_key = StateKey::from_u48(u64::from_be_bytes(key_bytes));
-                offset += 6;
 
-                let seq = StateSequence::from_u32(u32::from_be_bytes(
-                    buf[offset..offset + 4].try_into().unwrap(),
-                ));
-                offset += 4;
-
-                let gen = GenerationId::from_u32(u32::from_be_bytes(
-                    buf[offset..offset + 4].try_into().unwrap(),
-                ));
-                offset += 4;
-
-                let deadline = u16::from_be_bytes(buf[offset..offset + 2].try_into().unwrap());
-                offset += 2;
-
-                let payload_len =
-                    u16::from_be_bytes(buf[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
-
-                if buf.len() < offset + payload_len {
-                    return Err(TransportError::BufferTooShort);
-                }
-
-                let payload = &buf[offset..offset + payload_len];
-                offset += payload_len;
+                let seq = StateSequence::from_u32(read_u32(buf, &mut offset)?);
+                let gen = GenerationId::from_u32(read_u32(buf, &mut offset)?);
+                let deadline = read_u16(buf, &mut offset)?;
+                let payload_len = read_u16(buf, &mut offset)? as usize;
+                let payload = read_bytes(buf, &mut offset, payload_len)?;
 
                 Ok((
                     Frame::Data {
@@ -505,41 +531,13 @@ impl<'a> Frame<'a> {
             }
 
             FRAME_TYPE_RELIABLE_DATA => {
-                if buf.len() < offset + 8 + 2 + 2 + 2 + 4 + 2 {
-                    return Err(TransportError::BufferTooShort);
-                }
-
-                let msg_id = MessageId::from_u64(u64::from_be_bytes(
-                    buf[offset..offset + 8].try_into().unwrap(),
-                ));
-                offset += 8;
-
-                let frag_id = FragmentId(u16::from_be_bytes(
-                    buf[offset..offset + 2].try_into().unwrap(),
-                ));
-                offset += 2;
-
-                let total_frags = u16::from_be_bytes(buf[offset..offset + 2].try_into().unwrap());
-                offset += 2;
-
-                let group_id = OrderedGroupId(u16::from_be_bytes(
-                    buf[offset..offset + 2].try_into().unwrap(),
-                ));
-                offset += 2;
-
-                let order_seq = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-                offset += 4;
-
-                let payload_len =
-                    u16::from_be_bytes(buf[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
-
-                if buf.len() < offset + payload_len {
-                    return Err(TransportError::BufferTooShort);
-                }
-
-                let payload = &buf[offset..offset + payload_len];
-                offset += payload_len;
+                let msg_id = MessageId::from_u64(read_u64(buf, &mut offset)?);
+                let frag_id = FragmentId(read_u16(buf, &mut offset)?);
+                let total_frags = read_u16(buf, &mut offset)?;
+                let group_id = OrderedGroupId(read_u16(buf, &mut offset)?);
+                let order_seq = read_u32(buf, &mut offset)?;
+                let payload_len = read_u16(buf, &mut offset)? as usize;
+                let payload = read_bytes(buf, &mut offset, payload_len)?;
 
                 Ok((
                     Frame::ReliableData {
@@ -555,33 +553,11 @@ impl<'a> Frame<'a> {
             }
 
             FRAME_TYPE_RETX => {
-                if buf.len() < offset + 8 + 2 + 1 + 2 {
-                    return Err(TransportError::BufferTooShort);
-                }
-
-                let msg_id = MessageId::from_u64(u64::from_be_bytes(
-                    buf[offset..offset + 8].try_into().unwrap(),
-                ));
-                offset += 8;
-
-                let frag_id = FragmentId(u16::from_be_bytes(
-                    buf[offset..offset + 2].try_into().unwrap(),
-                ));
-                offset += 2;
-
-                let transmission_id = TransmissionId(buf[offset]);
-                offset += 1;
-
-                let payload_len =
-                    u16::from_be_bytes(buf[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
-
-                if buf.len() < offset + payload_len {
-                    return Err(TransportError::BufferTooShort);
-                }
-
-                let payload = &buf[offset..offset + payload_len];
-                offset += payload_len;
+                let msg_id = MessageId::from_u64(read_u64(buf, &mut offset)?);
+                let frag_id = FragmentId(read_u16(buf, &mut offset)?);
+                let transmission_id = TransmissionId(read_u8(buf, &mut offset)?);
+                let payload_len = read_u16(buf, &mut offset)? as usize;
+                let payload = read_bytes(buf, &mut offset, payload_len)?;
 
                 Ok((
                     Frame::Retx {
@@ -595,41 +571,27 @@ impl<'a> Frame<'a> {
             }
 
             FRAME_TYPE_PING => {
-                if buf.len() < offset + 8 {
-                    return Err(TransportError::BufferTooShort);
-                }
-                let nonce = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
-                offset += 8;
+                let nonce = read_u64(buf, &mut offset)?;
                 Ok((Frame::Ping { nonce }, offset))
             }
 
             FRAME_TYPE_PATH_CHALLENGE => {
-                if buf.len() < offset + 8 {
-                    return Err(TransportError::BufferTooShort);
-                }
+                let data_slice = read_bytes(buf, &mut offset, 8)?;
                 let mut data = [0u8; 8];
-                data.copy_from_slice(&buf[offset..offset + 8]);
-                offset += 8;
+                data.copy_from_slice(data_slice);
                 Ok((Frame::PathChallenge { data }, offset))
             }
 
             FRAME_TYPE_PATH_RESPONSE => {
-                if buf.len() < offset + 8 {
-                    return Err(TransportError::BufferTooShort);
-                }
+                let data_slice = read_bytes(buf, &mut offset, 8)?;
                 let mut data = [0u8; 8];
-                data.copy_from_slice(&buf[offset..offset + 8]);
-                offset += 8;
+                data.copy_from_slice(data_slice);
                 Ok((Frame::PathResponse { data }, offset))
             }
 
             FRAME_TYPE_MTU_PROBE => {
-                if buf.len() < offset + 4 {
-                    return Err(TransportError::BufferTooShort);
-                }
-                let probe_id = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-                offset += 4;
-                let padding_len = buf.len() - offset;
+                let probe_id = read_u32(buf, &mut offset)?;
+                let padding_len = buf.len().saturating_sub(offset);
                 offset = buf.len();
                 Ok((
                     Frame::MtuProbe {
@@ -641,32 +603,18 @@ impl<'a> Frame<'a> {
             }
 
             FRAME_TYPE_CLOSE => {
-                if buf.len() < offset + 2 + 1 {
-                    return Err(TransportError::BufferTooShort);
-                }
-                let error_code = u16::from_be_bytes(buf[offset..offset + 2].try_into().unwrap());
-                offset += 2;
-                let reason_len = buf[offset] as usize;
-                offset += 1;
-                if buf.len() < offset + reason_len {
-                    return Err(TransportError::BufferTooShort);
-                }
-                let reason = core::str::from_utf8(&buf[offset..offset + reason_len])
-                    .map_err(|_| TransportError::InvalidPacket("Malformed UTF-8 close reason"))?;
-                offset += reason_len;
+                let error_code = read_u16(buf, &mut offset)?;
+                let reason_len = read_u8(buf, &mut offset)? as usize;
+                let reason_bytes = read_bytes(buf, &mut offset, reason_len)?;
+                let reason = core::str::from_utf8(reason_bytes)
+                    .map_err(|_| TransportError::MalformedFrame("Malformed UTF-8 close reason"))?;
                 Ok((Frame::Close { error_code, reason }, offset))
             }
 
             FRAME_TYPE_ACK_FREQUENCY => {
-                if buf.len() < offset + 1 + 2 + 1 {
-                    return Err(TransportError::BufferTooShort);
-                }
-                let ack_freq = buf[offset];
-                offset += 1;
-                let max_delay = u16::from_be_bytes(buf[offset..offset + 2].try_into().unwrap());
-                offset += 2;
-                let reorder_thresh = buf[offset];
-                offset += 1;
+                let ack_freq = read_u8(buf, &mut offset)?;
+                let max_delay = read_u16(buf, &mut offset)?;
+                let reorder_thresh = read_u8(buf, &mut offset)?;
                 Ok((
                     Frame::AckFrequency {
                         ack_frequency_packets: ack_freq,
@@ -678,14 +626,10 @@ impl<'a> Frame<'a> {
             }
 
             FRAME_TYPE_HANDSHAKE_INIT => {
-                if buf.len() < offset + 16 + 4 {
-                    return Err(TransportError::BufferTooShort);
-                }
+                let nonce_slice = read_bytes(buf, &mut offset, 16)?;
                 let mut client_nonce = [0u8; 16];
-                client_nonce.copy_from_slice(&buf[offset..offset + 16]);
-                offset += 16;
-                let version = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-                offset += 4;
+                client_nonce.copy_from_slice(nonce_slice);
+                let version = read_u32(buf, &mut offset)?;
                 Ok((
                     Frame::HandshakeInit {
                         client_nonce,
@@ -696,17 +640,17 @@ impl<'a> Frame<'a> {
             }
 
             FRAME_TYPE_HANDSHAKE_RESPONSE => {
-                if buf.len() < offset + 16 + 32 + 8 {
-                    return Err(TransportError::BufferTooShort);
-                }
+                let s_nonce = read_bytes(buf, &mut offset, 16)?;
                 let mut server_nonce = [0u8; 16];
-                server_nonce.copy_from_slice(&buf[offset..offset + 16]);
-                offset += 16;
+                server_nonce.copy_from_slice(s_nonce);
+
+                let cookie = read_bytes(buf, &mut offset, 32)?;
                 let mut stateless_cookie = [0u8; 32];
-                stateless_cookie.copy_from_slice(&buf[offset..offset + 32]);
-                offset += 32;
-                let cid = ConnectionId::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
-                offset += 8;
+                stateless_cookie.copy_from_slice(cookie);
+
+                let cid_bytes = read_u64(buf, &mut offset)?;
+                let cid = ConnectionId(cid_bytes);
+
                 Ok((
                     Frame::HandshakeResponse {
                         server_nonce,
@@ -718,15 +662,14 @@ impl<'a> Frame<'a> {
             }
 
             FRAME_TYPE_HANDSHAKE_FINISH => {
-                if buf.len() < offset + 32 + 16 {
-                    return Err(TransportError::BufferTooShort);
-                }
+                let cookie = read_bytes(buf, &mut offset, 32)?;
                 let mut cookie_echo = [0u8; 32];
-                cookie_echo.copy_from_slice(&buf[offset..offset + 32]);
-                offset += 32;
+                cookie_echo.copy_from_slice(cookie);
+
+                let proof = read_bytes(buf, &mut offset, 16)?;
                 let mut client_proof = [0u8; 16];
-                client_proof.copy_from_slice(&buf[offset..offset + 16]);
-                offset += 16;
+                client_proof.copy_from_slice(proof);
+
                 Ok((
                     Frame::HandshakeFinish {
                         cookie_echo,
@@ -737,14 +680,12 @@ impl<'a> Frame<'a> {
             }
 
             FRAME_TYPE_PADDING => {
-                let padding_len = buf.len() - offset;
+                let padding_len = buf.len().saturating_sub(offset);
                 offset = buf.len();
                 Ok((Frame::Padding { len: padding_len }, offset))
             }
 
-            _ => Err(TransportError::InvalidPacket(
-                "Unknown frame type encountered",
-            )),
+            _unknown => Err(TransportError::MalformedFrame("Unknown TLV frame type")),
         }
     }
 }
@@ -756,74 +697,80 @@ mod tests {
     #[test]
     fn test_ack_frame_roundtrip() {
         let mut ranges = [AckRange::default(); MAX_ACK_RANGES];
-        ranges[0] = AckRange { gap: 0, length: 5 };
-        ranges[1] = AckRange { gap: 2, length: 10 };
+        ranges[0] = AckRange { gap: 0, length: 10 };
+        ranges[1] = AckRange { gap: 2, length: 5 };
 
         let frame = Frame::Ack {
-            largest_acked: PacketNumber(1050),
+            largest_acked: PacketNumber(100),
             ack_delay_us: 1500,
             ranges,
             range_count: 2,
-            ect0_count: 100,
+            ect0_count: 50,
             ect1_count: 0,
             ce_count: 2,
         };
 
-        let mut buf = [0u8; 128];
+        let mut buf = [0u8; 256];
         let len = frame.encode(&mut buf).unwrap();
         let (decoded, consumed) = Frame::decode(&buf[..len]).unwrap();
-        assert_eq!(consumed, len);
+
+        assert_eq!(len, consumed);
         assert_eq!(frame, decoded);
     }
 
     #[test]
     fn test_data_and_reliable_frames_roundtrip() {
-        let payload = b"game_snapshot_data_12345";
+        let payload = b"hello_gameplay_state";
         let data_frame = Frame::Data {
-            message_id: MessageId(99),
-            state_key: StateKey::new(101, 1),
+            message_id: MessageId(1234),
+            state_key: StateKey::new(10, 2),
             sequence: StateSequence(50),
-            generation: GenerationId(4),
+            generation: GenerationId(1),
             deadline_ms: 100,
             payload,
         };
 
-        let mut buf = [0u8; 128];
+        let mut buf = [0u8; 256];
         let len = data_frame.encode(&mut buf).unwrap();
         let (decoded, consumed) = Frame::decode(&buf[..len]).unwrap();
-        assert_eq!(consumed, len);
+        assert_eq!(len, consumed);
         assert_eq!(data_frame, decoded);
 
         let reliable_frame = Frame::ReliableData {
-            message_id: MessageId(100),
+            message_id: MessageId(9999),
             fragment_id: FragmentId(0),
             total_fragments: 1,
-            group_id: OrderedGroupId(3),
-            order_seq: 15,
+            group_id: OrderedGroupId(5),
+            order_seq: 42,
             payload,
         };
 
         let len2 = reliable_frame.encode(&mut buf).unwrap();
         let (decoded2, consumed2) = Frame::decode(&buf[..len2]).unwrap();
-        assert_eq!(consumed2, len2);
+        assert_eq!(len2, consumed2);
         assert_eq!(reliable_frame, decoded2);
     }
 
     #[test]
     fn test_control_frames_roundtrip() {
-        let mut buf = [0u8; 128];
+        let mut buf = [0u8; 256];
 
-        let ping = Frame::Ping { nonce: 0xDEADBEEFCAFEBABE };
+        let ping = Frame::Ping { nonce: 0xCAFEBABE };
         let len = ping.encode(&mut buf).unwrap();
         let (decoded, _) = Frame::decode(&buf[..len]).unwrap();
         assert_eq!(ping, decoded);
 
-        let challenge = Frame::PathChallenge { data: [1, 2, 3, 4, 5, 6, 7, 8] };
+        let challenge = Frame::PathChallenge {
+            data: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
         let len = challenge.encode(&mut buf).unwrap();
         let (decoded, _) = Frame::decode(&buf[..len]).unwrap();
         assert_eq!(challenge, decoded);
 
-        let close = Frame::Close { error_code: 0x0100, reason: "Session timeout" };
+        let close = Frame::Close {
+            error_code: 0x01,
+            reason: "Server shutting down",
+        };
         let len = close.encode(&mut buf).unwrap();
         let (decoded, _) = Frame::decode(&buf[..len]).unwrap();
         assert_eq!(close, decoded);

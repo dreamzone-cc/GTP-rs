@@ -31,12 +31,16 @@ async fn main() -> Result<()> {
         .await?;
 
     // 3. Server receives message asynchronously
-    if let Some(msg) = tokio::time::timeout(std::time::Duration::from_millis(500), server_conn.recv())
-        .await
-        .ok()
-        .flatten()
+    if let Some(msg) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), server_conn.recv())
+            .await
+            .ok()
+            .flatten()
     {
-        println!("Server received payload: {}", String::from_utf8_lossy(&msg.payload));
+        println!(
+            "Server received payload: {}",
+            String::from_utf8_lossy(&msg.payload)
+        );
         assert_eq!(msg.payload, b"player_purchased_item_id_42");
     }
 

@@ -5,9 +5,9 @@ use gtp_types::Duration;
 pub struct NetworkProfile {
     pub one_way_delay: Duration,
     pub jitter: Duration,
-    pub loss_rate: f64,        // 0.0 to 1.0
-    pub duplicate_rate: f64,   // 0.0 to 1.0
-    pub reorder_rate: f64,     // 0.0 to 1.0
+    pub loss_rate: f64,      // 0.0 to 1.0
+    pub duplicate_rate: f64, // 0.0 to 1.0
+    pub reorder_rate: f64,   // 0.0 to 1.0
     pub bandwidth_bytes_per_sec: u64,
 }
 

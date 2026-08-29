@@ -3,7 +3,12 @@ use gtp_types::{Duration, MonotonicTime, PacketNumber};
 
 /// Generic interface implemented by all GTP congestion control algorithms.
 pub trait CongestionController: Send + Sync {
-    fn on_packet_sent(&mut self, packet_number: PacketNumber, bytes: usize, send_time: MonotonicTime);
+    fn on_packet_sent(
+        &mut self,
+        packet_number: PacketNumber,
+        bytes: usize,
+        send_time: MonotonicTime,
+    );
     fn on_ack(&mut self, ack_event: &AckEvent, now: MonotonicTime);
     fn on_loss(&mut self, loss_event: &LossEvent, now: MonotonicTime);
     fn on_ecn(&mut self, ce_count: u32, now: MonotonicTime);

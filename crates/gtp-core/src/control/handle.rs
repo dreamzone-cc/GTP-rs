@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use crate::control::config::GtpConfig;
 use crate::control::events::ControlEvent;
 use crate::control::metrics::DetailedMetrics;
@@ -8,6 +7,7 @@ use gtp_path::ConnectionState;
 use gtp_scheduler::SchedulableItem;
 use gtp_types::{MessageClass, MessageId, MonotonicTime, PriorityTier, Result};
 use gtp_wire::Frame;
+use std::net::SocketAddr;
 
 /// Dedicated control handle providing full administrative and tuning access to an active GTP connection.
 pub struct ConnectionControl<'a> {
@@ -67,8 +67,15 @@ impl<'a> ConnectionControl<'a> {
     }
 
     /// Trigger path validation and migration to a new remote address.
-    pub fn trigger_path_challenge(&mut self, new_addr: SocketAddr, nonce: [u8; 8], now: MonotonicTime) -> Result<()> {
-        self.hot.path_validator.start_challenge(new_addr, nonce, now);
+    pub fn trigger_path_challenge(
+        &mut self,
+        new_addr: SocketAddr,
+        nonce: [u8; 8],
+        now: MonotonicTime,
+    ) -> Result<()> {
+        self.hot
+            .path_validator
+            .start_challenge(new_addr, nonce, now);
 
         let frame = Frame::PathChallenge { data: nonce };
         let mut buf = [0u8; 16];
@@ -88,7 +95,12 @@ impl<'a> ConnectionControl<'a> {
     }
 
     /// Enqueue an MTU probe frame to test Path MTU expansion.
-    pub fn trigger_mtu_probe(&mut self, probe_id: u32, target_size: usize, now: MonotonicTime) -> Result<()> {
+    pub fn trigger_mtu_probe(
+        &mut self,
+        probe_id: u32,
+        target_size: usize,
+        now: MonotonicTime,
+    ) -> Result<()> {
         let frame = Frame::MtuProbe {
             probe_id,
             padding_len: target_size.saturating_sub(32),
@@ -129,7 +141,12 @@ impl<'a> ConnectionControl<'a> {
     }
 
     /// Initiate graceful session closing by emitting a CLOSE frame and transitioning to Draining.
-    pub fn graceful_close(&mut self, error_code: u16, reason: &'static str, now: MonotonicTime) -> Result<()> {
+    pub fn graceful_close(
+        &mut self,
+        error_code: u16,
+        reason: &'static str,
+        now: MonotonicTime,
+    ) -> Result<()> {
         let old_state = self.hot.state;
         self.hot.state.transition_to(ConnectionState::Draining)?;
         self.event_queue.push(ControlEvent::StateChanged {
@@ -198,6 +215,7 @@ impl<'a> ConnectionControl<'a> {
             total_tx_bytes: self.cold.total_tx_bytes,
             total_rx_bytes: self.cold.total_rx_bytes,
             total_retransmissions: self.cold.total_retransmissions,
+            total_corrupted_packets: self.cold.total_corrupted_packets,
             pto_count: self.hot.loss_detector.pto_count,
 
             ecn_ect0_count: 0,

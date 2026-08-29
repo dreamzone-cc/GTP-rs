@@ -94,11 +94,7 @@ impl CubicCongestionController {
 
         // K = cbrt(w_max * (1 - beta) / (C * SMSS))
         let w_diff = (self.w_max as f64 * (1.0 - BETA_CUBIC)) / (C_CUBIC * self.smss as f64);
-        self.k = if w_diff > 0.0 {
-            w_diff.cbrt()
-        } else {
-            0.0
-        };
+        self.k = if w_diff > 0.0 { w_diff.cbrt() } else { 0.0 };
 
         self.epoch_start = Some(now);
     }

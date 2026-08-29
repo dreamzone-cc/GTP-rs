@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use gtp_types::{OrderedGroupId, Result, TransportError};
+use std::collections::BTreeMap;
 
 pub const DEFAULT_MAX_GROUP_BUFFER_BYTES: usize = 256 * 1024; // 256 KB per group
 
@@ -39,7 +39,8 @@ impl OrderedGroupReceiver {
 
             // Drain any contiguous buffered items
             while let Some(buffered) = self.reorder_buffer.remove(&self.next_expected) {
-                self.current_buffer_bytes = self.current_buffer_bytes.saturating_sub(buffered.len());
+                self.current_buffer_bytes =
+                    self.current_buffer_bytes.saturating_sub(buffered.len());
                 ready.push(buffered);
                 self.next_expected += 1;
             }
@@ -51,9 +52,11 @@ impl OrderedGroupReceiver {
                 ));
             }
 
-            if !self.reorder_buffer.contains_key(&order_seq) {
+            if let std::collections::btree_map::Entry::Vacant(e) =
+                self.reorder_buffer.entry(order_seq)
+            {
                 self.current_buffer_bytes += payload.len();
-                self.reorder_buffer.insert(order_seq, payload.to_vec());
+                e.insert(payload.to_vec());
             }
         }
 

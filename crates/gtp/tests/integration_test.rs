@@ -15,18 +15,19 @@ fn test_gtp_library_end_to_end_integration() {
         GtpConfig::competitive_fps(),
     );
 
-    let mut server = GtpConnection::new_with_config(
-        cid,
-        client_addr,
-        true,
-        GtpConfig::competitive_fps(),
-    );
+    let mut server =
+        GtpConnection::new_with_config(cid, client_addr, true, GtpConfig::competitive_fps());
 
     let now = MonotonicTime::from_micros(1_000_000);
 
     // 2. Client sends 4 distinct message semantics through the public library API
     let msg_unreliable = client
-        .send_unreliable(b"client_input_vector".to_vec(), PriorityTier::P1Input, None, now)
+        .send_unreliable(
+            b"client_input_vector".to_vec(),
+            PriorityTier::P1Input,
+            None,
+            now,
+        )
         .expect("Failed to send unreliable input");
 
     let msg_sequenced = client

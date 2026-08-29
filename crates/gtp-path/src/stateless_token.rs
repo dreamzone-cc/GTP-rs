@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
 use gtp_types::{Duration, MonotonicTime};
+use std::net::SocketAddr;
 
 pub const TOKEN_LIFETIME: Duration = Duration::from_secs(10);
 
@@ -23,7 +23,10 @@ impl StatelessTokenManager {
         // Lightweight hash mixing secret + addr + timestamp
         for (i, b) in cookie.iter_mut().enumerate() {
             let secret_byte = self.secret[i % 32];
-            let addr_byte = addr_bytes.get(i % addr_bytes.len().max(1)).copied().unwrap_or(0);
+            let addr_byte = addr_bytes
+                .get(i % addr_bytes.len().max(1))
+                .copied()
+                .unwrap_or(0);
             let ts_byte = ts_bytes[i % 8];
             *b = secret_byte ^ addr_byte.wrapping_add(ts_byte).wrapping_add(i as u8);
         }

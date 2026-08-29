@@ -46,15 +46,15 @@
 //! }
 //! ```
 
+pub use gtp_cc as cc;
+pub use gtp_core as core;
+pub use gtp_crypto as crypto;
+pub use gtp_io as io;
+pub use gtp_path as path;
+pub use gtp_recovery as recovery;
+pub use gtp_scheduler as scheduler;
 pub use gtp_types as types;
 pub use gtp_wire as wire;
-pub use gtp_recovery as recovery;
-pub use gtp_cc as cc;
-pub use gtp_scheduler as scheduler;
-pub use gtp_path as path;
-pub use gtp_crypto as crypto;
-pub use gtp_core as core;
-pub use gtp_io as io;
 
 #[cfg(feature = "tokio")]
 pub use gtp_runtime_tokio as runtime;
@@ -83,8 +83,8 @@ pub use gtp_sim::{NetworkProfile, SimulationRunner};
 /// Common imports and traits for game engine integration.
 pub mod prelude {
     pub use gtp_core::{
-        ConnectionControl, ControlEvent, DetailedMetrics, GtpConfig, GtpConfigBuilder, GtpConnection,
-        NetworkFeedback, ReceivedMessage,
+        ConnectionControl, ControlEvent, DetailedMetrics, GtpConfig, GtpConfigBuilder,
+        GtpConnection, NetworkFeedback, ReceivedMessage,
     };
     pub use gtp_types::{
         ConnectionId, Duration, FragmentId, GenerationId, MessageClass, MessageId, MonotonicTime,

@@ -40,8 +40,13 @@ fn main() -> Result<()> {
 
         // Produce outgoing datagrams for network transmission
         let mut out_buffer = [0u8; 1500];
-        while let Some((dest, len)) = conn.produce_outgoing_datagram(current_time, &mut out_buffer)? {
-            println!("Tick #{}: Transmitted {} bytes datagram to {}", tick, len, dest);
+        while let Some((dest, len)) =
+            conn.produce_outgoing_datagram(current_time, &mut out_buffer)?
+        {
+            println!(
+                "Tick #{}: Transmitted {} bytes datagram to {}",
+                tick, len, dest
+            );
         }
     }
 
@@ -49,8 +54,14 @@ fn main() -> Result<()> {
     let metrics = conn.control().query_metrics(current_time);
     println!("\n--- GTP Diagnostics ---");
     println!("Total Packets Transmitted: {}", metrics.total_tx_packets);
-    println!("Total Bytes Transmitted:   {} bytes", metrics.total_tx_bytes);
-    println!("Pacing Rate:               {} bytes/sec", metrics.pacing_rate_bps);
+    println!(
+        "Total Bytes Transmitted:   {} bytes",
+        metrics.total_tx_bytes
+    );
+    println!(
+        "Pacing Rate:               {} bytes/sec",
+        metrics.pacing_rate_bps
+    );
     println!("Engine Backpressure:       {:?}", metrics.backpressure);
 
     println!("\nGTP library game loop example executed successfully.");

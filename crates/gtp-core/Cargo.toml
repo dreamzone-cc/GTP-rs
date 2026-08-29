@@ -13,6 +13,7 @@ gtp-cc = { workspace = true }
 gtp-scheduler = { workspace = true }
 gtp-path = { workspace = true }
 gtp-crypto = { workspace = true }
+rustc-hash = { workspace = true }
 
 [features]
 default = ["std"]

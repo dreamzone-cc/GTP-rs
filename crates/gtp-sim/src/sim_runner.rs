@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
 use crate::impairments::NetworkProfile;
 use crate::simulated_network::SimulatedNetwork;
 use gtp_core::{GtpConnection, ReceivedMessage};
 use gtp_types::{ConnectionId, Duration, MonotonicTime};
+use std::net::SocketAddr;
 
 /// Deterministic stepping simulation testbed for GTP protocol verification.
 pub struct SimulationRunner {
@@ -47,24 +47,32 @@ impl SimulationRunner {
         let mut out_buf = [0u8; 1500];
         while let Ok(Some((dest, len))) = self.client.produce_outgoing_datagram(now, &mut out_buf) {
             let data = out_buf[..len].to_vec();
-            self.network.transmit(self.client_addr, dest, data, now, &self.profile);
+            self.network
+                .transmit(self.client_addr, dest, data, now, &self.profile);
         }
 
         // 2. Server produce outgoing datagrams -> send to simulated network
         while let Ok(Some((dest, len))) = self.server.produce_outgoing_datagram(now, &mut out_buf) {
             let data = out_buf[..len].to_vec();
-            self.network.transmit(self.server_addr, dest, data, now, &self.profile);
+            self.network
+                .transmit(self.server_addr, dest, data, now, &self.profile);
         }
 
         // 3. Drain and deliver arrived packets from simulated network
         let delivered_packets = self.network.drain_ready(now);
         for mut pkt in delivered_packets {
             if pkt.dest == self.server_addr {
-                if let Ok(msgs) = self.server.handle_incoming_datagram(pkt.src, &mut pkt.data, now) {
+                if let Ok(msgs) = self
+                    .server
+                    .handle_incoming_datagram(pkt.src, &mut pkt.data, now)
+                {
                     server_received.extend(msgs);
                 }
             } else if pkt.dest == self.client_addr {
-                if let Ok(msgs) = self.client.handle_incoming_datagram(pkt.src, &mut pkt.data, now) {
+                if let Ok(msgs) = self
+                    .client
+                    .handle_incoming_datagram(pkt.src, &mut pkt.data, now)
+                {
                     client_received.extend(msgs);
                 }
             }
@@ -74,7 +82,11 @@ impl SimulationRunner {
     }
 
     /// Run simulation loop for specified duration.
-    pub fn run_for(&mut self, duration: Duration, step_size: Duration) -> (Vec<ReceivedMessage>, Vec<ReceivedMessage>) {
+    pub fn run_for(
+        &mut self,
+        duration: Duration,
+        step_size: Duration,
+    ) -> (Vec<ReceivedMessage>, Vec<ReceivedMessage>) {
         let mut all_client = Vec::new();
         let mut all_server = Vec::new();
         let end_time = self.current_time + duration;
@@ -114,7 +126,8 @@ mod tests {
         }
 
         // Run simulation for 3 seconds with 1ms time slices
-        let (_client_msgs, server_msgs) = runner.run_for(Duration::from_secs(3), Duration::from_millis(1));
+        let (_client_msgs, server_msgs) =
+            runner.run_for(Duration::from_secs(3), Duration::from_millis(1));
 
         // Server MUST receive all 10 messages in exact in-order sequence despite 20% loss!
         assert_eq!(server_msgs.len(), 10);

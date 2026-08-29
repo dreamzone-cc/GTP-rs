@@ -1,7 +1,7 @@
-use std::net::SocketAddr;
 use gtp_cc::BackpressureLevel;
 use gtp_path::ConnectionState;
 use gtp_types::{FragmentId, MessageId};
+use std::net::SocketAddr;
 
 /// Strongly typed protocol events emitted for game engine hooks and telemetry observers.
 /// Designed for easy future expansion as new protocol features are added.
@@ -34,25 +34,13 @@ pub enum ControlEvent {
         fragment_id: FragmentId,
     },
     /// Probe Timeout (PTO) timer expired, triggering retransmission sweeps.
-    PtoTriggered {
-        pto_count: u32,
-        inflight_bytes: u64,
-    },
+    PtoTriggered { pto_count: u32, inflight_bytes: u64 },
     /// Path MTU discovery updated the effective packet size.
-    MtuUpdated {
-        new_mtu: usize,
-    },
+    MtuUpdated { new_mtu: usize },
     /// Cryptographic key phase rotated for forward secrecy.
-    KeyPhaseRotated {
-        new_phase: bool,
-    },
+    KeyPhaseRotated { new_phase: bool },
     /// Explicit Congestion Notification (ECN CE) received from network routers.
-    EcnExperienced {
-        ce_count: u32,
-    },
+    EcnExperienced { ce_count: u32 },
     /// Extensible custom hook for future experimental or custom protocol features.
-    CustomExtensionEvent {
-        extension_id: u16,
-        payload: Vec<u8>,
-    },
+    CustomExtensionEvent { extension_id: u16, payload: Vec<u8> },
 }

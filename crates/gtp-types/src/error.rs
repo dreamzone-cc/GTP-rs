@@ -7,6 +7,9 @@ pub enum TransportError {
     BufferTooShort,
     BufferOverflow,
     AuthenticationFailed,
+    CryptoFailure,
+    TruncatedFrame { needed: usize, available: usize },
+    MalformedFrame(&'static str),
     ReplayDetected,
     ProtocolViolation(&'static str),
     ResourceLimitExceeded(&'static str),
@@ -24,6 +27,15 @@ impl fmt::Display for TransportError {
             Self::BufferTooShort => write!(f, "Buffer too short"),
             Self::BufferOverflow => write!(f, "Buffer overflow"),
             Self::AuthenticationFailed => write!(f, "AEAD authentication failed"),
+            Self::CryptoFailure => write!(f, "Cryptographic operation failed"),
+            Self::TruncatedFrame { needed, available } => {
+                write!(
+                    f,
+                    "Truncated frame: needed {} bytes, available {}",
+                    needed, available
+                )
+            }
+            Self::MalformedFrame(reason) => write!(f, "Malformed frame: {}", reason),
             Self::ReplayDetected => write!(f, "Replayed packet rejected"),
             Self::ProtocolViolation(reason) => write!(f, "Protocol violation: {}", reason),
             Self::ResourceLimitExceeded(reason) => write!(f, "Resource limit exceeded: {}", reason),

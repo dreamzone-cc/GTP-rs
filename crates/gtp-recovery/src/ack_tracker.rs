@@ -103,7 +103,8 @@ impl AckTracker {
                 return;
             }
             if pn > interval.end {
-                self.intervals.insert(i, PacketInterval { start: pn, end: pn });
+                self.intervals
+                    .insert(i, PacketInterval { start: pn, end: pn });
                 return;
             }
             i += 1;
@@ -155,7 +156,10 @@ impl AckTracker {
             // First range: Largest Acked down to first interval start
             let first = self.intervals[0];
             let first_len = (first.end - first.start) as u32;
-            ranges[0] = AckRange { gap: 0, length: first_len };
+            ranges[0] = AckRange {
+                gap: 0,
+                length: first_len,
+            };
             range_count = 1;
 
             let mut prev_start = first.start;
@@ -200,7 +204,13 @@ mod tests {
         assert!(tracker.should_send_ack(now));
 
         let ack = tracker.generate_ack_frame(now).unwrap();
-        if let Frame::Ack { largest_acked, range_count, ranges, .. } = ack {
+        if let Frame::Ack {
+            largest_acked,
+            range_count,
+            ranges,
+            ..
+        } = ack
+        {
             assert_eq!(largest_acked, PacketNumber(2));
             assert_eq!(range_count, 1);
             assert_eq!(ranges[0].gap, 0);
@@ -221,7 +231,13 @@ mod tests {
         assert!(tracker.should_send_ack(now)); // Gap triggers immediate ACK
 
         let ack = tracker.generate_ack_frame(now).unwrap();
-        if let Frame::Ack { largest_acked, range_count, ranges, .. } = ack {
+        if let Frame::Ack {
+            largest_acked,
+            range_count,
+            ranges,
+            ..
+        } = ack
+        {
             assert_eq!(largest_acked, PacketNumber(3));
             assert_eq!(range_count, 2);
             assert_eq!(ranges[0].length, 0); // [3]

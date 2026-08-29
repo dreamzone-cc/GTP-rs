@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use gtp_types::{GenerationId, MessageId, StateKey, StateSequence};
+use std::collections::HashMap;
 
 /// Tracks latest state generation and sequence per StateKey to manage automatic supersession.
 #[derive(Clone, Debug, Default)]
@@ -37,7 +37,8 @@ impl StateTable {
     ) -> Option<MessageId> {
         let key_u48 = key.to_u48();
         if let Some(&(curr_gen, curr_seq, old_msg_id)) = self.entries.get(&key_u48) {
-            let is_newer = gen.is_newer_than(curr_gen) || (gen == curr_gen && seq.is_newer_than(curr_seq));
+            let is_newer =
+                gen.is_newer_than(curr_gen) || (gen == curr_gen && seq.is_newer_than(curr_seq));
             if is_newer {
                 self.entries.insert(key_u48, (gen, seq, msg_id));
                 Some(old_msg_id)

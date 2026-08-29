@@ -187,7 +187,10 @@ pub struct StateKey {
 
 impl StateKey {
     pub const fn new(entity_id: u32, state_type: u16) -> Self {
-        Self { entity_id, state_type }
+        Self {
+            entity_id,
+            state_type,
+        }
     }
 
     pub fn to_u48(self) -> u64 {
@@ -204,7 +207,11 @@ impl StateKey {
 
 impl fmt::Debug for StateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "StateKey(entity: {}, type: {})", self.entity_id, self.state_type)
+        write!(
+            f,
+            "StateKey(entity: {}, type: {})",
+            self.entity_id, self.state_type
+        )
     }
 }
 

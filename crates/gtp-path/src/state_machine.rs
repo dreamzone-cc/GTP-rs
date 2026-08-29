@@ -40,7 +40,9 @@ impl ConnectionState {
                 *self = next;
                 Ok(())
             }
-            (_current, _invalid) => Err(TransportError::ProtocolViolation("Illegal state transition")),
+            (_current, _invalid) => Err(TransportError::ProtocolViolation(
+                "Illegal state transition",
+            )),
         }
     }
 }
@@ -62,6 +64,8 @@ mod tests {
 
         // Invalid jump from Closed to Established
         let mut closed_state = ConnectionState::Closed;
-        assert!(closed_state.transition_to(ConnectionState::Established).is_err());
+        assert!(closed_state
+            .transition_to(ConnectionState::Established)
+            .is_err());
     }
 }

@@ -170,9 +170,10 @@ impl PacketHeader {
 
         let mut offset = 1;
         let version = if is_long {
-            let ver = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
+            let mut ver_bytes = [0u8; 4];
+            ver_bytes.copy_from_slice(&buf[offset..offset + 4]);
             offset += 4;
-            Some(ver)
+            Some(u32::from_be_bytes(ver_bytes))
         } else {
             None
         };
@@ -184,18 +185,24 @@ impl PacketHeader {
             return Err(TransportError::InvalidPacket("Invalid header length"));
         }
 
-        let cid = ConnectionId::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
+        let mut cid_bytes = [0u8; 8];
+        cid_bytes.copy_from_slice(&buf[offset..offset + 8]);
+        let cid = ConnectionId::from_be_bytes(cid_bytes);
         offset += 8;
 
-        let pkt_num = PacketNumber::from_u64(u64::from_be_bytes(
-            buf[offset..offset + 8].try_into().unwrap(),
-        ));
+        let mut pn_bytes = [0u8; 8];
+        pn_bytes.copy_from_slice(&buf[offset..offset + 8]);
+        let pkt_num = PacketNumber::from_u64(u64::from_be_bytes(pn_bytes));
         offset += 8;
 
-        let ts = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
+        let mut ts_bytes = [0u8; 4];
+        ts_bytes.copy_from_slice(&buf[offset..offset + 4]);
+        let ts = u32::from_be_bytes(ts_bytes);
         offset += 4;
 
-        let payload_len = u16::from_be_bytes(buf[offset..offset + 2].try_into().unwrap());
+        let mut len_bytes = [0u8; 2];
+        len_bytes.copy_from_slice(&buf[offset..offset + 2]);
+        let payload_len = u16::from_be_bytes(len_bytes);
         let _ = offset; // suppress unused assignment
 
         // Skip any future extension bytes up to header_len

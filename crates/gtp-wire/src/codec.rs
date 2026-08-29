@@ -69,7 +69,9 @@ impl<'a> PacketBuilder<'a> {
     }
 
     pub fn remaining_capacity(&self) -> usize {
-        self.buf.len().saturating_sub(self.header_len + self.payload_len)
+        self.buf
+            .len()
+            .saturating_sub(self.header_len + self.payload_len)
     }
 
     pub fn append_frame(&mut self, frame: &Frame<'_>) -> Result<()> {
@@ -139,7 +141,8 @@ mod tests {
         assert!(total_packet_bytes > crate::header::MIN_COMMON_HEADER_LEN);
 
         // Decode packet
-        let (decoded_hdr, consumed_hdr) = PacketHeader::decode(&buffer[..total_packet_bytes]).unwrap();
+        let (decoded_hdr, consumed_hdr) =
+            PacketHeader::decode(&buffer[..total_packet_bytes]).unwrap();
         assert_eq!(decoded_hdr.connection_id, ConnectionId(0x1234567890ABCDEF));
         assert_eq!(decoded_hdr.packet_number, PacketNumber(500));
         assert!(decoded_hdr.flags.has_ack());

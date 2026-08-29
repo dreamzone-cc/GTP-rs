@@ -29,6 +29,7 @@ pub struct DetailedMetrics {
     pub total_tx_bytes: u64,
     pub total_rx_bytes: u64,
     pub total_retransmissions: u64,
+    pub total_corrupted_packets: u64,
     pub pto_count: u32,
 
     // --- ECN Signals ---

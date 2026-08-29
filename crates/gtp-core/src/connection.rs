@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use crate::api::{NetworkFeedback, ReceivedMessage};
 use crate::control::{ConnectionControl, ControlEvent, GtpConfig};
 use crate::state::{ConnectionCold, ConnectionHot};
@@ -6,11 +5,11 @@ use gtp_cc::{calculate_backpressure, BackpressureLevel, CongestionController};
 use gtp_recovery::{RetransmissionRecord, SentPacketRecord};
 use gtp_scheduler::{OrderedGroupReceiver, SchedulableItem};
 use gtp_types::{
-    ConnectionId, FragmentId, GenerationId, MessageClass, MessageId, MonotonicTime,
-    OrderedGroupId, PriorityTier, Result, StateKey, StateSequence, TransmissionId,
-    TransportError,
+    ConnectionId, FragmentId, GenerationId, MessageClass, MessageId, MonotonicTime, OrderedGroupId,
+    PriorityTier, Result, StateKey, StateSequence, TransmissionId, TransportError,
 };
 use gtp_wire::{Frame, FrameIterator, PacketBuilder, PacketHeader, MIN_COMMON_HEADER_LEN};
+use std::net::SocketAddr;
 
 /// High-level Game Transport Protocol Connection Engine with dedicated Control API.
 pub struct GtpConnection {
@@ -161,7 +160,11 @@ impl GtpConnection {
         let msg_id = MessageId(self.hot.next_message_id);
         self.hot.next_message_id += 1;
 
-        let order_seq = self.hot.next_order_seqs.entry(group_id.as_u16()).or_insert(0);
+        let order_seq = self
+            .hot
+            .next_order_seqs
+            .entry(group_id.as_u16())
+            .or_insert(0);
         let current_order_seq = *order_seq;
         *order_seq += 1;
 
@@ -194,7 +197,9 @@ impl GtpConnection {
     ) -> Result<Vec<ReceivedMessage>> {
         self.cold.total_rx_packets += 1;
         self.cold.total_rx_bytes += datagram.len() as u64;
-        self.hot.anti_amplification.on_bytes_received(datagram.len());
+        self.hot
+            .anti_amplification
+            .on_bytes_received(datagram.len());
 
         // 1. Decode Packet Header
         let (header, header_consumed) = PacketHeader::decode(datagram)?;
@@ -205,16 +210,26 @@ impl GtpConnection {
         }
 
         // 3. Replay Protection Window
-        self.hot.replay_window.check_and_update(header.packet_number)?;
+        self.hot
+            .replay_window
+            .check_and_update(header.packet_number)?;
 
         // 4. Decrypt & Authenticate Payload
         let (aad_slice, encrypted_payload) = datagram.split_at_mut(header_consumed);
-        let decrypted_len = self.hot.protector.open(
+        let ciphertext_len = encrypted_payload.len();
+        let decrypted_len = match self.hot.protector.open(
             header.packet_number,
             header.connection_id,
             aad_slice,
             encrypted_payload,
-        )?;
+            ciphertext_len,
+        ) {
+            Ok(len) => len,
+            Err(e) => {
+                self.cold.total_corrupted_packets += 1;
+                return Err(e);
+            }
+        };
 
         let decrypted_slice = &encrypted_payload[..decrypted_len];
         let mut delivered_messages = Vec::new();
@@ -222,7 +237,13 @@ impl GtpConnection {
 
         // 5. Frame Dispatch Loop
         for frame_res in FrameIterator::new(decrypted_slice) {
-            let frame = frame_res?;
+            let frame = match frame_res {
+                Ok(f) => f,
+                Err(_) => {
+                    self.cold.total_corrupted_packets += 1;
+                    break;
+                }
+            };
             if frame.is_ack_eliciting() {
                 is_ack_eliciting = true;
             }
@@ -256,10 +277,11 @@ impl GtpConnection {
                     // Re-enqueue lost reliable frames for retransmission
                     for retrans in loss_ev.retransmittable {
                         self.cold.total_retransmissions += 1;
-                        self.event_queue.push(ControlEvent::RetransmissionTriggered {
-                            message_id: retrans.message_id,
-                            fragment_id: retrans.fragment_id,
-                        });
+                        self.event_queue
+                            .push(ControlEvent::RetransmissionTriggered {
+                                message_id: retrans.message_id,
+                                fragment_id: retrans.fragment_id,
+                            });
 
                         let item = SchedulableItem {
                             message_id: retrans.message_id,
@@ -331,10 +353,7 @@ impl GtpConnection {
                     }
                 }
 
-                Frame::Retx {
-                    payload,
-                    ..
-                } => {
+                Frame::Retx { payload, .. } => {
                     delivered_messages.push(ReceivedMessage {
                         class: MessageClass::ReliableUnordered,
                         payload: payload.to_vec(),
@@ -363,7 +382,11 @@ impl GtpConnection {
                 }
 
                 Frame::PathResponse { data } => {
-                    if self.hot.path_validator.validate_response(src_addr, &data, now) {
+                    if self
+                        .hot
+                        .path_validator
+                        .validate_response(src_addr, &data, now)
+                    {
                         let old_addr = self.hot.active_path;
                         self.hot.active_path = src_addr;
                         self.event_queue.push(ControlEvent::PathMigrated {
@@ -379,13 +402,17 @@ impl GtpConnection {
                     reorder_threshold,
                 } => {
                     self.config.ack_frequency_packets = ack_frequency_packets;
-                    self.config.max_ack_delay = gtp_types::Duration::from_millis(max_ack_delay_ms as u64);
+                    self.config.max_ack_delay =
+                        gtp_types::Duration::from_millis(max_ack_delay_ms as u64);
                     self.config.ack_reorder_threshold = reorder_threshold;
                 }
 
                 Frame::Close { error_code, .. } => {
                     let old_state = self.hot.state;
-                    let _ = self.hot.state.transition_to(gtp_path::ConnectionState::Closed);
+                    let _ = self
+                        .hot
+                        .state
+                        .transition_to(gtp_path::ConnectionState::Closed);
                     self.event_queue.push(ControlEvent::StateChanged {
                         old_state,
                         new_state: gtp_path::ConnectionState::Closed,
@@ -428,7 +455,9 @@ impl GtpConnection {
         now: MonotonicTime,
         out_buf: &mut [u8],
     ) -> Result<Option<(SocketAddr, usize)>> {
-        if !self.hot.state.is_active() && !matches!(self.hot.state, gtp_path::ConnectionState::Handshaking) {
+        if !self.hot.state.is_active()
+            && !matches!(self.hot.state, gtp_path::ConnectionState::Handshaking)
+        {
             return Ok(None);
         }
 
@@ -446,10 +475,11 @@ impl GtpConnection {
 
                 for retrans in loss_ev.retransmittable {
                     self.cold.total_retransmissions += 1;
-                    self.event_queue.push(ControlEvent::RetransmissionTriggered {
-                        message_id: retrans.message_id,
-                        fragment_id: retrans.fragment_id,
-                    });
+                    self.event_queue
+                        .push(ControlEvent::RetransmissionTriggered {
+                            message_id: retrans.message_id,
+                            fragment_id: retrans.fragment_id,
+                        });
 
                     let item = SchedulableItem {
                         message_id: retrans.message_id,
@@ -564,7 +594,10 @@ impl GtpConnection {
                             payload: item.payload,
                         });
                     }
-                    MessageClass::ReliableOrdered { group_id, order_seq } => {
+                    MessageClass::ReliableOrdered {
+                        group_id,
+                        order_seq,
+                    } => {
                         let frame = Frame::ReliableData {
                             message_id: item.message_id,
                             fragment_id: FragmentId(0),
@@ -614,7 +647,9 @@ impl GtpConnection {
         if !self.hot.anti_amplification.can_send(total_datagram_len) {
             return Ok(None);
         }
-        self.hot.anti_amplification.on_bytes_sent(total_datagram_len);
+        self.hot
+            .anti_amplification
+            .on_bytes_sent(total_datagram_len);
 
         // 7. Record In-Flight and CC Telemetry
         let sent_record = SentPacketRecord {
@@ -644,12 +679,8 @@ impl GtpConnection {
     pub fn feedback(&self, now: MonotonicTime) -> NetworkFeedback {
         let rtt = self.hot.loss_detector.rtt_stats;
         let eff_queue = self.hot.scheduler.effective_queue_bytes(now);
-        let backpressure = calculate_backpressure(
-            eff_queue,
-            self.hot.cc.cwnd(),
-            rtt.smoothed_rtt,
-            rtt.min_rtt,
-        );
+        let backpressure =
+            calculate_backpressure(eff_queue, self.hot.cc.cwnd(), rtt.smoothed_rtt, rtt.min_rtt);
 
         NetworkFeedback {
             rtt: rtt.latest_rtt,
@@ -681,18 +712,36 @@ mod tests {
         let now = MonotonicTime::from_micros(1_000_000);
 
         // 1. Client enqueues unreliable and reliable messages
-        let _ = client.send_unreliable(b"client_input".to_vec(), PriorityTier::P1Input, None, now).unwrap();
-        let _ = client.send_reliable_unordered(b"player_damage".to_vec(), PriorityTier::P3ReliableGameplay, None, now).unwrap();
+        let _ = client
+            .send_unreliable(b"client_input".to_vec(), PriorityTier::P1Input, None, now)
+            .unwrap();
+        let _ = client
+            .send_reliable_unordered(
+                b"player_damage".to_vec(),
+                PriorityTier::P3ReliableGameplay,
+                None,
+                now,
+            )
+            .unwrap();
 
         // 2. Client produces outgoing datagram
         let mut out_buffer = [0u8; 1500];
-        let (dest, len) = client.produce_outgoing_datagram(now, &mut out_buffer).unwrap().unwrap();
+        let (dest, len) = client
+            .produce_outgoing_datagram(now, &mut out_buffer)
+            .unwrap()
+            .unwrap();
         assert_eq!(dest, server_addr);
         assert!(len > MIN_COMMON_HEADER_LEN);
 
         // 3. Server receives and parses datagram
         let mut in_buffer = out_buffer;
-        let delivered = server.handle_incoming_datagram(client_addr, &mut in_buffer[..len], now + Duration::from_millis(10)).unwrap();
+        let delivered = server
+            .handle_incoming_datagram(
+                client_addr,
+                &mut in_buffer[..len],
+                now + Duration::from_millis(10),
+            )
+            .unwrap();
 
         assert_eq!(delivered.len(), 2);
         assert_eq!(delivered[0].payload, b"client_input");
@@ -704,12 +753,8 @@ mod tests {
         let server_addr: SocketAddr = "127.0.0.1:6000".parse().unwrap();
         let cid = ConnectionId(0x9988776655443322);
 
-        let mut conn = GtpConnection::new_with_config(
-            cid,
-            server_addr,
-            true,
-            GtpConfig::competitive_fps(),
-        );
+        let mut conn =
+            GtpConnection::new_with_config(cid, server_addr, true, GtpConfig::competitive_fps());
 
         let now = MonotonicTime::from_micros(1_000_000);
 
@@ -725,9 +770,18 @@ mod tests {
         assert_eq!(metrics.backpressure, BackpressureLevel::Low);
 
         // 4. Test Event Drain on Graceful Close
-        assert!(conn.control().graceful_close(0, "Game session ended", now).is_ok());
+        assert!(conn
+            .control()
+            .graceful_close(0, "Game session ended", now)
+            .is_ok());
         let events = conn.drain_events();
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], ControlEvent::StateChanged { new_state: gtp_path::ConnectionState::Draining, .. }));
+        assert!(matches!(
+            events[0],
+            ControlEvent::StateChanged {
+                new_state: gtp_path::ConnectionState::Draining,
+                ..
+            }
+        ));
     }
 }

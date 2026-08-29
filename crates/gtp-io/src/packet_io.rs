@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
 use gtp_types::Result;
+use std::net::SocketAddr;
 
 /// Datagram payload buffer for batch reception.
 pub const MAX_DATAGRAM_SIZE: usize = 2048;

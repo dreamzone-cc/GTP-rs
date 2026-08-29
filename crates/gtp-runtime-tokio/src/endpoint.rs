@@ -1,13 +1,14 @@
+use crate::async_connection::AsyncGtpConnection;
+use gtp_core::{GtpConnection, ReceivedMessage};
+use gtp_types::{ConnectionId, MonotonicTime, Result, TransportError};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use crate::async_connection::AsyncGtpConnection;
-use gtp_core::{GtpConnection, ReceivedMessage};
-use gtp_types::{ConnectionId, MonotonicTime, Result, TransportError};
 
-type ConnectionMap = Arc<RwLock<HashMap<ConnectionId, (Arc<Mutex<GtpConnection>>, mpsc::Sender<ReceivedMessage>)>>>;
+type ConnectionMap =
+    Arc<RwLock<HashMap<ConnectionId, (Arc<Mutex<GtpConnection>>, mpsc::Sender<ReceivedMessage>)>>>;
 
 /// Async GTP Endpoint running on top of Tokio.
 pub struct GtpEndpoint {
@@ -36,7 +37,12 @@ impl GtpEndpoint {
             .map_err(|e| TransportError::Io(e.to_string()))
     }
 
-    pub async fn connect(&self, cid: ConnectionId, peer_addr: SocketAddr, secure: bool) -> AsyncGtpConnection {
+    pub async fn connect(
+        &self,
+        cid: ConnectionId,
+        peer_addr: SocketAddr,
+        secure: bool,
+    ) -> AsyncGtpConnection {
         let (tx, rx) = mpsc::channel(1024);
         let conn = GtpConnection::new(cid, peer_addr, secure);
         let conn_arc = Arc::new(Mutex::new(conn));
@@ -69,8 +75,10 @@ impl GtpEndpoint {
                 let conns = connections.read().await;
                 for (conn_arc, tx) in conns.values() {
                     let mut guard = conn_arc.lock().await;
-                    if guard.peer_addr() == src || true {
-                        if let Ok(msgs) = guard.handle_incoming_datagram(src, &mut datagram_copy, now) {
+                    if guard.peer_addr() == src || guard.peer_addr().ip().is_unspecified() {
+                        if let Ok(msgs) =
+                            guard.handle_incoming_datagram(src, &mut datagram_copy, now)
+                        {
                             for msg in msgs {
                                 let _ = tx.send(msg).await;
                             }
@@ -97,7 +105,8 @@ impl GtpEndpoint {
                     break;
                 }
 
-                while let Ok(Some((dest, len))) = guard.produce_outgoing_datagram(now, &mut out_buf) {
+                while let Ok(Some((dest, len))) = guard.produce_outgoing_datagram(now, &mut out_buf)
+                {
                     let _ = socket.send_to(&out_buf[..len], dest).await;
                 }
             }
@@ -112,10 +121,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_endpoint_tokio_e2e() {
-        let server_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let server_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let server_addr = server_ep.local_addr().unwrap();
 
-        let client_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let client_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let client_addr = client_ep.local_addr().unwrap();
 
         let cid = ConnectionId(0x554433221100AABB);
@@ -130,10 +143,11 @@ mod tests {
             .unwrap();
 
         // Receive message on server side
-        let received = tokio::time::timeout(std::time::Duration::from_millis(500), server_conn.recv())
-            .await
-            .expect("Receive timed out")
-            .expect("Channel closed");
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(500), server_conn.recv())
+                .await
+                .expect("Receive timed out")
+                .expect("Channel closed");
 
         assert_eq!(received.payload, b"async_game_hello");
 

@@ -1,11 +1,11 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
 use gtp_core::{ControlEvent, DetailedMetrics, GtpConnection, NetworkFeedback, ReceivedMessage};
 use gtp_types::{
     ConnectionId, GenerationId, MessageId, MonotonicTime, OrderedGroupId, PriorityTier, Result,
     StateKey, StateSequence,
 };
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 
 /// High-level asynchronous GTP Connection handle for tokio applications.
 pub struct AsyncGtpConnection {
@@ -93,7 +93,12 @@ impl AsyncGtpConnection {
     ) -> Result<()> {
         let mut guard = self.conn.lock().await;
         let now = MonotonicTime::now();
-        guard.control().set_ack_frequency(ack_frequency_packets, max_ack_delay_ms, reorder_threshold, now)
+        guard.control().set_ack_frequency(
+            ack_frequency_packets,
+            max_ack_delay_ms,
+            reorder_threshold,
+            now,
+        )
     }
 
     pub async fn trigger_path_challenge(&self, new_addr: SocketAddr, nonce: [u8; 8]) -> Result<()> {

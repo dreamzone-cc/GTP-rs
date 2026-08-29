@@ -1,7 +1,7 @@
-use std::collections::BinaryHeap;
-use std::net::SocketAddr;
 use crate::impairments::NetworkProfile;
 use gtp_types::{Duration, MonotonicTime};
+use std::collections::BinaryHeap;
+use std::net::SocketAddr;
 
 #[derive(Clone, Debug)]
 pub struct SimulatedPacket {
@@ -76,8 +76,8 @@ impl SimulatedNetwork {
         let effective_delay = (base_delay_micros + jitter_micros).max(100) as u64;
 
         // 3. Serialization delay based on bandwidth
-        let serialization_micros = ((data.len() as f64 / profile.bandwidth_bytes_per_sec as f64)
-            * 1_000_000.0) as u64;
+        let serialization_micros =
+            ((data.len() as f64 / profile.bandwidth_bytes_per_sec as f64) * 1_000_000.0) as u64;
 
         let total_delay = Duration::from_micros(effective_delay + serialization_micros);
         let deliver_at = now + total_delay;

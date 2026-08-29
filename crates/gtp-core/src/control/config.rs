@@ -114,13 +114,7 @@ impl GtpConfig {
             pacing_gain: 1.20,
             max_pacing_burst_bytes: 12_000,
 
-            max_queue_bytes_per_tier: [
-                64 * 1024,
-                256 * 1024,
-                1024 * 1024,
-                1024 * 1024,
-                512 * 1024,
-            ],
+            max_queue_bytes_per_tier: [64 * 1024, 256 * 1024, 1024 * 1024, 1024 * 1024, 512 * 1024],
             tier_weights: [15, 30, 30, 20, 5],
             auto_state_supersession: true,
             enable_deadline_pruning: true,
@@ -157,13 +151,7 @@ impl GtpConfig {
             pacing_gain: 1.15,
             max_pacing_burst_bytes: 8_000,
 
-            max_queue_bytes_per_tier: [
-                64 * 1024,
-                256 * 1024,
-                512 * 1024,
-                512 * 1024,
-                128 * 1024,
-            ],
+            max_queue_bytes_per_tier: [64 * 1024, 256 * 1024, 512 * 1024, 512 * 1024, 128 * 1024],
             tier_weights: [20, 40, 25, 10, 5],
             auto_state_supersession: true,
             enable_deadline_pruning: true,

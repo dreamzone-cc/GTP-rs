@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+description = "GTP Packet Protection, AEAD (ChaCha20-Poly1305), HKDF Key Derivation, and Replay Defense"
 
 [dependencies]
 gtp-types = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
 
 [features]
 default = ["std"]
