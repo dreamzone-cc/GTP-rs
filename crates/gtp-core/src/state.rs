@@ -28,10 +28,16 @@ pub struct ConnectionHot {
     pub path_validator: PathValidator,
     pub next_message_id: u64,
     pub next_order_seqs: FxHashMap<u16, u32>,
+    pub current_session_key: [u8; 32],
+    pub packets_since_ratchet: u64,
 }
 
 impl ConnectionHot {
+    #[deprecated(
+        note = "Uses a hardcoded shared secret; use the handshake-driven GtpEndpoint::connect which derives real per-session keys via X25519. Only safe for offline gtp-sim testing with secure=false."
+    )]
     pub fn new(cid: ConnectionId, peer_addr: SocketAddr, secure: bool) -> Self {
+        #[allow(deprecated)]
         Self::new_with_master_secret(
             cid,
             peer_addr,
@@ -71,26 +77,28 @@ impl ConnectionHot {
             path_validator: PathValidator::new(peer_addr),
             next_message_id: 1,
             next_order_seqs: FxHashMap::default(),
+            current_session_key: key,
+            packets_since_ratchet: 0,
         }
     }
 
+    #[deprecated(
+        note = "Uses a hardcoded shared secret; use the handshake-driven GtpEndpoint::connect which derives real per-session keys via X25519. Only safe for offline gtp-sim testing with secure=false."
+    )]
     pub fn new_with_master_secret(
         cid: ConnectionId,
         peer_addr: SocketAddr,
         secure: bool,
         master_secret: &[u8],
     ) -> Self {
-        let protector = if secure {
+        let (protector, key) = if secure {
             let (key, iv) = derive_session_keys(master_secret, cid);
-            Protector::Aead(GtpAeadProtector::new(key, iv))
+            (Protector::Aead(GtpAeadProtector::new(key, iv)), key)
         } else {
-            Protector::Plaintext(PlaintextProtector)
+            (Protector::Plaintext(PlaintextProtector), [0u8; 32])
         };
 
-        let mut anti_amp = AntiAmplificationLimiter::new();
-        if secure {
-            anti_amp.mark_validated();
-        }
+        let anti_amp = AntiAmplificationLimiter::new();
 
         Self {
             connection_id: cid,
@@ -110,6 +118,8 @@ impl ConnectionHot {
             path_validator: PathValidator::new(peer_addr),
             next_message_id: 1,
             next_order_seqs: FxHashMap::default(),
+            current_session_key: key,
+            packets_since_ratchet: 0,
         }
     }
 }

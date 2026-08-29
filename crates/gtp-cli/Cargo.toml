@@ -15,6 +15,7 @@ gtp-wire = { workspace = true }
 gtp-core = { workspace = true }
 gtp-sim = { workspace = true }
 gtp-io = { workspace = true }
+gtp-path = { workspace = true }
 gtp-runtime-tokio = { workspace = true }
 gtp = { workspace = true }
 clap = { workspace = true }

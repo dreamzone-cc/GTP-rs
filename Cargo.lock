@@ -280,6 +280,7 @@ dependencies = [
  "gtp",
  "gtp-core",
  "gtp-io",
+ "gtp-path",
  "gtp-runtime-tokio",
  "gtp-sim",
  "gtp-types",
@@ -345,8 +346,13 @@ name = "gtp-runtime-tokio"
 version = "0.2.0"
 dependencies = [
  "gtp-core",
+ "gtp-crypto",
  "gtp-io",
+ "gtp-path",
  "gtp-types",
+ "gtp-wire",
+ "rand",
+ "rustc-hash",
  "tokio",
 ]
 

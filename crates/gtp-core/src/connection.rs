@@ -25,14 +25,17 @@ impl GtpConnection {
         Self::new_with_config(cid, peer_addr, secure, GtpConfig::default())
     }
 
+    #[allow(deprecated)]
     pub fn new_with_config(
         cid: ConnectionId,
         peer_addr: SocketAddr,
         secure: bool,
         config: GtpConfig,
     ) -> Self {
+        let mut hot = ConnectionHot::new(cid, peer_addr, secure);
+        hot.anti_amplification.mark_validated();
         Self {
-            hot: ConnectionHot::new(cid, peer_addr, secure),
+            hot,
             cold: ConnectionCold::default(),
             config,
             event_queue: Vec::with_capacity(32),
