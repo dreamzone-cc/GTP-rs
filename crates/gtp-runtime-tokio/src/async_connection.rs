@@ -129,6 +129,11 @@ impl AsyncGtpConnection {
         guard.control().graceful_close(error_code, reason, now)
     }
 
+    pub async fn ratchet_key(&self) {
+        let mut guard = self.conn.lock().await;
+        guard.control().ratchet_key();
+    }
+
     pub async fn drain_events(&self) -> Vec<ControlEvent> {
         let mut guard = self.conn.lock().await;
         guard.drain_events()

@@ -690,6 +690,7 @@ impl GtpConnection {
         self.hot.pacing.consume(total_datagram_len);
 
         self.hot.next_packet_number = pn.next();
+        self.hot.packets_since_ratchet += 1;
         self.cold.total_tx_packets += 1;
         self.cold.total_tx_bytes += total_datagram_len as u64;
 

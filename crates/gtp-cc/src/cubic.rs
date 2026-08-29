@@ -8,13 +8,14 @@ pub const MIN_CWND_PACKETS: u64 = 2;
 pub const BETA_CUBIC: f64 = 0.7;
 pub const C_CUBIC: f64 = 0.4;
 
-/// CUBIC Congestion Control implementation for GTP.
+/// CUBIC Congestion Control implementation for GTP (RFC 8312 compliant with TCP-Friendly region and Fast Convergence).
 #[derive(Clone, Debug)]
 pub struct CubicCongestionController {
     smss: u64,
     cwnd: u64,
     ssthresh: u64,
     w_max: u64,
+    w_last_max: u64,
     k: f64,
     epoch_start: Option<MonotonicTime>,
     origin_point: u64,
@@ -38,6 +39,7 @@ impl CubicCongestionController {
             cwnd: initial_cwnd,
             ssthresh: u64::MAX,
             w_max: initial_cwnd,
+            w_last_max: initial_cwnd,
             k: 0.0,
             epoch_start: None,
             origin_point: initial_cwnd,
@@ -59,8 +61,18 @@ impl CubicCongestionController {
 
         let t = now.duration_since(epoch_start).as_secs_f64();
         let target_diff = t - self.k;
-        let w_cubic = C_CUBIC * (target_diff * target_diff * target_diff) * (self.smss as f64)
+        let mut w_cubic = C_CUBIC * (target_diff * target_diff * target_diff) * (self.smss as f64)
             + (self.origin_point as f64);
+
+        // RFC 8312 TCP-Friendly Region: W_tcp(t) = W_max*beta + 3*(1-beta)/(1+beta)*(t/RTT)*SMSS
+        let rtt_secs = self.min_rtt.as_secs_f64().max(0.001);
+        let beta = BETA_CUBIC;
+        let tcp_factor = 3.0 * (1.0 - beta) / (1.0 + beta);
+        let w_tcp = (self.w_max as f64 * beta) + (tcp_factor * (t / rtt_secs) * (self.smss as f64));
+
+        if w_tcp > w_cubic {
+            w_cubic = w_tcp;
+        }
 
         let w_cubic_clamped = (w_cubic.max(self.min_cwnd() as f64)) as u64;
 
@@ -86,8 +98,16 @@ impl CubicCongestionController {
         }
         self.last_loss_time = Some(now);
 
-        // Fast Recovery & CUBIC epoch initialization
-        self.w_max = self.cwnd;
+        // RFC 8312 Fast Convergence:
+        if self.cwnd < self.w_last_max {
+            self.w_last_max = self.cwnd;
+            self.w_max =
+                ((self.cwnd as f64 * (1.0 + BETA_CUBIC) / 2.0) as u64).max(self.min_cwnd());
+        } else {
+            self.w_last_max = self.cwnd;
+            self.w_max = self.cwnd;
+        }
+
         self.ssthresh = ((self.cwnd as f64 * BETA_CUBIC) as u64).max(self.min_cwnd());
         self.cwnd = self.ssthresh;
         self.origin_point = self.w_max;

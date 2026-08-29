@@ -82,6 +82,15 @@ impl ConnectionHot {
         }
     }
 
+    /// Rotates the session AEAD encryption key for forward secrecy (Key Phase ratchet).
+    pub fn ratchet_session_key(&mut self) {
+        let next_key = gtp_crypto::ratchet_key(&self.current_session_key, self.connection_id);
+        let (_, iv) = derive_session_keys(&next_key, self.connection_id);
+        self.protector = Protector::Aead(GtpAeadProtector::new(next_key, iv));
+        self.current_session_key = next_key;
+        self.packets_since_ratchet = 0;
+    }
+
     #[deprecated(
         note = "Uses a hardcoded shared secret; use the handshake-driven GtpEndpoint::connect which derives real per-session keys via X25519. Only safe for offline gtp-sim testing with secure=false."
     )]

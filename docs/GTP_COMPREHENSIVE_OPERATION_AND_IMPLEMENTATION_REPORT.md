@@ -15,13 +15,18 @@ This report provides a complete, authoritative record of all engineering operati
 GTP-rs has reached full production readiness as a high-performance, cryptographically secure transport protocol tailored specifically for competitive multiplayer game engines and real-time interactive simulations.
 
 ### Key Milestones Achieved:
-1. **Dynamic Server Accept (`endpoint.accept()`)**: Real dynamic client intake allowing arbitrary incoming `ConnectionId`s without static pre-registration.
-2. **Stateless Anti-Amplification & Cookie Validation**: Server remains entirely stateless upon `ClientHello` and cryptographically verifies address ownership in `HandshakeFinish`.
-3. **Elimination of Silent Fallbacks**: Complete removal of static master secret fallbacks; `connect()` enforces strict typed error returns.
-4. **`ConnectionId`-Based Wire Routing**: Clean separation of session demultiplexing from socket IP addresses, enabling seamless NAT rebinding and multi-session concurrency.
-5. **Handshake Loss Recovery**: Automated 400ms `ClientHello` retransmission with server-side ephemeral state reuse preventing key mismatch races.
-6. **Physical Multi-Node Telemetry**: Verified on physical network between `192.168.1.10` and `192.168.1.20` with sub-millisecond latency ($394\ \mu\text{s}$ smoothed RTT) and $0.00\%$ loss.
-7. **Comprehensive 6-Stage Stress Suite**: 100% pass across all load tiers, chaotic network impairments (up to 35% loss, 250ms RTT), 50k continuous endurance packets, 200 concurrent parallel client handshakes (11,519 sessions/sec), and live NAT rebinding.
+1. **Cryptographic Key Confirmation (`client_proof`)**: Wired HMAC-SHA256 key confirmation proof in `HandshakeFinish`, proving both peers derived identical session keys before establishing session state.
+2. **Session Key Ratchet Wired into Lifecycle & Control API**: Wired `ConnectionHot::ratchet_session_key()` with explicit runtime control handle and automatic counter tracking for forward secrecy.
+3. **RFC 8312 CUBIC TCP-Friendly Region & Fast Convergence**: Enforced $W_{tcp}(t)$ window lower-bounds for network fairness and Fast Convergence capacity release.
+4. **Active MITM Attack Test & Security Proof**: Added integration test `test_active_mitm_key_tamper_rejected` proving immediate rejection of key substitution attacks.
+5. **Criterion Benchmark Suites & Fuzzing Infrastructure**: Added automated Criterion benchmarks (`crypto_bench.rs`, `wire_bench.rs`) and `fuzz/` coverage-guided fuzz targets.
+6. **Dynamic Server Accept (`endpoint.accept()`)**: Real dynamic client intake allowing arbitrary incoming `ConnectionId`s without static pre-registration.
+7. **Stateless Anti-Amplification & Cookie Validation**: Server remains entirely stateless upon `ClientHello` and cryptographically verifies address ownership in `HandshakeFinish`.
+8. **Elimination of Silent Fallbacks**: Complete removal of static master secret fallbacks; `connect()` enforces strict typed error returns.
+9. **`ConnectionId`-Based Wire Routing**: Clean separation of session demultiplexing from socket IP addresses, enabling seamless NAT rebinding and multi-session concurrency.
+10. **Handshake Loss Recovery**: Automated 400ms `ClientHello` retransmission with server-side ephemeral state reuse preventing key mismatch races.
+11. **Physical Multi-Node Telemetry**: Verified on physical network between `192.168.1.10` and `192.168.1.20` with sub-millisecond latency ($394\ \mu\text{s}$ smoothed RTT) and $0.00\%$ loss.
+12. **Comprehensive 6-Stage Stress Suite**: 100% pass across all load tiers, chaotic network impairments (up to 35% loss, 250ms RTT), 50k continuous endurance packets, 200 concurrent parallel client handshakes (11,519 sessions/sec), and live NAT rebinding.
 
 ---
 

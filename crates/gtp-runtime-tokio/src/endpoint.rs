@@ -161,7 +161,8 @@ impl GtpEndpoint {
         let shared = client_pair.compute_shared_secret(&server_pk);
         let (key, iv) = derive_handshake_session_keys(&shared, &client_nonce, &server_nonce, cid);
 
-        // 4. Send HandshakeFinish confirmation
+        // 4. Send HandshakeFinish confirmation with Key Confirmation Proof
+        let client_proof = gtp_crypto::compute_client_proof(&key, &client_pk, &server_pk);
         let mut fin_buf = [0u8; 128];
         let fin_hdr = PacketHeader::new_long(1, cid, PacketNumber(1), 0, 0);
         let fin_hdr_len = fin_hdr
@@ -169,7 +170,7 @@ impl GtpEndpoint {
             .map_err(|_| TransportError::BufferOverflow)?;
         let fin_frame = Frame::HandshakeFinish {
             cookie_echo: stateless_cookie,
-            client_proof: [0u8; 32],
+            client_proof,
         };
         let fin_frame_len = fin_frame
             .encode(&mut fin_buf[fin_hdr_len..])
@@ -361,12 +362,17 @@ impl GtpEndpoint {
                             continue;
                         }
 
-                        // Case C: Incoming HandshakeFinish on Server (Address Verified!)
+                        // Case C: Incoming HandshakeFinish on Server (Address & Key Verified!)
                         if frame_type == FRAME_TYPE_HANDSHAKE_FINISH {
-                            if let Ok((Frame::HandshakeFinish { cookie_echo, .. }, _)) =
-                                Frame::decode(frame_payload)
+                            if let Ok((
+                                Frame::HandshakeFinish {
+                                    cookie_echo,
+                                    client_proof,
+                                },
+                                _,
+                            )) = Frame::decode(frame_payload)
                             {
-                                // Strict Cookie Verification (Address Ownership Verified!)
+                                // 1. Strict Cookie Verification (Address Ownership Verified!)
                                 if stateless_tokens.verify_cookie(src, &cookie_echo, now) {
                                     let pending_entry = {
                                         let mut psh = pending_server_handshakes.write().await;
@@ -382,6 +388,7 @@ impl GtpEndpoint {
                                     )) = pending_entry
                                     {
                                         let server_nonce = server_pair.nonce;
+                                        let server_pk = server_pair.public_key;
                                         let shared = server_pair.compute_shared_secret(&client_pk);
                                         let (key, iv) = derive_handshake_session_keys(
                                             &shared,
@@ -390,36 +397,44 @@ impl GtpEndpoint {
                                             cid,
                                         );
 
-                                        // Instantiate verified connection (pre_validated: true)
-                                        let conn = GtpConnection::new_with_session_keys(
-                                            cid,
-                                            src,
-                                            key,
-                                            iv,
-                                            true,
-                                            GtpConfig::competitive_fps(),
-                                        );
+                                        // 2. Cryptographic Key Confirmation: Client & Server derived identical keys
+                                        if gtp_crypto::verify_client_proof(
+                                            &key,
+                                            &client_pk,
+                                            &server_pk,
+                                            &client_proof,
+                                        ) {
+                                            // Instantiate verified connection (pre_validated: true)
+                                            let conn = GtpConnection::new_with_session_keys(
+                                                cid,
+                                                src,
+                                                key,
+                                                iv,
+                                                true,
+                                                GtpConfig::competitive_fps(),
+                                            );
 
-                                        let (tx, rx) = mpsc::channel(1024);
-                                        let conn_arc = Arc::new(Mutex::new(conn));
+                                            let (tx, rx) = mpsc::channel(1024);
+                                            let conn_arc = Arc::new(Mutex::new(conn));
 
-                                        {
-                                            let mut conns = connections.write().await;
-                                            conns.insert(cid, (Arc::clone(&conn_arc), tx));
+                                            {
+                                                let mut conns = connections.write().await;
+                                                conns.insert(cid, (Arc::clone(&conn_arc), tx));
+                                            }
+
+                                            Self::spawn_tx_loop(
+                                                Arc::clone(&socket),
+                                                Arc::clone(&conn_arc),
+                                            );
+
+                                            let async_conn = AsyncGtpConnection {
+                                                cid,
+                                                conn: conn_arc,
+                                                rx_channel: rx,
+                                            };
+
+                                            let _ = incoming_tx.send(async_conn).await;
                                         }
-
-                                        Self::spawn_tx_loop(
-                                            Arc::clone(&socket),
-                                            Arc::clone(&conn_arc),
-                                        );
-
-                                        let async_conn = AsyncGtpConnection {
-                                            cid,
-                                            conn: conn_arc,
-                                            rx_channel: rx,
-                                        };
-
-                                        let _ = incoming_tx.send(async_conn).await;
                                     }
                                 }
                             }

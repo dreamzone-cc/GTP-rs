@@ -9,6 +9,13 @@ authors.workspace = true
 gtp-types = { workspace = true }
 bytes = { workspace = true, optional = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "wire_bench"
+harness = false
+
 [features]
 default = ["std"]
 std = ["gtp-types/std"]

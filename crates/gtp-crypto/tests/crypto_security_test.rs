@@ -151,3 +151,43 @@ fn test_key_ratchet_forward_security() {
     assert_ne!(phase_1_key, phase_2_key);
     assert_ne!(initial_key, phase_2_key);
 }
+
+#[test]
+fn test_active_mitm_key_tamper_rejected() {
+    use gtp_crypto::{compute_client_proof, verify_client_proof};
+
+    let client_ephemeral = EphemeralKeyPair::generate();
+    let server_ephemeral = EphemeralKeyPair::generate();
+    let attacker_ephemeral = EphemeralKeyPair::generate();
+
+    let client_pk = client_ephemeral.public_key;
+    let client_nonce = client_ephemeral.nonce;
+
+    let server_pk = server_ephemeral.public_key;
+    let server_nonce = server_ephemeral.nonce;
+
+    let attacker_pk = attacker_ephemeral.public_key;
+
+    let cid = ConnectionId(0xAAAA_BBBB_CCCC_DDDD);
+
+    // 1. Client computes shared secret with legitimate server PK
+    let client_shared = client_ephemeral.compute_shared_secret(&server_pk);
+    let (client_key, _) =
+        derive_handshake_session_keys(&client_shared, &client_nonce, &server_nonce, cid);
+
+    // 2. Attacker tampers with ClientHello on the wire, substituting client_pk with attacker_pk
+    // Server computes shared secret with attacker_pk instead of client_pk
+    let server_shared = server_ephemeral.compute_shared_secret(&attacker_pk);
+    let (server_key, _) =
+        derive_handshake_session_keys(&server_shared, &client_nonce, &server_nonce, cid);
+
+    // 3. Client generates HMAC Key Confirmation proof based on its key and PKs
+    let client_proof = compute_client_proof(&client_key, &client_pk, &server_pk);
+
+    // 4. Server MUST REJECT the tampered handshake finish proof
+    let is_valid = verify_client_proof(&server_key, &attacker_pk, &server_pk, &client_proof);
+    assert!(
+        !is_valid,
+        "Active MITM key substitution MUST fail cryptographic key confirmation!"
+    );
+}

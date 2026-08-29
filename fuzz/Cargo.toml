@@ -1,0 +1,26 @@
+[package]
+name = "gtp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gtp-wire = { path = "../crates/gtp-wire" }
+gtp-crypto = { path = "../crates/gtp-crypto" }
+gtp-types = { path = "../crates/gtp-types" }
+
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "handshake_frames"
+path = "fuzz_targets/handshake_frames.rs"
+test = false
+doc = false

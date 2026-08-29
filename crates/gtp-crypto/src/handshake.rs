@@ -99,6 +99,37 @@ pub fn ratchet_key(current_key: &[u8; 32], connection_id: ConnectionId) -> [u8; 
     next_key
 }
 
+type HmacSha256 = hmac::Hmac<Sha256>;
+
+/// Computes HMAC-SHA256 client key confirmation proof over `b"gtp-handshake-finish"` || `client_pk` || `server_pk`.
+pub fn compute_client_proof(
+    derived_key: &[u8; 32],
+    client_pk: &[u8; 32],
+    server_pk: &[u8; 32],
+) -> [u8; 32] {
+    use hmac::Mac;
+    let mut mac = HmacSha256::new_from_slice(derived_key).expect("HMAC can take key of any size");
+    mac.update(b"gtp-handshake-finish");
+    mac.update(client_pk);
+    mac.update(server_pk);
+    let result = mac.finalize();
+    let mut proof = [0u8; 32];
+    proof.copy_from_slice(&result.into_bytes());
+    proof
+}
+
+/// Verifies client key confirmation proof in constant time.
+pub fn verify_client_proof(
+    derived_key: &[u8; 32],
+    client_pk: &[u8; 32],
+    server_pk: &[u8; 32],
+    candidate_proof: &[u8; 32],
+) -> bool {
+    use subtle::ConstantTimeEq;
+    let expected = compute_client_proof(derived_key, client_pk, server_pk);
+    expected.ct_eq(candidate_proof).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +165,29 @@ mod tests {
         // Test key ratcheting produces new key
         let ratcheted = ratchet_key(&client_key, cid);
         assert_ne!(ratcheted, client_key);
+
+        // Test client proof HMAC verification
+        let proof = compute_client_proof(&client_key, &client_pk, &server_pk);
+        assert!(verify_client_proof(
+            &server_key,
+            &client_pk,
+            &server_pk,
+            &proof
+        ));
+
+        let mut tampered_proof = proof;
+        tampered_proof[0] ^= 0xFF;
+        assert!(!verify_client_proof(
+            &server_key,
+            &client_pk,
+            &server_pk,
+            &tampered_proof
+        ));
+
+        // Mismatched keys must fail
+        let wrong_key = [0x55u8; 32];
+        assert!(!verify_client_proof(
+            &wrong_key, &client_pk, &server_pk, &proof
+        ));
     }
 }

@@ -182,6 +182,11 @@ impl<'a> ConnectionControl<'a> {
         Ok(())
     }
 
+    /// Rotates the active session AEAD encryption key for forward secrecy (Key Ratchet).
+    pub fn ratchet_key(&mut self) {
+        self.hot.ratchet_session_key();
+    }
+
     /// Take a comprehensive telemetry snapshot of all protocol subsystems.
     pub fn query_metrics(&self, now: MonotonicTime) -> DetailedMetrics {
         let rtt = self.hot.loss_detector.rtt_stats;
