@@ -34,6 +34,7 @@ gtp-core = { path = "crates/gtp-core" }
 gtp-io = { path = "crates/gtp-io" }
 gtp-runtime-tokio = { path = "crates/gtp-runtime-tokio" }
 gtp-sim = { path = "crates/gtp-sim" }
+gtp = { path = "crates/gtp" }
 
 # Standard dependencies
 bytes = "1.9"

@@ -246,8 +246,10 @@ name = "gtp-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "gtp",
  "gtp-core",
  "gtp-io",
+ "gtp-runtime-tokio",
  "gtp-sim",
  "gtp-types",
  "gtp-wire",
