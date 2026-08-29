@@ -62,6 +62,39 @@ impl GtpEndpoint {
         }
     }
 
+    pub async fn connect_with_session_keys(
+        &self,
+        cid: ConnectionId,
+        peer_addr: SocketAddr,
+        key: [u8; 32],
+        iv: [u8; 12],
+        pre_validated: bool,
+    ) -> AsyncGtpConnection {
+        let (tx, rx) = mpsc::channel(1024);
+        let conn = GtpConnection::new_with_session_keys(
+            cid,
+            peer_addr,
+            key,
+            iv,
+            pre_validated,
+            gtp_core::GtpConfig::competitive_fps(),
+        );
+        let conn_arc = Arc::new(Mutex::new(conn));
+
+        {
+            let mut conns = self.connections.write().await;
+            conns.insert(cid, (Arc::clone(&conn_arc), tx));
+        }
+
+        self.start_tx_loop(Arc::clone(&conn_arc));
+
+        AsyncGtpConnection {
+            cid,
+            conn: conn_arc,
+            rx_channel: rx,
+        }
+    }
+
     fn start_rx_loop(&self) {
         let socket = Arc::clone(&self.socket);
         let connections = Arc::clone(&self.connections);

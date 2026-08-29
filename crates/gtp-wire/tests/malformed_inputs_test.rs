@@ -24,12 +24,22 @@ fn test_decode_truncated_frames_does_not_panic() {
     let res = Frame::decode(&buf_truncated_close);
     assert!(matches!(res, Err(TransportError::TruncatedFrame { .. })));
 
-    // 5. Unknown frame type
+    // 5. Truncated ClientHello (frame type 0x0B with only 10 bytes)
+    let buf_truncated_hello = [0x0B, 0x01, 0x02, 0x03, 0x04];
+    let res = Frame::decode(&buf_truncated_hello);
+    assert!(matches!(res, Err(TransportError::TruncatedFrame { .. })));
+
+    // 6. Truncated ServerHello (frame type 0x0C with only 20 bytes)
+    let buf_truncated_shello = [0x0C; 20];
+    let res = Frame::decode(&buf_truncated_shello);
+    assert!(matches!(res, Err(TransportError::TruncatedFrame { .. })));
+
+    // 7. Unknown frame type
     let buf_unknown = [0xFF, 0x01, 0x02, 0x03];
     let res = Frame::decode(&buf_unknown);
     assert!(matches!(res, Err(TransportError::MalformedFrame(_))));
 
-    // 6. Completely empty buffer
+    // 8. Completely empty buffer
     let buf_empty: [u8; 0] = [];
     let res = Frame::decode(&buf_empty);
     assert!(matches!(res, Err(TransportError::TruncatedFrame { .. })));

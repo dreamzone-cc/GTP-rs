@@ -17,7 +17,9 @@ pub const FRAME_TYPE_MTU_PROBE: u8 = 0x08;
 pub const FRAME_TYPE_CLOSE: u8 = 0x09;
 pub const FRAME_TYPE_ACK_FREQUENCY: u8 = 0x0A;
 pub const FRAME_TYPE_HANDSHAKE_INIT: u8 = 0x0B;
+pub const FRAME_TYPE_CLIENT_HELLO: u8 = 0x0B;
 pub const FRAME_TYPE_HANDSHAKE_RESPONSE: u8 = 0x0C;
+pub const FRAME_TYPE_SERVER_HELLO: u8 = 0x0C;
 pub const FRAME_TYPE_HANDSHAKE_FINISH: u8 = 0x0D;
 
 /// Compact ACK Range representation.
@@ -84,18 +86,20 @@ pub enum Frame<'a> {
         max_ack_delay_ms: u16,
         reorder_threshold: u8,
     },
-    HandshakeInit {
-        client_nonce: [u8; 16],
+    ClientHello {
+        client_public_key: [u8; 32],
+        client_nonce: [u8; 32],
         version: u32,
     },
-    HandshakeResponse {
-        server_nonce: [u8; 16],
+    ServerHello {
+        server_public_key: [u8; 32],
+        server_nonce: [u8; 32],
         stateless_cookie: [u8; 32],
         assigned_cid: ConnectionId,
     },
     HandshakeFinish {
         cookie_echo: [u8; 32],
-        client_proof: [u8; 16],
+        client_proof: [u8; 32],
     },
     Padding {
         len: usize,
@@ -183,8 +187,8 @@ impl<'a> Frame<'a> {
             Self::MtuProbe { .. } => FRAME_TYPE_MTU_PROBE,
             Self::Close { .. } => FRAME_TYPE_CLOSE,
             Self::AckFrequency { .. } => FRAME_TYPE_ACK_FREQUENCY,
-            Self::HandshakeInit { .. } => FRAME_TYPE_HANDSHAKE_INIT,
-            Self::HandshakeResponse { .. } => FRAME_TYPE_HANDSHAKE_RESPONSE,
+            Self::ClientHello { .. } => FRAME_TYPE_CLIENT_HELLO,
+            Self::ServerHello { .. } => FRAME_TYPE_SERVER_HELLO,
             Self::HandshakeFinish { .. } => FRAME_TYPE_HANDSHAKE_FINISH,
             Self::Padding { .. } => FRAME_TYPE_PADDING,
         }
@@ -411,29 +415,35 @@ impl<'a> Frame<'a> {
                 offset += 1;
             }
 
-            Self::HandshakeInit {
+            Self::ClientHello {
+                client_public_key,
                 client_nonce,
                 version,
             } => {
-                if buf.len() < offset + 16 + 4 {
+                if buf.len() < offset + 32 + 32 + 4 {
                     return Err(TransportError::BufferOverflow);
                 }
-                buf[offset..offset + 16].copy_from_slice(client_nonce);
-                offset += 16;
+                buf[offset..offset + 32].copy_from_slice(client_public_key);
+                offset += 32;
+                buf[offset..offset + 32].copy_from_slice(client_nonce);
+                offset += 32;
                 buf[offset..offset + 4].copy_from_slice(&version.to_be_bytes());
                 offset += 4;
             }
 
-            Self::HandshakeResponse {
+            Self::ServerHello {
+                server_public_key,
                 server_nonce,
                 stateless_cookie,
                 assigned_cid,
             } => {
-                if buf.len() < offset + 16 + 32 + 8 {
+                if buf.len() < offset + 32 + 32 + 32 + 8 {
                     return Err(TransportError::BufferOverflow);
                 }
-                buf[offset..offset + 16].copy_from_slice(server_nonce);
-                offset += 16;
+                buf[offset..offset + 32].copy_from_slice(server_public_key);
+                offset += 32;
+                buf[offset..offset + 32].copy_from_slice(server_nonce);
+                offset += 32;
                 buf[offset..offset + 32].copy_from_slice(stateless_cookie);
                 offset += 32;
                 buf[offset..offset + 8].copy_from_slice(&assigned_cid.to_be_bytes());
@@ -444,13 +454,13 @@ impl<'a> Frame<'a> {
                 cookie_echo,
                 client_proof,
             } => {
-                if buf.len() < offset + 32 + 16 {
+                if buf.len() < offset + 32 + 32 {
                     return Err(TransportError::BufferOverflow);
                 }
                 buf[offset..offset + 32].copy_from_slice(cookie_echo);
                 offset += 32;
-                buf[offset..offset + 16].copy_from_slice(client_proof);
-                offset += 16;
+                buf[offset..offset + 32].copy_from_slice(client_proof);
+                offset += 32;
             }
 
             Self::Padding { len } => {
@@ -626,12 +636,18 @@ impl<'a> Frame<'a> {
             }
 
             FRAME_TYPE_HANDSHAKE_INIT => {
-                let nonce_slice = read_bytes(buf, &mut offset, 16)?;
-                let mut client_nonce = [0u8; 16];
+                let pk_slice = read_bytes(buf, &mut offset, 32)?;
+                let mut client_public_key = [0u8; 32];
+                client_public_key.copy_from_slice(pk_slice);
+
+                let nonce_slice = read_bytes(buf, &mut offset, 32)?;
+                let mut client_nonce = [0u8; 32];
                 client_nonce.copy_from_slice(nonce_slice);
+
                 let version = read_u32(buf, &mut offset)?;
                 Ok((
-                    Frame::HandshakeInit {
+                    Frame::ClientHello {
+                        client_public_key,
                         client_nonce,
                         version,
                     },
@@ -640,8 +656,12 @@ impl<'a> Frame<'a> {
             }
 
             FRAME_TYPE_HANDSHAKE_RESPONSE => {
-                let s_nonce = read_bytes(buf, &mut offset, 16)?;
-                let mut server_nonce = [0u8; 16];
+                let pk_slice = read_bytes(buf, &mut offset, 32)?;
+                let mut server_public_key = [0u8; 32];
+                server_public_key.copy_from_slice(pk_slice);
+
+                let s_nonce = read_bytes(buf, &mut offset, 32)?;
+                let mut server_nonce = [0u8; 32];
                 server_nonce.copy_from_slice(s_nonce);
 
                 let cookie = read_bytes(buf, &mut offset, 32)?;
@@ -652,7 +672,8 @@ impl<'a> Frame<'a> {
                 let cid = ConnectionId(cid_bytes);
 
                 Ok((
-                    Frame::HandshakeResponse {
+                    Frame::ServerHello {
+                        server_public_key,
                         server_nonce,
                         stateless_cookie,
                         assigned_cid: cid,
@@ -666,8 +687,8 @@ impl<'a> Frame<'a> {
                 let mut cookie_echo = [0u8; 32];
                 cookie_echo.copy_from_slice(cookie);
 
-                let proof = read_bytes(buf, &mut offset, 16)?;
-                let mut client_proof = [0u8; 16];
+                let proof = read_bytes(buf, &mut offset, 32)?;
+                let mut client_proof = [0u8; 32];
                 client_proof.copy_from_slice(proof);
 
                 Ok((
@@ -774,5 +795,32 @@ mod tests {
         let len = close.encode(&mut buf).unwrap();
         let (decoded, _) = Frame::decode(&buf[..len]).unwrap();
         assert_eq!(close, decoded);
+
+        let client_hello = Frame::ClientHello {
+            client_public_key: [0x42; 32],
+            client_nonce: [0x77; 32],
+            version: 0x0101,
+        };
+        let len = client_hello.encode(&mut buf).unwrap();
+        let (decoded, _) = Frame::decode(&buf[..len]).unwrap();
+        assert_eq!(client_hello, decoded);
+
+        let server_hello = Frame::ServerHello {
+            server_public_key: [0x55; 32],
+            server_nonce: [0x88; 32],
+            stateless_cookie: [0x99; 32],
+            assigned_cid: ConnectionId(0xDEADBEEFCAFE),
+        };
+        let len = server_hello.encode(&mut buf).unwrap();
+        let (decoded, _) = Frame::decode(&buf[..len]).unwrap();
+        assert_eq!(server_hello, decoded);
+
+        let finish = Frame::HandshakeFinish {
+            cookie_echo: [0x99; 32],
+            client_proof: [0xAA; 32],
+        };
+        let len = finish.encode(&mut buf).unwrap();
+        let (decoded, _) = Frame::decode(&buf[..len]).unwrap();
+        assert_eq!(finish, decoded);
     }
 }

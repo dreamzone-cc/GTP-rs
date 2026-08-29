@@ -62,7 +62,10 @@ pub use gtp_runtime_tokio as runtime;
 #[cfg(feature = "sim")]
 pub use gtp_sim as sim;
 
-// --- Primary Ergonomic Re-exports ---
+pub use gtp_crypto::{
+    derive_handshake_session_keys, ratchet_key, EphemeralKeyPair, HandshakeSharedSecret,
+};
+
 pub use gtp_core::{
     ConnectionControl, ControlEvent, DetailedMetrics, GtpConfig, GtpConfigBuilder, GtpConnection,
     NetworkFeedback, ReceivedMessage,
@@ -85,6 +88,9 @@ pub mod prelude {
     pub use gtp_core::{
         ConnectionControl, ControlEvent, DetailedMetrics, GtpConfig, GtpConfigBuilder,
         GtpConnection, NetworkFeedback, ReceivedMessage,
+    };
+    pub use gtp_crypto::{
+        derive_handshake_session_keys, ratchet_key, EphemeralKeyPair, HandshakeSharedSecret,
     };
     pub use gtp_types::{
         ConnectionId, Duration, FragmentId, GenerationId, MessageClass, MessageId, MonotonicTime,

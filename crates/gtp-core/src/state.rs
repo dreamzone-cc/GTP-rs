@@ -40,6 +40,40 @@ impl ConnectionHot {
         )
     }
 
+    pub fn new_with_session_keys(
+        cid: ConnectionId,
+        peer_addr: SocketAddr,
+        key: [u8; 32],
+        iv: [u8; 12],
+        pre_validated: bool,
+    ) -> Self {
+        let protector = Protector::Aead(GtpAeadProtector::new(key, iv));
+        let mut anti_amp = AntiAmplificationLimiter::new();
+        if pre_validated {
+            anti_amp.mark_validated();
+        }
+
+        Self {
+            connection_id: cid,
+            next_packet_number: PacketNumber(1),
+            state: ConnectionState::Established,
+            active_path: peer_addr,
+            next_send_time: MonotonicTime::ZERO,
+            loss_detector: LossDetector::new(),
+            ack_tracker: AckTracker::new(),
+            cc: CubicCongestionController::default(),
+            pacing: PacingEngine::default(),
+            scheduler: GameScheduler::default(),
+            ordered_groups: FxHashMap::default(),
+            replay_window: ReplayWindow::new(),
+            protector,
+            anti_amplification: anti_amp,
+            path_validator: PathValidator::new(peer_addr),
+            next_message_id: 1,
+            next_order_seqs: FxHashMap::default(),
+        }
+    }
+
     pub fn new_with_master_secret(
         cid: ConnectionId,
         peer_addr: SocketAddr,
@@ -54,7 +88,9 @@ impl ConnectionHot {
         };
 
         let mut anti_amp = AntiAmplificationLimiter::new();
-        anti_amp.mark_validated(); // Default validated for established sessions
+        if secure {
+            anti_amp.mark_validated();
+        }
 
         Self {
             connection_id: cid,

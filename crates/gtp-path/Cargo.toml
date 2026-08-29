@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 gtp-types = { workspace = true }
 gtp-wire = { workspace = true }
+subtle = { workspace = true }
 
 [features]
 default = ["std"]

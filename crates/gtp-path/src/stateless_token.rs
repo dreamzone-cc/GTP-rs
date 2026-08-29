@@ -46,7 +46,8 @@ impl StatelessTokenManager {
         }
 
         let expected = self.generate_cookie(addr, token_time);
-        cookie == &expected
+        use subtle::ConstantTimeEq;
+        cookie.ct_eq(&expected).into()
     }
 }
 

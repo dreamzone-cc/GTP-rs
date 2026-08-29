@@ -17,7 +17,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["GTP Engineering Team"]
 license = "AGPL-3.0"
@@ -46,6 +46,9 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 hkdf = "0.12"
 sha2 = "0.10"
 rustc-hash = "2.1"
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets"] }
+zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2.6"
 
 [profile.release]
 opt-level = 3

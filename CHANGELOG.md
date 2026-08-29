@@ -8,16 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.0] - 2026-08-29
 
 ### Added
-- **Production ChaCha20-Poly1305 AEAD**: Replaced initial XOR/FNV scaffold with standard RFC 8439 ChaCha20-Poly1305 authenticated encryption in `gtp-crypto`.
+- **Ephemeral X25519 Diffie-Hellman Key Exchange**: Integrated `x25519-dalek` in `gtp-crypto::handshake` with random client/server nonces and zeroization via `zeroize`.
+- **Active Anti-Amplification Enforcement**: Strictly enforces RFC 9000 3× bytes limit on unauthenticated peer responses until address ownership is verified via authentic AEAD packets or handshake tokens.
+- **Session Key Ratchet & Rotation**: Implemented `ratchet_key` in `gtp-crypto::handshake` for long-lived session key forward secrecy.
+- **Constant-Time Verification**: Applied `subtle::ConstantTimeEq` to stateless tokens and cookies in `gtp-path` to mitigate timing side-channels.
+- **Expanded 6-Stage Stress Suite**: Added high-concurrency multi-session stress (200 parallel clients) and live NAT rebinding/path migration stages to `gtp-cli stress-suite`.
+- **Production ChaCha20-Poly1305 AEAD**: Replaced initial XOR scaffold with standard RFC 8439 ChaCha20-Poly1305 authenticated encryption in `gtp-crypto`.
 - **HKDF-SHA256 Session Key Derivation**: Implemented `kdf.rs` to derive unique, isolated 256-bit encryption keys and 96-bit base IVs per `ConnectionId`.
 - **Static Dispatch `Protector` Enum**: Replaced `Box<dyn PacketProtector>` in `ConnectionHot` with zero-allocation `Protector` enum for static dispatch.
 - **Decode-Path Hardening**: Replaced all unchecked `unwrap()` calls on incoming untrusted wire bytes in `gtp-wire` with bounds-checked parsing returning `TransportError::TruncatedFrame` or `TransportError::MalformedFrame`.
 - **Fast Hot-Path Integer Hashing**: Integrated `rustc-hash::FxHashMap` in `gtp-core` for internal channel state tables.
-- **Malformed Inputs & Fuzzing Test Suite**: Added deterministic fuzzing and boundary tests in `gtp-wire/tests/malformed_inputs_test.rs` and `gtp-crypto/tests/crypto_security_test.rs`.
-- **GitHub Actions CI Workflow**: Added `.github/workflows/ci.yml` verifying builds, tests, clippy (zero warnings), formatting, and documentation.
-- **Toolchain Pinning**: Added `rust-toolchain.toml` targeting Rust 1.85.0.
+- **Security Audit in CI**: Added `cargo-audit` via `rustsec/audit-check` to `.github/workflows/ci.yml`.
 
 ### Changed
+- **BREAKING WIRE CHANGE**: Handshake frame types upgraded to `ClientHello` and `ServerHello` carrying 32-byte X25519 public keys and 32-byte nonces.
 - `PacketProtector::open` signature now accepts `ciphertext_len: usize` for explicit boundary verification.
 - `DetailedMetrics` now exposes `total_corrupted_packets` counter.
 

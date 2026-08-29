@@ -40,6 +40,23 @@ impl GtpConnection {
         }
     }
 
+    pub fn new_with_session_keys(
+        cid: ConnectionId,
+        peer_addr: SocketAddr,
+        key: [u8; 32],
+        iv: [u8; 12],
+        pre_validated: bool,
+        config: GtpConfig,
+    ) -> Self {
+        Self {
+            hot: ConnectionHot::new_with_session_keys(cid, peer_addr, key, iv, pre_validated),
+            cold: ConnectionCold::default(),
+            config,
+            event_queue: Vec::with_capacity(32),
+            last_backpressure: BackpressureLevel::Low,
+        }
+    }
+
     pub fn connection_id(&self) -> ConnectionId {
         self.hot.connection_id
     }
@@ -224,7 +241,11 @@ impl GtpConnection {
             encrypted_payload,
             ciphertext_len,
         ) {
-            Ok(len) => len,
+            Ok(len) => {
+                // Legitimate authenticated packet proves peer address ownership
+                self.hot.anti_amplification.mark_validated();
+                len
+            }
             Err(e) => {
                 self.cold.total_corrupted_packets += 1;
                 return Err(e);
