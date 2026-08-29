@@ -8,9 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.0] - 2026-08-29
 
 ### Added
+- **Dynamic Server Connection Intake (`GtpEndpoint::accept`)**: Implemented dynamic async accept loop yielding verified `AsyncGtpConnection` handles upon valid client handshakes.
 - **Full-Duplex Live X25519 Diffie-Hellman Handshake**: Wired automated `ClientHello`, `ServerHello`, and `HandshakeFinish` state machine into `GtpEndpoint::connect` and `start_rx_loop` with dynamic shared secret computation and zeroization.
-- **Active Anti-Amplification & Per-IP Rate Limiter**: Enforced RFC 9000 3× bytes boundary for unauthenticated peers with 20 hellos/sec rate limiting in `GtpEndpoint`.
-- **Integrated Stateless Cookie Verification**: Initialized `StatelessTokenManager` in `GtpEndpoint` with constant-time `subtle::ConstantTimeEq` validation.
+- **Handshake Loss Recovery**: Automated 400ms `ClientHello` retransmission with server-side ephemeral state preservation for duplicate packet idempotency.
+- **Strict Stateless Cookie Verification**: Initialized `StatelessTokenManager` in `GtpEndpoint` with constant-time `subtle::ConstantTimeEq` validation strictly enforced in `HandshakeFinish`.
+- **ConnectionId-Based Datagram Routing**: Decoupled packet demultiplexing from socket IP addresses to support seamless NAT rebinding and multi-session concurrency.
+- **Active Anti-Amplification & Per-IP Rate Limiter**: Enforced RFC 9000 3× bytes boundary for unauthenticated peers with loopback exemption in `GtpEndpoint`.
 - **Dynamic NAT Rebind Cryptographic Verification**: Integrated live `PathValidator::start_challenge` and `validate_response` in `gtp-cli stress-suite`.
 - **Production ChaCha20-Poly1305 AEAD**: Standard RFC 8439 ChaCha20-Poly1305 authenticated encryption with HKDF-SHA256 session key derivation.
 - **Session Key Ratchet**: Implemented `ratchet_key` in `gtp-crypto::handshake` for forward-secure long-lived connections.
@@ -22,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ConnectionHot::new` and `ConnectionHot::new_with_master_secret` marked as deprecated; live network code now requires dynamic handshake derivation.
 
 ### Changed
+- **Elimination of Silent Static Fallback**: `GtpEndpoint::connect` now strictly returns `Result<AsyncGtpConnection, TransportError>`, returning typed errors on failure rather than falling back to static keys.
 - **BREAKING WIRE CHANGE**: Upgraded handshake wire frames to `ClientHello` (32-byte public key + 32-byte nonce) and `ServerHello` (32-byte public key + 32-byte nonce + 32-byte stateless cookie).
 - `PacketProtector::open` signature now accepts `ciphertext_len: usize` for explicit boundary verification.
 - `DetailedMetrics` now exposes `total_corrupted_packets` counter.

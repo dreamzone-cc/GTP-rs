@@ -101,10 +101,13 @@ cargo run -p gtp-cli -- dissect 80000100011811223344556677880000000000000001000F
   - [`GTP_1_1_Comprehensive_Technical_Specification.md`](GTP_1_1_Comprehensive_Technical_Specification.md): Full technical specification (516 sections).
   - [`GTP_Architecture_Decision_Paper_v1.0.md`](GTP_Architecture_Decision_Paper_v1.0.md): Architecture decision record.
   - Sub-specifications: `docs/specs/GTP-ARCH-01.md` through `docs/specs/GTP-TEST-01.md`.
+- **Reports & Operational Verification**:
+  - [`docs/GTP_COMPREHENSIVE_OPERATION_AND_IMPLEMENTATION_REPORT.md`](docs/GTP_COMPREHENSIVE_OPERATION_AND_IMPLEMENTATION_REPORT.md): Complete engineering report covering dynamic server accept, security audits, and multi-machine benchmarks.
+  - [`docs/GTP_COMPREHENSIVE_STRESS_AND_STABILITY_TEST_REPORT.md`](docs/GTP_COMPREHENSIVE_STRESS_AND_STABILITY_TEST_REPORT.md): Comprehensive 6-stage stress, endurance, and stability testing report.
+  - [`docs/GTP_COMPREHENSIVE_COMPLIANCE_AND_FEATURE_AUDIT_REPORT.md`](docs/GTP_COMPREHENSIVE_COMPLIANCE_AND_FEATURE_AUDIT_REPORT.md): Compliance audit report mapping all specification requirements.
 - **API & Architecture Guides**:
   - [`docs/GTP_API_ARCHITECTURE_AND_DEVELOPMENT_GUIDELINES.md`](docs/GTP_API_ARCHITECTURE_AND_DEVELOPMENT_GUIDELINES.md): Architecture guide and continuous protocol evolution rules.
   - [`docs/GTP_CONTROL_API_REFERENCE_MANUAL.md`](docs/GTP_CONTROL_API_REFERENCE_MANUAL.md): Complete function-by-function reference manual.
-  - [`docs/GTP_COMPREHENSIVE_COMPLIANCE_AND_FEATURE_AUDIT_REPORT.md`](docs/GTP_COMPREHENSIVE_COMPLIANCE_AND_FEATURE_AUDIT_REPORT.md): Compliance audit report mapping all specification requirements.
 
 ---
 
