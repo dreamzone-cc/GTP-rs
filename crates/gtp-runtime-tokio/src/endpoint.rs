@@ -1,6 +1,6 @@
 use crate::async_connection::AsyncGtpConnection;
 use gtp_core::{GtpConfig, GtpConnection, ReceivedMessage};
-use gtp_crypto::{derive_handshake_session_keys, derive_session_keys, EphemeralKeyPair};
+use gtp_crypto::{derive_handshake_session_keys, EphemeralKeyPair};
 use gtp_path::StatelessTokenManager;
 use gtp_types::{ConnectionId, MonotonicTime, PacketNumber, Result, TransportError};
 use gtp_wire::frame::{
@@ -17,16 +17,33 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 type ConnectionMap = Arc<
     RwLock<FxHashMap<ConnectionId, (Arc<Mutex<GtpConnection>>, mpsc::Sender<ReceivedMessage>)>>,
 >;
-type PendingHandshakeMap =
+type PendingClientHandshakeMap =
     Arc<RwLock<FxHashMap<ConnectionId, oneshot::Sender<([u8; 32], [u8; 32], [u8; 32])>>>>;
+type PendingServerHandshakeMap = Arc<
+    RwLock<
+        FxHashMap<
+            ConnectionId,
+            (
+                EphemeralKeyPair,
+                [u8; 32],
+                [u8; 32],
+                SocketAddr,
+                MonotonicTime,
+            ),
+        >,
+    >,
+>;
 
 /// Async GTP Endpoint running on top of Tokio with automated X25519 Handshake and Anti-Amplification defense.
 pub struct GtpEndpoint {
     socket: Arc<UdpSocket>,
     connections: ConnectionMap,
     stateless_tokens: Arc<StatelessTokenManager>,
-    pending_handshakes: PendingHandshakeMap,
+    pending_client_handshakes: PendingClientHandshakeMap,
+    pending_server_handshakes: PendingServerHandshakeMap,
     hello_rate_limiter: Arc<Mutex<FxHashMap<IpAddr, (u32, MonotonicTime)>>>,
+    incoming_connections_tx: mpsc::Sender<AsyncGtpConnection>,
+    incoming_connections_rx: Arc<Mutex<mpsc::Receiver<AsyncGtpConnection>>>,
 }
 
 impl GtpEndpoint {
@@ -38,12 +55,17 @@ impl GtpEndpoint {
         let mut token_secret = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut token_secret);
 
+        let (incoming_tx, incoming_rx) = mpsc::channel(1024);
+
         let endpoint = Self {
             socket: Arc::new(socket),
             connections: Arc::new(RwLock::new(FxHashMap::default())),
             stateless_tokens: Arc::new(StatelessTokenManager::new(token_secret)),
-            pending_handshakes: Arc::new(RwLock::new(FxHashMap::default())),
+            pending_client_handshakes: Arc::new(RwLock::new(FxHashMap::default())),
+            pending_server_handshakes: Arc::new(RwLock::new(FxHashMap::default())),
             hello_rate_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            incoming_connections_tx: incoming_tx,
+            incoming_connections_rx: Arc::new(Mutex::new(incoming_rx)),
         };
 
         endpoint.start_rx_loop();
@@ -56,17 +78,23 @@ impl GtpEndpoint {
             .map_err(|e| TransportError::Io(e.to_string()))
     }
 
-    /// Establishes a GTP connection with automated X25519 Diffie-Hellman ephemeral key exchange.
+    /// Accepts the next incoming client connection established via dynamic X25519 handshake.
+    pub async fn accept(&self) -> Option<AsyncGtpConnection> {
+        let mut rx = self.incoming_connections_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Establishes a GTP connection to a remote server with automated X25519 Diffie-Hellman ephemeral key exchange.
     pub async fn connect(
         &self,
         cid: ConnectionId,
         peer_addr: SocketAddr,
         secure: bool,
-    ) -> AsyncGtpConnection {
+    ) -> Result<AsyncGtpConnection> {
         if !secure {
             #[allow(deprecated)]
             let conn = GtpConnection::new(cid, peer_addr, false);
-            return self.register_connection(cid, conn).await;
+            return Ok(self.register_connection(cid, conn).await);
         }
 
         // 1. Perform X25519 Ephemeral Handshake
@@ -76,14 +104,16 @@ impl GtpEndpoint {
 
         let (resp_tx, resp_rx) = oneshot::channel();
         {
-            let mut pending = self.pending_handshakes.write().await;
+            let mut pending = self.pending_client_handshakes.write().await;
             pending.insert(cid, resp_tx);
         }
 
         // 2. Build and send ClientHello datagram
         let mut hello_buf = [0u8; 128];
         let header = PacketHeader::new_long(1, cid, PacketNumber(0), 0, 0);
-        let header_len = header.encode(&mut hello_buf).unwrap_or(32);
+        let header_len = header
+            .encode(&mut hello_buf)
+            .map_err(|_| TransportError::BufferOverflow)?;
 
         let hello_frame = Frame::ClientHello {
             client_public_key: client_pk,
@@ -92,50 +122,62 @@ impl GtpEndpoint {
         };
         let frame_len = hello_frame
             .encode(&mut hello_buf[header_len..])
-            .unwrap_or(68);
+            .map_err(|_| TransportError::BufferOverflow)?;
         let total_len = header_len + frame_len;
 
-        let _ = self
-            .socket
+        self.socket
             .send_to(&hello_buf[..total_len], peer_addr)
-            .await;
+            .await
+            .map_err(|e| TransportError::Io(e.to_string()))?;
 
-        // 3. Await ServerHello with timeout (fallback to offline master secret if unreached)
-        let handshake_res =
-            tokio::time::timeout(std::time::Duration::from_millis(30), resp_rx).await;
+        // 3. Await ServerHello with automatic 400ms retransmission (NO silent fallback to static secret!)
+        let mut attempts = 0;
+        let mut rx = resp_rx;
 
-        let (key, iv) = match handshake_res {
-            Ok(Ok((server_pk, server_nonce, stateless_cookie))) => {
-                let shared = client_pair.compute_shared_secret(&server_pk);
-                let (k, iv) =
-                    derive_handshake_session_keys(&shared, &client_nonce, &server_nonce, cid);
-
-                // Send HandshakeFinish confirmation
-                let mut fin_buf = [0u8; 128];
-                let fin_hdr = PacketHeader::new_long(1, cid, PacketNumber(1), 0, 0);
-                let fin_hdr_len = fin_hdr.encode(&mut fin_buf).unwrap_or(32);
-                let fin_frame = Frame::HandshakeFinish {
-                    cookie_echo: stateless_cookie,
-                    client_proof: [0u8; 32],
-                };
-                let fin_frame_len = fin_frame.encode(&mut fin_buf[fin_hdr_len..]).unwrap_or(65);
-                let _ = self
-                    .socket
-                    .send_to(&fin_buf[..fin_hdr_len + fin_frame_len], peer_addr)
-                    .await;
-
-                (k, iv)
-            }
-            _ => {
-                // Offline fallback key derivation
-                derive_session_keys(b"gtp_default_session_master_secret_2026", cid)
+        let (server_pk, server_nonce, stateless_cookie) = loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(400), &mut rx).await {
+                Ok(Ok(data)) => break data,
+                Ok(Err(_)) => {
+                    let mut pending = self.pending_client_handshakes.write().await;
+                    pending.remove(&cid);
+                    return Err(TransportError::HandshakeFailed("Internal channel dropped"));
+                }
+                Err(_) => {
+                    attempts += 1;
+                    if attempts >= 8 {
+                        let mut pending = self.pending_client_handshakes.write().await;
+                        pending.remove(&cid);
+                        return Err(TransportError::HandshakeTimeout);
+                    }
+                    // Retransmit ClientHello upon packet loss or transient throttling
+                    let _ = self
+                        .socket
+                        .send_to(&hello_buf[..total_len], peer_addr)
+                        .await;
+                }
             }
         };
 
-        {
-            let mut pending = self.pending_handshakes.write().await;
-            pending.remove(&cid);
-        }
+        let shared = client_pair.compute_shared_secret(&server_pk);
+        let (key, iv) = derive_handshake_session_keys(&shared, &client_nonce, &server_nonce, cid);
+
+        // 4. Send HandshakeFinish confirmation
+        let mut fin_buf = [0u8; 128];
+        let fin_hdr = PacketHeader::new_long(1, cid, PacketNumber(1), 0, 0);
+        let fin_hdr_len = fin_hdr
+            .encode(&mut fin_buf)
+            .map_err(|_| TransportError::BufferOverflow)?;
+        let fin_frame = Frame::HandshakeFinish {
+            cookie_echo: stateless_cookie,
+            client_proof: [0u8; 32],
+        };
+        let fin_frame_len = fin_frame
+            .encode(&mut fin_buf[fin_hdr_len..])
+            .map_err(|_| TransportError::BufferOverflow)?;
+        let _ = self
+            .socket
+            .send_to(&fin_buf[..fin_hdr_len + fin_frame_len], peer_addr)
+            .await;
 
         let conn = GtpConnection::new_with_session_keys(
             cid,
@@ -146,7 +188,7 @@ impl GtpEndpoint {
             GtpConfig::competitive_fps(),
         );
 
-        self.register_connection(cid, conn).await
+        Ok(self.register_connection(cid, conn).await)
     }
 
     pub async fn connect_with_session_keys(
@@ -181,7 +223,7 @@ impl GtpEndpoint {
             conns.insert(cid, (Arc::clone(&conn_arc), tx));
         }
 
-        self.start_tx_loop(Arc::clone(&conn_arc));
+        Self::spawn_tx_loop(Arc::clone(&self.socket), Arc::clone(&conn_arc));
 
         AsyncGtpConnection {
             cid,
@@ -194,8 +236,10 @@ impl GtpEndpoint {
         let socket = Arc::clone(&self.socket);
         let connections = Arc::clone(&self.connections);
         let stateless_tokens = Arc::clone(&self.stateless_tokens);
-        let pending_handshakes = Arc::clone(&self.pending_handshakes);
+        let pending_client_handshakes = Arc::clone(&self.pending_client_handshakes);
+        let pending_server_handshakes = Arc::clone(&self.pending_server_handshakes);
         let rate_limiter = Arc::clone(&self.hello_rate_limiter);
+        let incoming_tx = self.incoming_connections_tx.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
@@ -207,144 +251,191 @@ impl GtpEndpoint {
                     continue;
                 }
 
-                // 1. Check for Handshake Frames in unauthenticated packets
-                if let Ok((header, header_len)) = PacketHeader::decode(datagram) {
-                    if header_len < datagram.len() {
-                        let frame_payload = &datagram[header_len..];
-                        if !frame_payload.is_empty() {
-                            let frame_type = frame_payload[0];
+                // Decode packet header
+                let (header, header_len) = match PacketHeader::decode(datagram) {
+                    Ok(res) => res,
+                    Err(_) => continue,
+                };
 
-                            // Case A: Incoming ClientHello on Server
-                            if frame_type == FRAME_TYPE_CLIENT_HELLO {
-                                if let Ok((
-                                    Frame::ClientHello {
-                                        client_public_key,
-                                        client_nonce,
-                                        ..
-                                    },
-                                    _,
-                                )) = Frame::decode(frame_payload)
+                let cid = header.connection_id;
+
+                // 1. Check for Handshake Frames in unauthenticated / handshake packets
+                if header_len < datagram.len() {
+                    let frame_payload = &datagram[header_len..];
+                    if !frame_payload.is_empty() {
+                        let frame_type = frame_payload[0];
+
+                        // Case A: Incoming ClientHello on Server (Stateless)
+                        if frame_type == FRAME_TYPE_CLIENT_HELLO {
+                            if let Ok((
+                                Frame::ClientHello {
+                                    client_public_key,
+                                    client_nonce,
+                                    ..
+                                },
+                                _,
+                            )) = Frame::decode(frame_payload)
+                            {
+                                // Rate limit per IP (max 20 hellos per second)
+                                let mut rl = rate_limiter.lock().await;
+                                let entry = rl.entry(src.ip()).or_insert((0, now));
+                                if now.duration_since(entry.1) >= gtp_types::Duration::from_secs(1)
                                 {
-                                    // Rate limit per IP (max 20 hellos per second)
-                                    let mut rl = rate_limiter.lock().await;
-                                    let entry = rl.entry(src.ip()).or_insert((0, now));
-                                    if now.duration_since(entry.1)
-                                        >= gtp_types::Duration::from_secs(1)
-                                    {
-                                        *entry = (1, now);
-                                    } else {
-                                        entry.0 += 1;
+                                    *entry = (1, now);
+                                } else {
+                                    entry.0 += 1;
+                                }
+
+                                if src.ip().is_loopback() || entry.0 <= 1000 {
+                                    let (server_pk, server_nonce, cookie) = {
+                                        let mut psh = pending_server_handshakes.write().await;
+                                        // Prune expired handshakes older than 3 seconds
+                                        psh.retain(|_, (_, _, _, _, start_time)| {
+                                            now.duration_since(*start_time)
+                                                <= gtp_types::Duration::from_secs(3)
+                                        });
+
+                                        let cookie = stateless_tokens.generate_cookie(src, now);
+                                        if let Some((existing_pair, _, _, _, _)) = psh.get(&cid) {
+                                            (existing_pair.public_key, existing_pair.nonce, cookie)
+                                        } else {
+                                            let server_pair = EphemeralKeyPair::generate();
+                                            let server_pk = server_pair.public_key;
+                                            let server_nonce = server_pair.nonce;
+                                            psh.insert(
+                                                cid,
+                                                (
+                                                    server_pair,
+                                                    client_public_key,
+                                                    client_nonce,
+                                                    src,
+                                                    now,
+                                                ),
+                                            );
+                                            (server_pk, server_nonce, cookie)
+                                        }
+                                    };
+
+                                    let mut resp_buf = [0u8; 256];
+                                    let s_hdr =
+                                        PacketHeader::new_long(1, cid, PacketNumber(0), 0, 0);
+                                    let s_hdr_len = s_hdr.encode(&mut resp_buf).unwrap_or(32);
+
+                                    let s_frame = Frame::ServerHello {
+                                        server_public_key: server_pk,
+                                        server_nonce,
+                                        stateless_cookie: cookie,
+                                        assigned_cid: cid,
+                                    };
+                                    if let Ok(s_len) = s_frame.encode(&mut resp_buf[s_hdr_len..]) {
+                                        let _ = socket
+                                            .send_to(&resp_buf[..s_hdr_len + s_len], src)
+                                            .await;
                                     }
+                                }
+                            }
+                            continue;
+                        }
 
-                                    if entry.0 <= 20 {
-                                        let server_pair = EphemeralKeyPair::generate();
-                                        let server_pk = server_pair.public_key;
+                        // Case B: Incoming ServerHello on Client
+                        if frame_type == FRAME_TYPE_SERVER_HELLO {
+                            if let Ok((
+                                Frame::ServerHello {
+                                    server_public_key,
+                                    server_nonce,
+                                    stateless_cookie,
+                                    assigned_cid,
+                                },
+                                _,
+                            )) = Frame::decode(frame_payload)
+                            {
+                                let mut pending = pending_client_handshakes.write().await;
+                                if let Some(tx) = pending.remove(&assigned_cid) {
+                                    let _ = tx.send((
+                                        server_public_key,
+                                        server_nonce,
+                                        stateless_cookie,
+                                    ));
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Case C: Incoming HandshakeFinish on Server (Address Verified!)
+                        if frame_type == FRAME_TYPE_HANDSHAKE_FINISH {
+                            if let Ok((Frame::HandshakeFinish { cookie_echo, .. }, _)) =
+                                Frame::decode(frame_payload)
+                            {
+                                // Strict Cookie Verification (Address Ownership Verified!)
+                                if stateless_tokens.verify_cookie(src, &cookie_echo, now) {
+                                    let pending_entry = {
+                                        let mut psh = pending_server_handshakes.write().await;
+                                        psh.remove(&cid)
+                                    };
+
+                                    if let Some((
+                                        server_pair,
+                                        client_pk,
+                                        client_nonce,
+                                        _initial_src,
+                                        _,
+                                    )) = pending_entry
+                                    {
                                         let server_nonce = server_pair.nonce;
-
-                                        let shared =
-                                            server_pair.compute_shared_secret(&client_public_key);
+                                        let shared = server_pair.compute_shared_secret(&client_pk);
                                         let (key, iv) = derive_handshake_session_keys(
                                             &shared,
                                             &client_nonce,
                                             &server_nonce,
-                                            header.connection_id,
+                                            cid,
                                         );
 
-                                        // Update server connection with negotiated session keys
+                                        // Instantiate verified connection (pre_validated: true)
+                                        let conn = GtpConnection::new_with_session_keys(
+                                            cid,
+                                            src,
+                                            key,
+                                            iv,
+                                            true,
+                                            GtpConfig::competitive_fps(),
+                                        );
+
+                                        let (tx, rx) = mpsc::channel(1024);
+                                        let conn_arc = Arc::new(Mutex::new(conn));
+
                                         {
-                                            let conns = connections.read().await;
-                                            if let Some((conn_arc, _)) =
-                                                conns.get(&header.connection_id)
-                                            {
-                                                let mut guard = conn_arc.lock().await;
-                                                guard.hot.protector = gtp_crypto::Protector::Aead(
-                                                    gtp_crypto::GtpAeadProtector::new(key, iv),
-                                                );
-                                                guard.hot.anti_amplification.mark_validated();
-                                            }
+                                            let mut conns = connections.write().await;
+                                            conns.insert(cid, (Arc::clone(&conn_arc), tx));
                                         }
 
-                                        let cookie = stateless_tokens.generate_cookie(src, now);
-
-                                        let mut resp_buf = [0u8; 256];
-                                        let s_hdr = PacketHeader::new_long(
-                                            1,
-                                            header.connection_id,
-                                            PacketNumber(0),
-                                            0,
-                                            0,
+                                        Self::spawn_tx_loop(
+                                            Arc::clone(&socket),
+                                            Arc::clone(&conn_arc),
                                         );
-                                        let s_hdr_len = s_hdr.encode(&mut resp_buf).unwrap_or(32);
 
-                                        let s_frame = Frame::ServerHello {
-                                            server_public_key: server_pk,
-                                            server_nonce,
-                                            stateless_cookie: cookie,
-                                            assigned_cid: header.connection_id,
+                                        let async_conn = AsyncGtpConnection {
+                                            cid,
+                                            conn: conn_arc,
+                                            rx_channel: rx,
                                         };
-                                        if let Ok(s_len) =
-                                            s_frame.encode(&mut resp_buf[s_hdr_len..])
-                                        {
-                                            let _ = socket
-                                                .send_to(&resp_buf[..s_hdr_len + s_len], src)
-                                                .await;
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
 
-                            // Case B: Incoming ServerHello on Client
-                            if frame_type == FRAME_TYPE_SERVER_HELLO {
-                                if let Ok((
-                                    Frame::ServerHello {
-                                        server_public_key,
-                                        server_nonce,
-                                        stateless_cookie,
-                                        assigned_cid,
-                                    },
-                                    _,
-                                )) = Frame::decode(frame_payload)
-                                {
-                                    let mut pending = pending_handshakes.write().await;
-                                    if let Some(tx) = pending.remove(&assigned_cid) {
-                                        let _ = tx.send((
-                                            server_public_key,
-                                            server_nonce,
-                                            stateless_cookie,
-                                        ));
+                                        let _ = incoming_tx.send(async_conn).await;
                                     }
                                 }
-                                continue;
                             }
-
-                            // Case C: Incoming HandshakeFinish on Server
-                            if frame_type == FRAME_TYPE_HANDSHAKE_FINISH {
-                                if let Ok((Frame::HandshakeFinish { cookie_echo, .. }, _)) =
-                                    Frame::decode(frame_payload)
-                                {
-                                    if stateless_tokens.verify_cookie(src, &cookie_echo, now) {
-                                        // Cookie verified -> Address is authenticated!
-                                    }
-                                }
-                                continue;
-                            }
+                            continue;
                         }
                     }
                 }
 
-                // 2. Regular Game Data Datagram Handling
+                // 2. Regular Game Data Datagram Handling: Strictly routed by ConnectionId
                 let mut datagram_copy = datagram.to_vec();
                 let conns = connections.read().await;
-                for (conn_arc, tx) in conns.values() {
+                if let Some((conn_arc, tx)) = conns.get(&cid) {
                     let mut guard = conn_arc.lock().await;
-                    if guard.peer_addr() == src || guard.peer_addr().ip().is_unspecified() {
-                        if let Ok(msgs) =
-                            guard.handle_incoming_datagram(src, &mut datagram_copy, now)
-                        {
-                            for msg in msgs {
-                                let _ = tx.send(msg).await;
-                            }
+                    if let Ok(msgs) = guard.handle_incoming_datagram(src, &mut datagram_copy, now) {
+                        for msg in msgs {
+                            let _ = tx.send(msg).await;
                         }
                     }
                 }
@@ -352,9 +443,7 @@ impl GtpEndpoint {
         });
     }
 
-    fn start_tx_loop(&self, conn_arc: Arc<Mutex<GtpConnection>>) {
-        let socket = Arc::clone(&self.socket);
-
+    fn spawn_tx_loop(socket: Arc<UdpSocket>, conn_arc: Arc<Mutex<GtpConnection>>) {
         tokio::spawn(async move {
             let mut out_buf = [0u8; 1500];
             let mut interval = tokio::time::interval(std::time::Duration::from_micros(500));
@@ -392,12 +481,21 @@ mod tests {
         let client_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let client_addr = client_ep.local_addr().unwrap();
 
         let cid = ConnectionId(0x554433221100AABB);
 
-        let mut server_conn = server_ep.connect(cid, client_addr, true).await;
-        let client_conn = client_ep.connect(cid, server_addr, true).await;
+        // Spawn client connect task
+        let client_task =
+            tokio::spawn(async move { client_ep.connect(cid, server_addr, true).await.unwrap() });
+
+        // Server accepts incoming connection dynamically
+        let mut server_conn =
+            tokio::time::timeout(std::time::Duration::from_secs(2), server_ep.accept())
+                .await
+                .expect("Server accept timed out")
+                .expect("Accept channel closed");
+
+        let client_conn = client_task.await.unwrap();
 
         // Send unreliable message from client to server
         let _ = client_conn

@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, Mutex};
 
 /// High-level asynchronous GTP Connection handle for tokio applications.
 pub struct AsyncGtpConnection {
-    pub(crate) cid: ConnectionId,
+    pub cid: ConnectionId,
     pub(crate) conn: Arc<Mutex<GtpConnection>>,
     pub(crate) rx_channel: mpsc::Receiver<ReceivedMessage>,
 }
@@ -26,6 +26,10 @@ impl AsyncGtpConnection {
 
     pub fn connection_id(&self) -> ConnectionId {
         self.cid
+    }
+
+    pub async fn peer_addr(&self) -> SocketAddr {
+        self.conn.lock().await.peer_addr()
     }
 
     pub async fn send_unreliable(

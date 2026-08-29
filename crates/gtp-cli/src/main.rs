@@ -253,37 +253,39 @@ async fn main() -> Result<()> {
             let endpoint = GtpEndpoint::bind(bind_addr).await?;
             let running = Arc::new(AtomicBool::new(true));
 
+            println!("[Server Loop] Ready and listening for incoming client connections via X25519 Handshake on UDP {}...\n", bind_addr);
+
             let r = running.clone();
             tokio::spawn(async move {
-                let mut total_received_msgs = 0u64;
-                let mut client_sessions = std::collections::HashSet::new();
-
-                println!("[Server Loop] Ready and waiting for client connections over UDP...\n");
-
-                let cid = ConnectionId(0x1020_3040_5060_7080);
-                let mut conn = endpoint
-                    .connect(cid, "0.0.0.0:0".parse().unwrap(), true)
-                    .await;
+                let total_received_msgs = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
                 while r.load(Ordering::Relaxed) {
-                    if let Some(msg) =
-                        tokio::time::timeout(std::time::Duration::from_millis(500), conn.recv())
-                            .await
-                            .ok()
-                            .flatten()
-                    {
-                        total_received_msgs += 1;
-                        client_sessions.insert(cid);
-                        let payload_str = String::from_utf8_lossy(&msg.payload);
-                        if total_received_msgs <= 20 || total_received_msgs % 100 == 0 {
-                            println!(
-                                "[Server RX #{:>5}] Class: {:<20} | Payload: '{}' ({} bytes)",
-                                total_received_msgs,
-                                format!("{:?}", msg.class),
-                                payload_str,
-                                msg.payload.len()
-                            );
-                        }
+                    if let Some(mut client_conn) = endpoint.accept().await {
+                        let cid = client_conn.cid;
+                        let peer = client_conn.peer_addr().await;
+                        println!(
+                            "✨ [Server] Accepted NEW verified client session! CID=0x{:X}, Peer={}",
+                            cid.as_u64(),
+                            peer
+                        );
+
+                        let counter = Arc::clone(&total_received_msgs);
+                        tokio::spawn(async move {
+                            while let Some(msg) = client_conn.recv().await {
+                                let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                let payload_str = String::from_utf8_lossy(&msg.payload);
+                                if count <= 20 || count % 100 == 0 {
+                                    println!(
+                                        "[Server RX #{:>5} | CID: 0x{:X}] Class: {:<20} | Payload: '{}' ({} bytes)",
+                                        count,
+                                        cid.as_u64(),
+                                        format!("{:?}", msg.class),
+                                        payload_str,
+                                        msg.payload.len()
+                                    );
+                                }
+                            }
+                        });
                     }
                 }
             });
@@ -312,7 +314,7 @@ async fn main() -> Result<()> {
             println!("Client local UDP socket bound to: {}\n", local_addr);
 
             let cid = ConnectionId(0x1020_3040_5060_7080);
-            let client_conn = client_ep.connect(cid, server_addr, true).await;
+            let client_conn = client_ep.connect(cid, server_addr, true).await?;
 
             let start_time = Instant::now();
 
@@ -478,11 +480,20 @@ async fn main() -> Result<()> {
                     let mem_before = get_process_memory_mb();
                     let start = Instant::now();
 
+                    let server_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap()).await?;
+                    let s_addr = server_ep.local_addr()?;
+
                     let client_ep = GtpEndpoint::bind("0.0.0.0:0".parse().unwrap()).await?;
-                    let s_addr: SocketAddr = server.parse().unwrap();
-                    let conn = client_ep
-                        .connect(ConnectionId(0x1020304050607080), s_addr, true)
-                        .await;
+                    let client_task = tokio::spawn(async move {
+                        client_ep
+                            .connect(ConnectionId(0x1020304050607080), s_addr, true)
+                            .await
+                    });
+
+                    let mut s_conn = server_ep.accept().await.unwrap();
+                    tokio::spawn(async move { while (s_conn.recv().await).is_some() {} });
+
+                    let conn = client_task.await.unwrap()?;
 
                     let target_items = (rate / 2).max(50);
                     for i in 0..target_items {
@@ -848,14 +859,30 @@ async fn main() -> Result<()> {
                 println!("================================================================================");
 
                 let num_concurrent = 200;
-                let s_addr: SocketAddr = server.parse().unwrap();
                 let start = Instant::now();
                 let mem_before = get_process_memory_mb();
 
                 println!(
-                    "Spawning {} concurrent asynchronous GTP client sessions...",
+                    "Spawning {} concurrent asynchronous GTP client sessions with live X25519 handshakes...",
                     num_concurrent
                 );
+
+                let server_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap()).await?;
+                let s_addr = server_ep.local_addr()?;
+                let s_ep_arc = Arc::new(server_ep);
+
+                let s_accept = Arc::clone(&s_ep_arc);
+                let server_task = tokio::spawn(async move {
+                    let mut accepted = 0;
+                    while accepted < num_concurrent {
+                        if let Some(mut client_conn) = s_accept.accept().await {
+                            accepted += 1;
+                            tokio::spawn(
+                                async move { while (client_conn.recv().await).is_some() {} },
+                            );
+                        }
+                    }
+                });
 
                 let mut handles = Vec::new();
                 for i in 1..=num_concurrent {
@@ -864,7 +891,7 @@ async fn main() -> Result<()> {
                             .await
                             .unwrap();
                         let cid = ConnectionId(0x2000_0000_0000_0000 + i as u64);
-                        let conn = client_ep.connect(cid, s_addr, true).await;
+                        let conn = client_ep.connect(cid, s_addr, true).await.unwrap();
 
                         for p in 0..10 {
                             let payload = format!("concurrent_client_{}_pkt_{}", i, p).into_bytes();
@@ -876,6 +903,7 @@ async fn main() -> Result<()> {
                 for h in handles {
                     let _ = h.await;
                 }
+                server_task.abort();
 
                 let elapsed = start.elapsed();
                 let mem_after = get_process_memory_mb();
@@ -913,12 +941,22 @@ async fn main() -> Result<()> {
                 println!("🔄 [STAGE 6] LIVE NAT REBINDING & PATH MIGRATION VERIFICATION");
                 println!("================================================================================");
 
-                let s_addr: SocketAddr = server.parse().unwrap();
+                let server_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap()).await?;
+                let s_addr = server_ep.local_addr()?;
+                let s_ep_arc = Arc::new(server_ep);
+
+                let s_accept = Arc::clone(&s_ep_arc);
+                tokio::spawn(async move {
+                    while let Some(mut c) = s_accept.accept().await {
+                        tokio::spawn(async move { while (c.recv().await).is_some() {} });
+                    }
+                });
+
                 let client_ep_1 = GtpEndpoint::bind("0.0.0.0:0".parse().unwrap()).await?;
                 let addr_1 = client_ep_1.local_addr()?;
                 let cid = ConnectionId(0xDEAD_FACE_1122_3344);
 
-                let conn_1 = client_ep_1.connect(cid, s_addr, true).await;
+                let conn_1 = client_ep_1.connect(cid, s_addr, true).await?;
 
                 // Send initial packet from Socket #1
                 let _ = conn_1
@@ -937,7 +975,7 @@ async fn main() -> Result<()> {
                     addr_2.port()
                 );
 
-                let conn_2 = client_ep_2.connect(cid, s_addr, true).await;
+                let conn_2 = client_ep_2.connect(cid, s_addr, true).await?;
                 let _ = conn_2
                     .send_unreliable(b"nat_rebind_post_migration".to_vec(), PriorityTier::P1Input)
                     .await;

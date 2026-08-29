@@ -16,11 +16,14 @@ async fn main() -> Result<()> {
 
     let cid = ConnectionId(0xCAFE_BABE_1122_3344);
 
-    // 1. Establish async connection handles on both peers
-    let mut server_conn = server_ep.connect(cid, client_addr, true).await;
-    let client_conn = client_ep.connect(cid, server_addr, true).await;
+    // 1. Client connects via automated X25519 ephemeral handshake
+    let client_task = tokio::spawn(async move { client_ep.connect(cid, server_addr, true).await });
 
-    // 2. Client sends gameplay message asynchronously
+    // 2. Server dynamically accepts incoming client
+    let mut server_conn = server_ep.accept().await.expect("Failed to accept client");
+    let client_conn = client_task.await.unwrap()?;
+
+    // 3. Client sends gameplay message asynchronously
     println!("Client sending reliable gameplay event...");
     client_conn
         .send_reliable_ordered(
