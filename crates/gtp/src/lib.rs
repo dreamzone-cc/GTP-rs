@@ -35,7 +35,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let endpoint = GtpEndpoint::bind("0.0.0.0:7777".parse()?).await?;
 //!     let client_addr: SocketAddr = "192.168.1.50:5000".parse()?;
-//!     let mut conn = endpoint.connect(ConnectionId(0x1122334455667788), client_addr, true).await;
+//!     let mut conn = endpoint.connect(ConnectionId(0x1122334455667788), client_addr, true).await?;
 //!     
 //!     tokio::spawn(async move {
 //!         while let Some(msg) = conn.recv().await {
