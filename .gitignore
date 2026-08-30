@@ -14,3 +14,5 @@
 # OS files
 .DS_Store
 Thumbs.db
+# Machine-local Arabic documentation originals (kept out of the repository per docs policy)
+arabic-local/

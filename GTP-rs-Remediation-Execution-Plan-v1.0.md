@@ -1,89 +1,88 @@
-# خطة التنفيذ الشاملة لمعالجة نتائج تدقيق GTP-rs
+# GTP-rs Remediation Execution Plan — Comprehensive
 
-| البند | القيمة |
+| Field | Value |
 | :--- | :--- |
-| **المرجع الأساسي الملزم** | `GTP-rs-Architecture-Protocol-Audit-Paper-v1.0.md` (الورقة التقنية) |
-| **ملحق تعديلي معتمد** | `GTP-rs_Cross-Audit_Reconciliation_AR.md` — بنوده 0.7 و0.8 وإضافة §6 (التخفيض الزائف للنافذة) وأولوية CORE-3 **مدمجة إلزامياً** في هذه الخطة |
-| **النطاق** | جميع عيوب الورقة (~70 عيباً، 6 مراحل) — التنفيذ يبدأ بالمرحلتين 0 و1 كاملتين + بنود المرحلة 2 عالية الأولوية |
-| **آلية المراجعة** | `GTP-rs-Remediation-Tracker.md` + `scripts/verify_remediation.sh` — انظر §8 |
-| **نسخة الخطة** | v1.0 — 2026-08-30 |
+| **Binding primary reference** | `GTP-rs-Architecture-Protocol-Audit-Paper-v1.0.md` (the technical audit paper) |
+| **Approved amendment** | `GTP-rs-Cross-Audit-Reconciliation.md` — its items 0.7 and 0.8, the §6 addition (the phantom window reduction), and the CORE-3 priority bump are **mandatorily merged** into this plan |
+| **Scope** | All findings of the audit paper (~70 defects, 6 phases) — execution starts with Phases 0 and 1 in full plus the high-priority Phase 2 items |
+| **Review mechanism** | `GTP-rs-Remediation-Tracker.md` + `scripts/verify_remediation.sh` — see §8 |
+| **Plan version** | v1.0 — 2026-08-30 |
 
 ---
 
-## 1. قواعد العمل الملزمة
+## 1. Binding working rules
 
-1. **الورقة التقنية هي المرجع الحَكَم**: كل بند تنفيذ يُشار إلى معرفه في السجل (§12 من الورقة). أي خلاف بين التنفيذ والورقة يُحل لصالح الورقة إلا حيث تعدّلها وثيقة المطابقة صراحةً.
-2. **لا يُعلَن بند "مُنفَّذاً" إلا بثلاثة أدلة**: (أ) تعديل الكود مدمج، (ب) اختبار تثبيت (regression) يفشل قبل الإصلاح وينجح بعده أو يُثبت الخاصية الجديدة، (ج) نجاح بوابة التحقق كاملة (`cargo test --workspace` + clippy).
-3. **كل إصلاح موضعي لا معماري**: لا يُعاد تصميم بروتوكول ضمن هذه الخطة — الاستثناءات الموثقة فقط (SEC-5 مصادقة الخادم، حماية الترويسة) تُصنَّف "مؤجَّل بقرار معماري".
-4. **لا انحدار في الاختبارات الحالية**: اختبار قديم يفشل بسبب إصلاح (مثل `assert_eq!(client_key, server_key)`) يُعاد كتابته ليؤكد السلوك الصحيح الجديد، مع توثيق السبب.
-5. **بوابة التحقق قبل إغلاق أي مرحلة**، ويُحدَّث مستند التتبع فوراً بالحالة والدليل.
+1. **The audit paper is the governing reference**: every work item cites its registry ID (paper §12). Any conflict between the implementation and the paper is resolved in favor of the paper, except where the reconciliation document explicitly amends it.
+2. **No item is declared "done" without three pieces of evidence**: (a) the code change merged, (b) a regression test that fails before the fix and passes after (or proves the new property), (c) a green full verification gate (`cargo test --workspace` + clippy).
+3. **Every fix is local, not architectural**: no protocol redesign within this plan — the documented exceptions (SEC-5 server authentication, header protection) are classified "deferred by architectural decision".
+4. **No regression in existing tests**: a legacy test failing because of a fix (e.g., `assert_eq!(client_key, server_key)`) is rewritten to assert the new correct behavior, with the reason documented.
+5. **The verification gate runs before closing any phase**, and the tracker document is updated immediately with status and evidence.
 
-## 2. المرحلة 0 — إيقاف النزيف الأمني (حرج)
+## 2. Phase 0 — stop the security bleeding (critical)
 
-| البند | يعالج | الملفات المستهدفة | الملخص التنفيذي | معيار القبول |
+| Item | Fixes | Target files | Execution summary | Acceptance criteria |
 | :--- | :--- | :--- | :--- | :--- |
-| **P0-1** | SEC-1 | `gtp-crypto/handshake.rs`, `gtp-crypto/kdf.rs`, `gtp-core/state.rs`, `gtp-core/connection.rs`, `gtp-runtime-tokio/endpoint.rs` | اشتقاق **أربع مواد** (مفتاح+IV لكل اتجاه) بتسميتي HKDF منفصلتين؛ كل طرف يختم بمفتاح اتجاه صعوده ويفتح باتجاه نزوله. بنيّة `DirectionalKeys` جديدة. المسار الثابت المُهمَل يُحوَّل أيضاً للاشتقاق الاتجاهي | `assert_ne!` بين مفتاحي الاتجاهين؛ فشل فك حزمة العميل بمفتاح العميل (اختبار متقاطع)؛ اختبار المصافحة e2e الحي ينجح |
-| **P0-2** | SEC-2 | `gtp-crypto/aead.rs` | الـ nonce = `IV ⊕ PN_be[0..8]` في البايتات 4..12 (كامل الـ 64 بت). إزالة CID من الـ nonce (المفتاح مُسقَف بالـ CID أصلاً في HKDF info) — يمنع التداخل | اختبار: nonce(PN=1) ≠ nonce(PN=2³²+1)؛ roundtrip AEAD ينجح |
-| **P0-3** | SEC-3 | `gtp-crypto/replay.rs`, `gtp-core/connection.rs` | فصل API النافذة: `check(pn)` (فحص بلا التزام) قبل المصادقة، و`commit(pn)` بعد نجاح AEAD فقط | حزمة مزيفة بـ PN=u64::MAX فاشلة المصادقة لا تحرق النافذة — الحزمة الشرعية اللاحقة بنفس PN تُقبل |
-| **P0-4** | SEC-4 | `gtp-path/stateless_token.rs`, `gtp-path/Cargo.toml` | استبدال XOR بـ `HMAC-SHA256(secret, "GTP-COOKIE-V1"‖addr‖ts)`؛ الطابع في البايتات 0..8 نصاً والباقي HMAC مقطوعاً 24 بايت؛ **رفض الطابع المستقبلي** (`token_time > now`) | اختبار: تعديل طابع كوكي قديم لتحديثه **يفشل**؛ استرجاع بايتات الـ secret من كوكي **مستحيل** (تغيير secret يغيّر HMAC) |
-| **P0-5** | SEC-7/10/12/14 | `Cargo.toml`, `aead.rs`, `handshake.rs` | تفعيل `x25519-dalek/zeroize`؛ `checked_add` في فحوص أطوال seal/open؛ فحص `was_contributory()` (توقيع `compute_shared_secret` يصبح `Result`)؛ `Debug` يدوي محجوب لـ `GtpAeadProtector` و`HandshakeSecret` | بناء نظيف؛ اختبار low-order key يُرفض؛ `format!("{:?}")` لا يحوي بايتات مفتاح |
-| **P0-6** | REC-10 + مطابقة 0.7/0.8 | `gtp-wire/frame.rs`, `gtp-recovery/loss_detector.rs` | (أ) **إصلاح فك النطاقات**: طرح `gap` قبل حساب `start` (اصطلاح المرمّز: gap يسبق النطاق). (ب) تحقق دلالي: `largest_acked ≤ أقصى PN مُرسَل`، سقف مجموع الحزم المُقرّة لكل إطار، رفض الالتفاف السفلي | **اختبار خاصية**: نمط استلام بفجوات عشوائية (بذرة حتمية) → مجموعة المُقرّة = المستلمة بالضبط؛ إطار بحجم تخصيص مهول يُرفض |
-| **P0-7** | Core-C1 (جزء التحصين) | — | *(منقول للمرحلة 1 — إصلاحه وظيفي لا أمني خالص)* | — |
+| **P0-1** | SEC-1 | `gtp-crypto/handshake.rs`, `gtp-crypto/kdf.rs`, `gtp-core/state.rs`, `gtp-core/connection.rs`, `gtp-runtime-tokio/endpoint.rs` | Derive **four key materials** (key+IV per direction) with two separate HKDF labels; each endpoint seals with its outbound direction key and opens with its inbound. New `DirectionalKeys` type. The deprecated static path also becomes directional | `assert_ne!` between direction keys; cross-decryption of client traffic with the client key fails (cross test); the live e2e handshake passes |
+| **P0-2** | SEC-2 | `gtp-crypto/aead.rs` | Nonce = `IV ⊕ PN_be[0..8]` in bytes 4..12 (all 64 bits). The CID leaves the nonce (the key is already CID-scoped via HKDF info) — removes the overlap | Test: nonce(PN=1) ≠ nonce(PN=2³²+1); AEAD round-trip passes |
+| **P0-3** | SEC-3 | `gtp-crypto/replay.rs`, `gtp-core/connection.rs` | Split the window API: `check(pn)` (no commitment) before authentication, `commit(pn)` only after successful AEAD | A forged unauthenticated PN=u64::MAX packet does not burn the window — the subsequent legitimate packet with that PN is accepted |
+| **P0-4** | SEC-4 | `gtp-path/stateless_token.rs`, `gtp-path/Cargo.toml` | Replace XOR with `HMAC-SHA256(secret, "GTP-COOKIE-V1"‖addr‖ts)`; the timestamp stays plaintext in bytes 0..8, the remaining 24 bytes are the truncated MAC; **reject future timestamps** (`token_time > now`) | Tests: refreshing an old cookie's timestamp **fails**; recovering secret bytes from a cookie **is impossible** (changing the secret changes the HMAC) |
+| **P0-5** | SEC-7/10/12/14 | `Cargo.toml`, `aead.rs`, `handshake.rs` | Enable `x25519-dalek/zeroize`; `checked_add` in the seal/open length checks; enforce `was_contributory()` (`compute_shared_secret` returns `Result`); manually redacted `Debug` for `GtpAeadProtector` and `HandshakeSecret` | Clean build; a low-order key is rejected; `format!("{:?}")` contains no key bytes |
+| **P0-6** | REC-10 + reconciliation 0.7/0.8 | `gtp-wire/frame.rs`, `gtp-recovery/loss_detector.rs` | (a) **Fix the range decoder**: apply `gap` before computing `start` (the encoder's convention: the gap precedes the block). (b) Semantic validation: `largest_acked ≤ largest sent PN`, a per-frame acked-count cap, reject underflow | **Property test**: a seeded random gap pattern → the acked set equals the received set exactly; a frame demanding a huge allocation is rejected |
 
-## 3. المرحلة 1 — إحياء التكامل الوظيفي
+## 3. Phase 1 — revive functional integration
 
-| البند | يعالج | الملفات المستهدفة | الملخص التنفيذي | معيار القبول |
+| Item | Fixes | Target files | Execution summary | Acceptance criteria |
 | :--- | :--- | :--- | :--- | :--- |
-| **P1-1** | Core-C1 + PATH-5 + جزء PATH-3 | `gtp-core/control/handle.rs`, `gtp-core/connection.rs`, `gtp-runtime-tokio/endpoint.rs` | **صف انتظار تحكم مستقل** في `ConnectionHot` (عناصر `Frame` مُملوكة + وجهة اختيارية) تُصرف مباشرة في `produce` قبل بيانات المجدول؛ رد PathResponse يُوجَّه لـ `src_addr` للمتحدّي؛ `graceful_close` يُدخل Close في الصف **قبل** انتقال Draining، وبوابة TX تسمح بالإنتاج في Draining حتى نضوب صف التحكم (حلقة TX تنكسر على `Closed` فقط) | اختبار e2e: ping يصل النظير كإطار Ping؛ Close يجعل النظير ينتقل Draining؛ تحدٍّ مسار عبر البروتوكول يبدّل `active_path` نحو العنوان الجديد |
-| **P1-2** | REC-7 + CC-6 + SEC-18 | `gtp-recovery/ack_tracker.rs`, `gtp-cc/cubic.rs`, `gtp-cc/pacing.rs`, `gtp-core/state.rs`, `gtp-core/control/config.rs` | حقن إعداد `GtpConfig` فعلياً: `AckTracker::with_policy(ack_frequency, max_ack_delay)`؛ `Cubic` يقبل β/C/IW/min_cwnd/SMSS؛ Pacing يقبل gain/burst؛ المسار المُهمَل `new()` يمرر القيم الافتراضية. حذف الحقول الميتة بلا قارئ أو توصيلها | اختبار: تكوين بأرقام غير افتراضية يُنتج سلوك ACK/cwnd مختلفاً قياساً |
-| **P1-3** | CC-3 + مطابقة §6 | `gtp-cc/cubic.rs`, `gtp-recovery/loss_detector.rs`, `gtp-core/connection.rs` | (أ) لا تُحصى بايتات ACK-only في `cc.inflight`. (ب) **فلترة حلقة كشف الفقد على `record.in_flight`** (RFC 9002 §2) — يمنع التخفيض الزائف للنافذة كل RTT | اختبار: إرسال 50 حزمة ACK-only ثم ACK واحد — `inflight` لا ينمو؛ cwnd لا تُخفَّض زوراً |
-| **P1-4** | REC-11 + ORD-4 | `gtp-recovery/loss_detector.rs`, `gtp-core/connection.rs` | `on_timeout` يُسقط السجلات التي يعيدها (سقف دفعة = 2، الأقدم أولاً، ack-eliciting فقط) + تراجع أُسّي `PTO×2^min(pto_count,8)` مع قراءة `pto_max_duration` سقفاً؛ **فهرس تسليم** (HashSet بسقف FIFO) يمنع تكرار تسليم `ReliableUnordered` لنفس message_id | اختبار محاكاة: فقدان 100% من الـ ACKs — عدد إطارات إعادة الإرسال لكل PTO ≤ 2 ولا يتسعّ؛ الرسالة تُسلَّم مرة واحدة |
-| **P1-5** | ORD-1 + SEM-1 + SEM-2 | `gtp-types/identifiers.rs`, `gtp-scheduler/ordered_group.rs`, `gtp-core/connection.rs` | RFC 1982 لـ `GenerationId` ولمقارنات `order_seq` (حساب لفّي صريح)؛ **drop-late استقبالاً**: إطار Data بمفتاح غير افتراضي وتسلسل غير صفري يُقارن بجدول RX-side قبل التسليم | اختبارات التفاف u32 للمجموعة والجيل؛ تسليم 5→3 يُسقط 3 |
-| **P1-6** | REC-5 + REC-6 | `gtp-recovery/ack_tracker.rs` | تقليم الفترات المؤكدة القديمة (دون أكبر نقطة مسلَّمة تسلسلياً) + عند تجاوز 32 فترة: دمج الفجوات الأصغر بدل إسقاط الإقرارات | اختبار: 100 فجوة متتالية — الإقرارات لا تتجاوز 32 ولا تُسقط بصمت؛ الذاكرة لا تنمو خطياً |
+| **P1-1** | Core-C1 + PATH-5 + part of PATH-3 | `gtp-core/control/handle.rs`, `gtp-core/connection.rs`, `gtp-runtime-tokio/endpoint.rs` | A **dedicated control queue** in `ConnectionHot` (owned `Frame` items + an optional destination) spent directly in `produce` ahead of scheduler data; the PathResponse echo is routed to the challenger's `src_addr`; `graceful_close` enqueues the Close **before** the Draining transition, and the TX gate produces throughout Draining until the control queue empties (the loop exits on `Closed` only) | e2e tests: a ping reaches the peer as a Ping frame; Close moves the peer to Draining; a protocol-level path challenge switches `active_path` to the new address |
+| **P1-2** | REC-7 + CC-6 + SEC-18 | `gtp-recovery/ack_tracker.rs`, `gtp-cc/cubic.rs`, `gtp-cc/pacing.rs`, `gtp-core/state.rs`, `gtp-core/control/config.rs` | Actually inject `GtpConfig`: `AckTracker::with_policy(freq, max_delay)`; Cubic accepts β/C/IW/min_cwnd/SMSS; Pacing accepts gain/burst; the deprecated `new()` path passes defaults. Delete the dead fields or wire them | Test: a non-default config produces measurably different ACK/cwnd behavior |
+| **P1-3** | CC-3 + reconciliation §6 | `gtp-cc/cubic.rs`, `gtp-recovery/loss_detector.rs`, `gtp-core/connection.rs` | (a) ACK-only bytes never enter `cc.inflight`. (b) **Filter the loss-detection loop on `record.in_flight`** (RFC 9002 §2) — prevents the phantom per-RTT window reduction | Tests: 50 ACK-only packets then one ACK — `inflight` does not grow; cwnd is not spuriously reduced |
+| **P1-4** | REC-11 + ORD-4 | `gtp-recovery/loss_detector.rs`, `gtp-core/connection.rs` | `on_timeout` drops the records it returns (burst cap = 2, oldest first, ack-eliciting only) + exponential backoff `PTO×2^min(pto_count,8)` capped by `pto_max_duration`; a **delivery index** (bounded FIFO set) blocks duplicate delivery of a `ReliableUnordered` message_id | Simulation test: 100% ACK loss — retransmissions per PTO ≤ 2 and non-escalating; the message is delivered exactly once |
+| **P1-5** | ORD-1 + SEM-1 + SEM-2 | `gtp-types/identifiers.rs`, `gtp-scheduler/ordered_group.rs`, `gtp-core/connection.rs` | RFC 1982 for `GenerationId` and for `order_seq` comparisons (explicit modular arithmetic); **receive-side drop-late**: a Data frame with a non-default key and non-zero sequence is checked against an RX-side table before delivery | Tests: u32 wrap for group and generation; delivering 5→3 drops 3 |
+| **P1-6** | REC-5 + REC-6 | `gtp-recovery/ack_tracker.rs` | Prune confirmed old intervals (below the sequential delivery point) + when 32 ranges would be exceeded: coalesce the smallest gaps instead of dropping acknowledgements | Test: 100 successive gaps — acknowledgements stay within 32 without silent drops; memory does not grow linearly |
 
-## 4. المرحلة 2 — بنود الأولوية العالية (تنفَّذ مع المرحلتين 0/1)
+## 4. Phase 2 — high-priority items (executed with Phases 0/1)
 
-| البند | يعالج | الملخص | معيار القبول |
+| Item | Fixes | Summary | Acceptance criteria |
 | :--- | :--- | :--- | :--- |
-| **P2-1** | CORE-3 | حلقة RX تستمر على `ConnectionReset/WouldBlock` وتسجل الأخطاء الأخرى بدل الموت — **سببه أولوية بقرار وثيقة المطابقة** (ICMP قابل للإرسال عن بُعد) | محاكاة خطأ socket لا تقتل الـ endpoint |
-| **P2-2** | ORD-2 | خطأ امتلاء مجموعة مرتبة **يعزل الإطار** (عدّاد dropped) ولا يجهض الـ datagram ولا يتخطى `ack_tracker.on_packet_received` | livelock الاختباري: امتلاء + إعادة إرسال → الحزمة تُعترف بها ويعود التقدم |
-| **P2-3** | PATH-1 + Draining→Closed | السماح بـ `Initial→Closed` و`Draining→Closed` (إغلاق فاشل المصافحة ممكن + إنهاء التصريف) | `force_close` على اتصال جديد ينجح |
-| **P2-4** | CORE-4 | إخلاء مدخل جدول CID عند بلوغ حالة Closed + رفض استبدال CID لاتصال حي (Established) | اختبار إخلاء ورفض التعديض |
-| **P2-5** | SEC-6 (تمكين آمن) | Ratchet يدير **زوجَي** الاتجاهين معاً بضبط بت KEY_PHASE + مفتاح RX سابق بنافذة سماح؛ الوثائق تنص على أنه مطلوب من الطرفين معاً (بلا تفاوض سلكي بعد) | اختبار: بعد ratchet متزامن لدى الطرفين يستمر تبادل البيانات |
-| **P2-6** | D-2 + ترتيب §3.4 | أخطاء `append_frame` تُعالج: العنصر يُعاد للمجدول (push-front) بدل إسقاطه مع تسجيل in-flight وهمي | اختبار: حمولة قرب سعة الـ datagram لا تُفقد ولا تُسجَّل وهمياً |
+| **P2-1** | CORE-3 | The RX loop continues on `ConnectionReset/WouldBlock` and logs other errors instead of dying — **promoted per the reconciliation decision** (ICMP is remotely sendable) | A simulated socket error does not kill the endpoint |
+| **P2-2** | ORD-2 | A full reorder buffer **isolates the frame** (a dropped counter) without aborting the datagram or skipping `ack_tracker.on_packet_received` | The livelock test: full buffer + retransmission → the packet is acknowledged and progress resumes |
+| **P2-3** | PATH-1 + Draining→Closed | Permit `Initial→Closed` and `Draining→Closed` (closing a failed handshake possible + terminating the drain) | `force_close` on a fresh connection succeeds |
+| **P2-4** | CORE-4 | Evict the CID table entry on reaching Closed + refuse to replace a live (Established) connection's CID | Eviction and replacement-rejection tests |
+| **P2-5** | SEC-6 (safe enablement) | The ratchet rotates **both** direction pairs together, sets the KEY_PHASE bit, and retains the previous RX key for a grace window; documentation states both peers must invoke it together (no wire negotiation yet) | Test: after a synchronized ratchet on both peers, data exchange continues |
+| **P2-6** | D-2 + §3.4 ordering | `append_frame` errors are handled: the item is requeued (push-front) instead of being dropped while recording phantom in-flight | Test: a payload near datagram capacity is neither lost nor phantom-recorded |
 
-## 5. المراحل 3–5 (مؤجَّلة بمتابعة — خارج نطاق هذه الجولة)
+## 5. Phases 3–5 (tracked, out of scope this round)
 
-| المرحلة | البنود | الحالة المبدئية |
+| Phase | Items | Initial status |
 | :--- | :--- | :--- |
-| **3 — عدالة الجدولة والذاكرة** | SCH-1/2/3/4، سقف المجموعات ORD-5، تقليم StateTable SEM-5 | مؤجَّلة — تُنفَّذ بعد استقرار المرحلتين 0/1 قياساً وتحقيقاً |
-| **4 — بنية اختبار الالتحام** | السيناريوهات 1–11 (incl. سيناريو ACK متعدد الفجوات من وثيقة المطابقة) | جزئياً منفَّذة ضمن اختبارات التثبيت أعلاه؛ الباقي (bodies ضغط CLI، بذور متعددة) مؤجَّل |
-| **5 — الأداء** | إزالة to_vec، تقليص Frame، مُحكى مخزّن، gtp-io، نبض TX | مؤجَّلة — بعد الصحة (مبدأ الورقة §13) |
-| **مؤجَّلة بقرار معماري** | SEC-5 (مصادقة خادم/Finished)، حماية الترويسة (توصية وثيقة المطابقة)، WIR-6 (امتدادات header_len)، WIR-10 (تفاوض نسخة) | تحتاج قرار تصميم بروتوكولي موثق قبل التنفيذ |
+| **3 — scheduler fairness and memory** | SCH-1/2/3/4, the group cap ORD-5, StateTable pruning SEM-5 | Deferred — executed after Phases 0/1 stabilize, by measurement and verification |
+| **4 — the seam-test harness** | Scenarios 1–11 (incl. the multi-gap ACK scenario from the reconciliation document) | Partially covered by the regression tests above; the remainder (CLI stress bodies, multiple seeds) deferred |
+| **5 — performance** | Remove to_vec, shrink Frame, cached cipher, gtp-io, TX tick | Deferred — after correctness (paper §13 principle) |
+| **Deferred by architectural decision** | SEC-5 (server authentication/Finished), header protection (reconciliation recommendation), WIR-6 (header_len extensions), WIR-10 (version negotiation) | Require a documented protocol design decision before implementation |
 
-## 6. خريطة التبعيات التنفيذية
+## 6. Implementation dependency map
 
 ```
 P0-5 (Cargo zeroize) ─┐
-P0-1 (اتجاهي) ────────┼─→ P2-5 (ratchet) ─→ P1-1 (تحكم) ─→ endpoint TX gate
+P0-1 (directional) ───┼─→ P2-5 (ratchet) ─→ P1-1 (control) ─→ endpoint TX gate
 P0-2 (nonce) ─────────┘
-P0-3 (نافذة) ──→ connection.rs RX إعادة ترتيب
-P0-6 (ACK فك) ──→ P1-3 (in_flight) ──→ P1-4 (PTO/تكرار)
-P1-2 (توصيل إعداد) ──→ P1-6 (تقليم ACK)
-P1-5 (RFC1982) مستقلة
+P0-3 (window) ──→ connection.rs RX reorder
+P0-6 (ACK decode) ──→ P1-3 (in_flight) ──→ P1-4 (PTO/dedup)
+P1-2 (config wiring) ──→ P1-6 (ACK pruning)
+P1-5 (RFC1982) independent
 ```
 
-## 7. تسلسل التنفيذ والتحقق لكل خطوة
+## 7. Per-step execution and verification sequence
 
-1. قراءة الملف الهدف + مواضع الورقة (`file:line`).
-2. التعديل + تعديل/إضافة الاختبارات في نفس الـ commit المنطقي.
-3. `cargo test -p <crate>` للطبقة، ثم `cargo test --workspace` عند كل نقطة التقاء.
-4. تحديث التتبع: الحالة + اسم اختبار التثبيت + نتيجة البوابة.
+1. Read the target file + the paper's locations (`file:line`).
+2. Apply the change + update/add the tests in the same logical commit.
+3. `cargo test -p <crate>` for the layer, then `cargo test --workspace` at every convergence point.
+4. Update the tracker: status + regression test name + gate result.
 
-## 8. آلية المراجعة والتحقق (Review Mechanism)
+## 8. Review and verification mechanism
 
-1. **مستند التتبع** `GTP-rs-Remediation-Tracker.md`: مصفوفة كل بنود الخطة × (الحالة | اختبار التثبيت | الدليل | ملاحظات). هو السجل الوحيد المعتمد لحالة التنفيذ.
-2. **بوابة التحقق** `scripts/verify_remediation.sh`: fmt + clippy (تقرير) + `cargo test --workspace --all-targets` (بوابة قاطعة) + فحوص grep إجرائية (اختبار عدم تساوي المفاتيح موجود، لا `assert_eq!` للمفاتيح، رفض الطابع المستقبلي موجود).
-3. **قاعدة الإغلاق**: بند بلا اختبار تثبيت مُسمّى في التتبع = غير مُنفَّذ.
-4. **قاعدة الانحدار**: أي فشل اختباري بعد دمج بند = البند يُعاد إلى `قيد الإصلاح` تلقائياً.
-5. المرجع الحَكَم عند أي نزاع: الورقة التقنية §12 (السجل) ثم وثيقة المطابقة.
+1. **Tracker document** `GTP-rs-Remediation-Tracker.md`: a matrix of every plan item × (status | regression test | evidence | notes). It is the single authoritative record of execution status.
+2. **Verification gate** `scripts/verify_remediation.sh`: fmt + clippy (report) + `cargo test --workspace --all-targets` (hard gate) + procedural grep checks (the key-inequality test exists, no `assert_eq!` on keys, the future-timestamp rejection exists).
+3. **Closure rule**: an item without a named regression test in the tracker is not implemented.
+4. **Regression rule**: any test failure after merging an item returns the item to `in repair` automatically.
+5. The arbiter for any dispute: the audit paper §12 (the registry), then the reconciliation document.

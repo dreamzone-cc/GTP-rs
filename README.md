@@ -108,6 +108,18 @@ cargo run -p gtp-cli -- dissect 80000100011811223344556677880000000000000001000F
 - **API & Architecture Guides**:
   - [`docs/GTP_API_ARCHITECTURE_AND_DEVELOPMENT_GUIDELINES.md`](docs/GTP_API_ARCHITECTURE_AND_DEVELOPMENT_GUIDELINES.md): Architecture guide and continuous protocol evolution rules.
   - [`docs/GTP_CONTROL_API_REFERENCE_MANUAL.md`](docs/GTP_CONTROL_API_REFERENCE_MANUAL.md): Complete function-by-function reference manual.
+- **Security & Remediation**:
+  - [`GTP-rs-Architecture-Protocol-Audit-Paper-v1.0.md`](GTP-rs-Architecture-Protocol-Audit-Paper-v1.0.md): Comprehensive architecture/protocol audit (~70 findings with severity ratings and exact locations).
+  - [`GTP-rs-Cross-Audit-Reconciliation.md`](GTP-rs-Cross-Audit-Reconciliation.md): Independent cross-audit reconciliation with the unified critical list.
+  - [`GTP-rs-Remediation-Execution-Plan-v1.0.md`](GTP-rs-Remediation-Execution-Plan-v1.0.md): Phased remediation execution plan derived from the audit.
+  - [`GTP-rs-Remediation-Tracker.md`](GTP-rs-Remediation-Tracker.md): Live execution tracker with per-item regression-test evidence.
+  - Verification gate: `bash scripts/verify_remediation.sh` (tests + clippy + procedural checks).
+- **Roadmap & Integration**:
+  - [`GTP-rs-technical-paper.md`](GTP-rs-technical-paper.md): Remaining work, enhancements, and additional testing.
+  - [`GTP-rs-remediation-plan.md`](GTP-rs-remediation-plan.md): Phased fix-and-development plan across all crates.
+  - [`GTP-rs-remaining-fixes.md`](GTP-rs-remaining-fixes.md): Post-705f985 fixes and updates.
+  - [`GTP-rs-wiring-fixes.md`](GTP-rs-wiring-fixes.md): Handshake and component wiring fixes.
+  - [`zgalaxy_rs_gtp_direct_relay_technical_spec_v3.md`](zgalaxy_rs_gtp_direct_relay_technical_spec_v3.md): zgalaxy-rs integration spec (direct-first with relay fallback).
 
 ---
 

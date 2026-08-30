@@ -1,127 +1,127 @@
-# ورقة تقنية للمطوّر: الإصلاحات والتحديثات المتبقية — GTP-rs (بعد الكوميت 705f985)
+# Developer Technical Paper: The Remaining Fixes and Updates — GTP-rs (after commit 705f985)
 
-**ملاحظة افتتاحية:** الفجوة الأمنية الجوهرية التي تتبعناها عبر عدة مراجعات سابقة (السر الجذري الثابت، ثم الـ handshake غير الموصول) **أُغلِقت فعليًا هذه المرة** — تحققت من الكود سطرًا بسطر: `connections.insert()` يحدث الآن فقط بعد نجاح التحقق من stateless cookie، `connect()` تُعيد `Result` صريحًا بدل السقوط الصامت لسر ثابت، والتوزيع يعتمد على `ConnectionId` لا عنوان الشبكة. هذا العمل جيد ولا يحتاج إعادة فتح.
+**Opening note:** the fundamental security gap we have been tracking across several previous reviews (the fixed master secret, then the unwired handshake) **is genuinely closed this time** — I verified the code line by line: `connections.insert()` now happens only after the stateless-cookie verification succeeds, `connect()` returns an explicit `Result` instead of silently falling back to a fixed secret, and routing keys off `ConnectionId` rather than the network address. This work is good and does not need reopening.
 
-ما تبقّى الآن هو مجموعة تحسينات **متوسطة إلى منخفضة الأولوية** — لا توجد ثغرة حرجة مفتوحة حاليًا في مسار الاتصال الأساسي. كل بند مستقل بصيغة: **الحالة الحالية / لماذا يستحق الإصلاح / التنفيذ المقترح / الأثر على الأداء والاستقرار**.
-
----
-
-## 1. تفعيل `ratchet_key` (لا يزال كودًا معزولًا)
-
-**الحالة الحالية:** `CHANGELOG.md` يذكرها تحت "Added" كأنها ميزة نشطة، لكن `grep -rn "ratchet_key"` يُظهر أنها **لا تُستدعى من أي مكان في `gtp-core` أو `gtp-runtime-tokio`** — فقط مُصدَّرة (re-export) من `gtp-crypto`/`gtp`. الدالة نفسها صحيحة ومُختبَرة وحدويًا.
-
-**لماذا يستحق الإصلاح:** بدون تفعيلها، أي جلسة تتجاوز ساعات طويلة تستمر على نفس المفتاح المُشتق عند بدء الاتصال إلى الأبد — لا خطر فوري، لكنه يقلل forward secrecy لجلسات البث المباشر أو الألعاب الطويلة جدًا (MMO مثلًا).
-
-**التنفيذ المقترح:**
-1. إضافة حقل `packets_since_rotation: u32` (أو استخدام `PacketNumber` الحالي مباشرة عبر `& ROTATION_MASK`) إلى `ConnectionHot`.
-2. إضافة بت "key phase" واحد في `PacketHeader` (`gtp-wire/src/header.rs`) — عند تجاوز العتبة (يُقترَح 2^24 حزمة أو ساعة واحدة، أيهما أقرب)، يُقلَب البت وتُستدعى `ratchet_key(current_key, cid)` لبناء `Protector::Aead` جديد.
-3. الطرف المستقبِل: عند رؤية بت مختلف عن المُخزَّن محليًا، يُحسَب `ratchet_key` محليًا أيضًا **قبل** محاولة `open()` — إن فشلت المحاولة الأولى، جرّب المفتاح المُدوَّر تلقائيًا (نافذة سماح لحزم متأخرة بالمفتاح القديم).
-
-**الأثر:** عملية HKDF واحدة كل ساعات/ملايين الحزم — مهملة تمامًا مقارنة بحجم الجلسة. صفر أثر على الكمون العادي.
+What remains now is a set of **medium-to-low priority improvements** — there is currently no open critical vulnerability in the core connection path. Each item is independent, in the format: **Current state / Why it deserves fixing / Proposed implementation / Performance & stability impact**.
 
 ---
 
-## 2. `client_proof` في `HandshakeFinish` غير مُفعَّل — لا يوجد تأكيد امتلاك مفتاح فعلي (Key Confirmation)
+## 1. Enabling `ratchet_key` (still isolated code)
 
-**اكتشاف جديد لم يُذكر سابقًا.** تحققت من `endpoint.rs:172`:
+**Current state:** `CHANGELOG.md` lists it under "Added" as if it were an active feature, but `grep -rn "ratchet_key"` shows it is **not invoked anywhere in `gtp-core` or `gtp-runtime-tokio`** — only re-exported from `gtp-crypto`/`gtp`. The function itself is correct and unit-tested.
+
+**Why it deserves fixing:** without enabling it, any session running past a few hours continues on the same connection-start key forever — no immediate danger, but it reduces forward secrecy for long streaming sessions or very long games (MMOs, for example).
+
+**Proposed implementation:**
+1. Add a `packets_since_rotation: u32` field to `ConnectionHot` (or use the current `PacketNumber` directly via `& ROTATION_MASK`).
+2. Add a single "key phase" bit in the `PacketHeader` (`gtp-wire/src/header.rs`) — when the threshold is exceeded (proposed: 2^24 packets or one hour, whichever comes first), flip the bit and call `ratchet_key(current_key, cid)` to build a new `Protector::Aead`.
+3. On the receiving side: upon seeing a bit different from the locally stored one, compute `ratchet_key` locally as well **before** attempting `open()` — if the first attempt fails, automatically try the rotated key (a grace window for late packets under the old key).
+
+**Impact:** one HKDF operation every few hours/millions of packets — entirely negligible against the session volume. Zero impact on normal latency.
+
+---
+
+## 2. The `client_proof` in `HandshakeFinish` is not enabled — there is no actual key-confirmation possession proof
+
+**A new discovery not previously mentioned.** I verified `endpoint.rs:172`:
 ```rust
 let fin_frame = Frame::HandshakeFinish {
     cookie_echo: stateless_cookie,
-    client_proof: [0u8; 32],   // ⚠️ دائمًا صفر، لا يُحسَب ولا يُتحقَّق منه أبدًا
+    client_proof: [0u8; 32],   // ⚠️ always zero, never computed, never verified
 };
 ```
-الحقل موجود في تنسيق السلك (`gtp-wire/src/frame.rs`) لكنه غير مُستخدَم فعليًا — أي مصادقة "إثبات الامتلاك" الوحيدة الحالية هي الـ cookie (تثبت ملكية عنوان IP)، وليس هناك إثبات أن الطرفين اشتقا فعلًا **نفس** مفتاح الجلسة قبل بدء إرسال بيانات حقيقية مشفَّرة.
+The field exists in the wire format (`gtp-wire/src/frame.rs`) but is not actually used — meaning the only "proof of possession" authentication today is the cookie (which proves IP address ownership), and there is no proof that both parties actually derived the **same** session key before real encrypted data transmission begins.
 
-**لماذا يستحق الإصلاح:** ليس ثغرة استغلال مباشرة (بدون المفتاح الخاص، لا يمكن للمهاجم حساب نفس السر أصلًا)، لكنه يعني أن أي خلل بسيط (تطابق خاطئ لنسخة بروتوكول، bug في ترتيب الـ nonce، إلخ) لن يُكتشَف إلا عند فشل فك تشفير أول حزمة بيانات فعلية — بدل أن يُكتشَف صراحة أثناء الـ handshake نفسه برسالة خطأ واضحة.
+**Why it deserves fixing:** not a directly exploitable vulnerability (without the private key an attacker cannot compute the same secret anyway), but it means any simple mismatch (a wrong protocol-version handshake, a bug in nonce ordering, etc.) is discovered only when the first real data packet fails to decrypt — instead of being caught explicitly during the handshake itself with a clear error message.
 
-**التنفيذ المقترح:**
+**Proposed implementation:**
 ```rust
-// العميل يحسب:
+// The client computes:
 let client_proof = hmac_sha256(derived_key, b"gtp-handshake-finish" || client_public_key || server_public_key);
 ```
-والخادم يتحقق من نفس القيمة بعد اشتقاق مفتاحه هو — استخدام `hmac` crate (خفيفة، pure Rust). هذا يحدث مرة واحدة فقط ضمن الـ handshake، **صفر أثر على مسار البيانات اللاحق**.
+and the server verifies the same value after deriving its own key — using the `hmac` crate (lightweight, pure Rust). This happens once inside the handshake, **zero impact on the subsequent data path**.
 
-**الأولوية:** متوسطة (تحسين تشخيصي/دفاع في العمق، وليس إغلاق ثغرة استغلال).
+**Priority:** medium (a diagnostic improvement / defense in depth, not the closure of an exploitable hole).
 
 ---
 
-## 3. لا يوجد `cargo-fuzz` حقيقي (Coverage-Guided) بعد
+## 3. No real (coverage-guided) `cargo-fuzz` yet
 
-**الحالة الحالية:** الاختبار الموجود (`test_fuzz_mutated_buffers_resilience`) حلقة LCG بسيطة بحجم مخازن محدود 64 بايت فقط. لا يوجد مجلد `fuzz/` في المشروع.
+**Current state:** the existing test (`test_fuzz_mutated_buffers_resilience`) is a simple LCG loop with buffer sizes capped at 64 bytes. There is no `fuzz/` directory in the project.
 
-**التنفيذ المقترح:**
+**Proposed implementation:**
 ```bash
 cargo install cargo-fuzz && cargo fuzz init
 ```
-هدفان على الأقل:
-- `fuzz_targets/decode_frame.rs` → يغذّي `Frame::decode` بأحجام تصل حتى MTU الكامل (1200+ بايت)، وليس 64 بايت فقط.
-- `fuzz_targets/handshake_frames.rs` → يغذّي تحديدًا `ClientHello`/`ServerHello`/`HandshakeFinish` تحديدًا بما أنها المسار الجديد الأكثر حساسية أمنيًا الآن.
+At least two targets:
+- `fuzz_targets/decode_frame.rs` → feeds `Frame::decode` sizes up to the full MTU (1200+ bytes), not just 64.
+- `fuzz_targets/handshake_frames.rs` → feeds specifically `ClientHello`/`ServerHello`/`HandshakeFinish`, since that is the newest, most security-sensitive path right now.
 
-يُشغَّل كمهمة CI منفصلة (بحد زمني، مثلًا 15 دقيقة عند كل push على الفرع الرئيسي، أو تشغيل ليلي)، **لا يدخل ضمن `cargo build --release`** فلا أثر على الإنتاج.
-
----
-
-## 4. لا توجد بنشماركات معيارية حقيقية (`criterion`)
-
-**الحالة الحالية:** كل الأرقام المنشورة في تقارير الأداء الداخلية (throughput، زمن seal/open) قياسات يدوية عبر `Instant::now()` داخل `gtp-cli StressSuite` — مفيدة لكنها ليست بنشماركات معيارية قابلة للمقارنة عبر الزمن أو الكشف التلقائي عن التراجع.
-
-**التنفيذ المقترح:** إضافة `criterion` كـ dev-dependency في `gtp-cc`, `gtp-wire`, `gtp-crypto` مع أهداف قياس لـ: `Frame::encode`/`decode`، `GtpAeadProtector::seal`/`open`، تقارب CUBIC عبر تكرارات محاكاة. تشغيل دوري ضمن CI (أسبوعي أو عند PR يمس هذه الكرايتات) مع حفظ تاريخي للنتائج لرصد أي تراجع أداء تلقائيًا.
-
-**الأثر:** صفر على الإنتاج — `cargo bench` هدف منفصل تمامًا.
+Run as a separate CI task (time-boxed, e.g., 15 minutes per push to the main branch, or nightly); **not included in `cargo build --release`**, hence no production impact.
 
 ---
 
-## 5. منطقة "TCP-Friendly" غائبة من CUBIC (لا تزال معلَّقة من مراجعات سابقة)
+## 4. No real standard benchmarks (`criterion`)
 
-**الحالة الحالية:** `gtp-cc/src/cubic.rs` يطبّق معادلة CUBIC الأساسية بشكل صحيح ($\beta=0.7$)، لكن بدون "TCP-friendly region" أو "fast convergence" من RFC 8312.
+**Current state:** all the figures published in internal performance reports (throughput, seal/open time) are manual measurements via `Instant::now()` inside the `gtp-cli StressSuite` — useful, but not standard benchmarks comparable over time or capable of automatic regression detection.
 
-**لماذا يستحق الإصلاح:** بدون هذه المنطقة، تدفقات GTP قد تكون عدوانية بشكل غير عادل تجاه تدفقات TCP/QUIC أخرى تتشارك نفس عنق الزجاجة في الشبكة (مثلًا لاعب يشغّل تحديث لعبة عبر HTTP بجانب جلسة GTP نشطة).
+**Proposed implementation:** add `criterion` as a dev-dependency in `gtp-cc`, `gtp-wire`, `gtp-crypto` with measurement targets for: `Frame::encode`/`decode`, `GtpAeadProtector::seal`/`open`, CUBIC convergence across simulation iterations. Periodic CI runs (weekly, or on PRs touching these crates) with historical archiving of results to automatically detect any performance regression.
 
-**التنفيذ المقترح:** إضافة فرع منطقي إضافي داخل `update_w_cubic` يحسب `W_tcp` (نافذة TCP المكافئة تقريبيًا) ويستخدم الأكبر بين `W_cubic` و`W_tcp` عند وجود منافسة — لا يغيّر توقيع الدالة الخارجي ولا يضيف تعقيدًا حسابيًا يُذكر (عمليات حسابية بسيطة إضافية فقط).
-
-**الأولوية:** منخفضة (تحسين عدالة، ليس عيبًا وظيفيًا).
+**Impact:** zero on production — `cargo bench` is a completely separate target.
 
 ---
 
-## 6. GSO/GRO Batching غائب (تحسين أداء اختياري للخوادم عالية الحمل)
+## 5. The "TCP-Friendly" region is missing from CUBIC (still pending from previous reviews)
 
-**الحالة الحالية:** `gtp-io/src/udp.rs` يستخدم `socket2` للتهيئة الأساسية فقط، بدون `UDP_SEGMENT`/`UDP_GRO`.
+**Current state:** `gtp-cc/src/cubic.rs` applies the basic CUBIC equation correctly (β=0.7), but without the "TCP-friendly region" or "fast convergence" from RFC 8312.
 
-**التنفيذ المقترح:** عند إرسال دفعات كبيرة من الحزم لعدة اتصالات في نفس الـ tick (مثل بث حالة عدة كيانات لخادم بآلاف اللاعبين)، استخدام تجميع الإرسال عبر نداء نظام واحد بدل نداء منفصل لكل حزمة — يقلل overhead النظام تحت الحمل المرتفع فقط. لا فائدة تُذكر لجلسات صغيرة/متوسطة الحمل، لذا هذا **تحسين مؤجَّل** حتى تظهر الحاجة الفعلية عبر بنشماركات حمل حقيقية (البند 4).
+**Why it deserves fixing:** without this region, GTP flows can be unfairly aggressive toward other TCP/QUIC flows sharing the same network bottleneck (e.g., a player downloading a game update over HTTP alongside an active GTP session).
 
-**الأولوية:** منخفضة، مشروط بنتائج بنشماركات مستقبلية تُظهر أن syscall overhead فعلًا عنق زجاجة.
+**Proposed implementation:** an extra logical branch inside `update_w_cubic` that computes `W_tcp` (the approximate equivalent TCP window) and uses the larger of `W_cubic` and `W_tcp` under competition — it changes neither the function's external signature nor adds meaningful computational complexity (just a few additional arithmetic operations).
 
----
-
-## 7. اختبار End-to-End لسيناريو MITM نشط (وليس السلبي فقط)
-
-**الحالة الحالية:** الاختبارات الأمنية الموجودة (`crypto_security_test.rs`) تغطي جيدًا سيناريو المراقب السلبي (لا يستطيع فك التشفير بدون المفتاح الخاص). لكن لا يوجد اختبار مخصَّص لسيناريو **مهاجم نشط** يعترض `ClientHello` ويستبدل مفتاحه العام بمفتاحه هو (كلاسيكي MITM على Diffie-Hellman غير المُصادَق).
-
-**لماذا يستحق الإصلاح:** X25519 وحده (بدون توقيع/مصادقة هوية) عرضة نظريًا لهذا الهجوم دائمًا — هذا محدود الخطورة هنا لأن انتحال IP المصدر يتطلب أيضًا تجاوز فحص الـ cookie في `HandshakeFinish` لاحقًا (صعوبة إضافية حقيقية)، لكن يستحق توثيقه كحد معروف للتصميم عبر اختبار صريح يُثبت متى يفشل النظام ومتى ينجح تحت هذا النوع من الهجوم، بدل تركه غير موثَّق.
-
-**التنفيذ المقترح:** اختبار تكامل يُدخِل "خادم وسيط" مزيَّف بين العميل والخادم الحقيقي، يعترض `ClientHello`/`ServerHello` ويستبدل المفاتيح، ويتحقق: (أ) إن لم يستطع تمرير `HandshakeFinish` بـ cookie صحيح مطابق لعنوان العميل الحقيقي، يفشل الاتصال. (ب) توثيق الفرضية الأمنية بوضوح في تعليقات الكود: "GTP handshake يفترض بيئة IP-spoofing-resistant جزئيًا عبر cookie، وليس مصادقة هوية كاملة كـ mTLS."
+**Priority:** low (a fairness improvement, not a functional defect).
 
 ---
 
-## 8. تصحيح دقة `CHANGELOG.md` بخصوص `ratchet_key`
+## 6. GSO/GRO batching absent (an optional performance improvement for high-load servers)
 
-**الحالة الحالية:** يصف `ratchet_key` تحت "Added" بصياغة "for forward-secure long-lived connections" بشكل يوحي بأنها مُفعَّلة فعليًا، بينما هي (كما في البند 1) كود مكتبة غير موصول بعد.
+**Current state:** `gtp-io/src/udp.rs` uses `socket2` for basic configuration only, without `UDP_SEGMENT`/`UDP_GRO`.
 
-**التنفيذ المقترح:** تعديل السطر إلى: "Session Key Ratchet (library primitive, not yet wired into connection lifecycle — see issue #N)" حتى إنجاز البند 1، ثم نقلها لقسم إصدار جديد يصفها كمُفعَّلة فعليًا.
+**Proposed implementation:** when sending large packet batches to multiple connections in the same tick (e.g., broadcasting several entity states for a server with thousands of players), use batched sending through a single syscall instead of one syscall per packet — it reduces system overhead only under high load. There is no meaningful benefit for small/medium-load sessions, so this is a **deferred improvement** until a real need is shown by real-load benchmarks (item 4).
+
+**Priority:** low, conditional on future benchmark results showing that syscall overhead is actually a bottleneck.
 
 ---
 
-## جدول الأولويات
+## 7. An end-to-end test for an active (not just passive) MITM scenario
 
-| # | البند | الأولوية | ملاحظة |
+**Current state:** the existing security tests (`crypto_security_test.rs`) cover the passive observer scenario well (it cannot decrypt without the private key). But there is no dedicated test for the **active attacker** scenario that intercepts a `ClientHello` and substitutes its own public key (the classic MITM on unauthenticated Diffie-Hellman).
+
+**Why it deserves fixing:** X25519 alone (without signatures/identity authentication) is theoretically always vulnerable to this attack — the risk here is bounded because source-IP spoofing also requires later passing the cookie check in `HandshakeFinish` (a genuine additional difficulty), but it deserves documentation as a known design limit via an explicit test proving when the system fails and when it holds under this attack type, instead of leaving it undocumented.
+
+**Proposed implementation:** an integration test that inserts a fake " intermediary server" between the client and the real server, intercepting `ClientHello`/`ServerHello` and substituting keys, verifying: (a) if it cannot pass `HandshakeFinish` with a correct cookie matching the real client's address, the connection fails. (b) Documenting the security assumption clearly in code comments: "the GTP handshake assumes a partially IP-spoofing-resistant environment via the cookie, not full identity authentication as in mTLS."
+
+---
+
+## 8. Correcting the accuracy of `CHANGELOG.md` regarding `ratchet_key`
+
+**Current state:** it describes `ratchet_key` under "Added" with the phrasing "for forward-secure long-lived connections", suggesting it is actually enabled, whereas (as in item 1) it is library code not yet wired.
+
+**Proposed implementation:** change the line to: "Session Key Ratchet (library primitive, not yet wired into connection lifecycle — see issue #N)" until item 1 is done, then move it to a new release section describing it as actually enabled.
+
+---
+
+## Priority table
+
+| # | Item | Priority | Note |
 |---|---|---|---|
-| 1 | تفعيل `ratchet_key` في دورة حياة الاتصال | 🟡 متوسطة | forward secrecy لجلسات طويلة فقط |
-| 2 | `client_proof` (key confirmation عبر HMAC) | 🟡 متوسطة | تشخيص أفضل، ليس ثغرة استغلال |
-| 3 | `cargo-fuzz` حقيقي | 🟡 متوسطة-عالية | يستهدف تحديدًا إطارات الـ handshake الجديدة |
-| 4 | بنشماركات `criterion` | 🟡 متوسطة | ضروري لتوثيق أداء موثوق بدل أرقام يدوية |
-| 5 | CUBIC TCP-friendly region | 🟢 منخفضة | عدالة تعايش شبكي |
-| 6 | GSO/GRO batching | 🟢 منخفضة | مؤجَّل حتى تظهر الحاجة عبر بنشماركات |
-| 7 | اختبار MITM نشط + توثيق الفرضية الأمنية | 🟢 منخفضة-متوسطة | توثيق حدود التصميم، ليس إصلاحًا لثغرة |
-| 8 | تصحيح CHANGELOG بخصوص ratchet_key | 🟡 متوسطة (مصداقية) | فوري ومستقل |
+| 1 | Enable `ratchet_key` in the connection lifecycle | 🟡 medium | Forward secrecy for long sessions only |
+| 2 | `client_proof` (HMAC key confirmation) | 🟡 medium | Better diagnostics, not an exploitable hole |
+| 3 | Real `cargo-fuzz` | 🟡 medium-high | Specifically targets the new handshake frames |
+| 4 | `criterion` benchmarks | 🟡 medium | Necessary for credible performance documentation instead of manual figures |
+| 5 | CUBIC TCP-friendly region | 🟢 low | Network coexistence fairness |
+| 6 | GSO/GRO batching | 🟢 low | Deferred until benchmarks show the need |
+| 7 | Active-MITM test + documenting the security assumption | 🟢 low-medium | Documenting design limits, not fixing a hole |
+| 8 | Correct the CHANGELOG regarding ratchet_key | 🟡 medium (credibility) | Immediate and independent |
 
-**لا يوجد بند "حرج" (🔴) في هذه القائمة** — وهذا بحد ذاته يعكس أن العمل الأساسي (الأمان الحقيقي لمسار الاتصال) اكتمل. الأولوية العملية الموصى بها: (3 + 8) فوريًا لكونهما مستقلَّين وسريعَي التنفيذ → (1 + 2) معًا لأنهما يخدمان نفس مسار الـ handshake → (4) لتوثيق الأداء الفعلي رسميًا → (5 + 6 + 7) لاحقًا حسب الأولوية التشغيلية.
+**There is no "critical" (🔴) item in this list** — which itself reflects that the foundational work (real security for the connection path) is complete. The recommended practical priority: (3 + 8) immediately since both are independent and quick to implement → (1 + 2) together since they serve the same handshake path → (4) to formally document actual performance → (5 + 6 + 7) later per operational priority.

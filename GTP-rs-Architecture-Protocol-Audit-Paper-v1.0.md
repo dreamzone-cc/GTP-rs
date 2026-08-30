@@ -1,764 +1,764 @@
-# ورقة تقنية: التدقيق الشامل لمعمارية وبروتوكول GTP-rs
+# Technical Paper: Comprehensive GTP-rs Architecture and Protocol Audit
 
-| البند | القيمة |
+| Field | Value |
 | :--- | :--- |
-| **عنوان الوثيقة** | التدقيق الشامل للمعمارية وبنية البروتوكول وتدقيق الخوارزميات والترابط الوظيفي بين الطبقات |
-| **المشروع** | GTP-rs — تنفيذ بروتوكول نقل الألعاب GTP/1.1 بلغة Rust |
-| **المستودع** | `github.com/dreamzone-cc/GTP-rs` (نسخة محلية: `/home/ggonlinux/GTP`) |
-| **نسخة الكود المدقَّقة** | فرع `main`، التثبيت `e1c9ef7` ("feat(security,cc): implement HMAC key confirmation, live key ratchet, CUBIC RFC 8312 ...") |
-| **إصدار الوثيقة** | v1.0 — 2026-08-30 |
-| **نطاق التدقيق** | الحزم الـ 13 كاملة + الاختبارات + الـ fuzz + الـ benches + مستندات المواصفة |
-| **منهجية التدقيق** | قراءة كاملة لملفات المصدر؛ مطابقة مع RFC 9000/9002/8312/8439 وRFC 1982 ومواصفة GTP/1.1؛ تشغيل `cargo test --workspace`؛ تتبّع مسارات RX/TX سطراً بسطر؛ تحليل نقاط الالتحام بين الطبقات (cross-layer seams) |
+| **Document title** | Comprehensive audit of the architecture, protocol structure, algorithms, and cross-layer functional integration of GTP-rs |
+| **Project** | GTP-rs — a Rust implementation of the Game Transport Protocol (GTP/1.1) |
+| **Repository** | `github.com/dreamzone-cc/GTP-rs` (local copy: `/home/ggonlinux/GTP`) |
+| **Audited revision** | branch `main`, commit `e1c9ef7` ("feat(security,cc): implement HMAC key confirmation, live key ratchet, CUBIC RFC 8312 ...") |
+| **Document version** | v1.0 — 2026-08-30 |
+| **Audit scope** | All 13 crates + tests + fuzz targets + benchmarks + specification documents |
+| **Methodology** | Full source read-through; conformance checking against RFC 9000/9002/8312/8439 and RFC 1982 plus the GTP/1.1 spec; `cargo test --workspace` execution; line-by-line RX/TX path tracing; cross-layer seam analysis |
 
 ---
 
-## جدول المحتويات
+## Table of Contents
 
-1. [الملخص التنفيذي والحكم النهائي](#1-الملخص-التنفيذي-والحكم-النهائي)
-2. [منهجية التدقيق ونطاقه](#2-منهجية-التدقيق-ونطاقه)
-3. [المعمارية العامة وبنية البروتوكول](#3-المعمارية-العامة-وبنية-البروتوكول)
-4. [نتائج التحقق من الترابط والتكامل الوظيفي](#4-نتائج-التحقق-من-الترابط-والتكامل-الوظيفي)
-5. [التدقيق الأمني — طبقة التشفير والمسار](#5-التدقيق-الأمني--طبقة-التشفير-والمسار)
-6. [تدقيق خوارزميات الاسترداد والتحكم بالازدحام](#6-تدقيق-خوارزميات-الاسترداد-والتحكم-بالازدحام)
-7. [تدقيق خوارزمية الجدولة ودلالات التسليم](#7-تدقيق-خوارزمية-الجدولة-ودلالات-التسليم)
-8. [تدقيق طبقة السلك (Wire Format)](#8-تدقيق-طبقة-السلك-wire-format)
-9. [تدقيق محرك النواة وطبقة التشغيل (Runtime)](#9-تدقيق-محرك-النواة-وطبقة-التشغيل-runtime)
-10. [تحليل الأداء والكفاءة](#10-تحليل-الأداء-والكفاءة)
-11. [تحليل الاستقرارية](#11-تحليل-الاستقرارية)
-12. [سجل العيوب الموحّد (Findings Registry)](#12-سجل-العيوب-الموحّد-findings-registry)
-13. [خطة المعالجة المرتبة بالأولوية](#13-خطة-المعالجة-المرتبة-بالأولوية)
-14. [الملاحق](#14-الملاحق)
+1. [Executive Summary and Final Verdict](#1-executive-summary-and-final-verdict)
+2. [Audit Methodology and Scope](#2-audit-methodology-and-scope)
+3. [Overall Architecture and Protocol Structure](#3-overall-architecture-and-protocol-structure)
+4. [Functional Integration and Interlocking Verification Results](#4-functional-integration-and-interlocking-verification-results)
+5. [Security Audit — Crypto and Path Layers](#5-security-audit--crypto-and-path-layers)
+6. [Loss Recovery and Congestion Control Algorithm Audit](#6-loss-recovery-and-congestion-control-algorithm-audit)
+7. [Scheduling Algorithm and Delivery Semantics Audit](#7-scheduling-algorithm-and-delivery-semantics-audit)
+8. [Wire Format Layer Audit](#8-wire-format-layer-audit)
+9. [Core Engine and Runtime Layer Audit](#9-core-engine-and-runtime-layer-audit)
+10. [Performance and Efficiency Analysis](#10-performance-and-efficiency-analysis)
+11. [Stability Analysis](#11-stability-analysis)
+12. [Unified Findings Registry](#12-unified-findings-registry)
+13. [Prioritized Remediation Plan](#13-prioritized-remediation-plan)
+14. [Appendices](#14-appendices)
 
 ---
 
-## 1. الملخص التنفيذي والحكم النهائي
+## 1. Executive Summary and Final Verdict
 
-### 1.1 الحكم العام
+### 1.1 Overall verdict
 
-المكوّن **غير جاهز للاستخدام الإنتاجي** بصيغته الحالية، رغم أن:
+The codebase is **not ready for production use** in its current state, despite the fact that:
 
-- البنية الطبقية **نظيفة التصميم وسهلة الإصلاح** (13 حزمة بمسؤوليات واضحة).
-- مسار البيانات **خالٍ تماماً من الانهيارات** (`panic`/`unwrap`) خارج الاختبارات — تحقق مباشر بالفحص اليدوي.
-- جميع الاختبارات الحالية ناجحة (**48 ناجحاً، 0 فاشلاً، 1 متجاهَلاً**).
-- طبقة السلك `gtp-wire` صفر تخصيص ذاكرة فعلياً ولا تعتمد على `alloc` إطلاقاً.
+- The layered architecture is **cleanly designed and easy to fix** (13 crates with clear responsibilities).
+- The data path is **entirely free of panics** (`panic`/`unwrap`) outside tests — verified by direct inspection.
+- All existing tests pass (**48 passed, 0 failed, 1 ignored**).
+- The `gtp-wire` crate is genuinely zero-allocation and depends on no `alloc` at all.
 
-المانع الجوهري: **العيوب الحرجة تتركز في نقاط الالتحام بين الطبقات** — وهي تحديداً المواضع التي لا تغطيها الاختبارات الحالية. كل طبقة معزولة تبدو سليمة ومُختبرة، لكن انتقال البيانات بين الطبقات يكسر ضمانات أساسية.
+The essential blocker: **the critical defects concentrate at the seams between layers** — precisely the places the current test suite does not cover. Every layer looks sound and tested in isolation, but the hand-offs of control and data between layers break fundamental guarantees.
 
-### 1.2 أخطر خمسة اكتشافات (مُتحقَّق منها مباشرة في الكود)
+### 1.2 The five most dangerous findings (verified directly in the code)
 
-| # | العيب | الخطورة | الأثر |
+| # | Defect | Severity | Impact |
 | :--- | :--- | :--- | :--- |
-| 1 | **إعادة استخدام nonce بين الاتجاهين**: مفتاح/IV واحد للطرفين + nonce مشتق من CID والبتات السفلى لرقم الحزمة فقط → أول حزمة من كل اتجاه تستخدمان نفس المفتاح والـ nonce (انتهاك RFC 8439) | حرج | كسر السرية وإمكانية تزوير؛ الاختبار الحالي `handshake.rs:155-163` يؤكد تساوي المفتاحين — أي يختبر الحالة الخطرة كأنها صحيحة |
-| 2 | **إطارات التحكم مغلّفة مرتين**: `Ping`/`PathChallenge`/`Close`/`AckFrequency`/`MtuProbe` تُرمَّز ثم تُلَف داخل `Frame::Data` → النظير لا ينفّذ معالجاتها أبداً | حرج | **ترحيل المسار وNAT rebinding والإغلاق المهذب وPing ميزات ميتة من طرف إلى طرف** رغم أنها مُختبرة وحدة-بوحدة |
-| 3 | **نافذة منع إعادة التشغيل تُحدَّث قبل مصادقة AEAD**: حزمة مزيفة واحدة برقم حزمة ضخم تحرق فضاء الأرقام نهائياً | حرج | قطع اتصال دائم (DoS) بحزمة واحدة لمن يعرف الـ CID فقط |
-| 4 | **كوكي المصافحة قابل للتزوير**: بنية XOR بسيطة بدل HMAC، والطابع الزمني غير مُوقَّع ومكتوب نصاً صريحاً | حرج | استرجاع 24 بايت من الـ secret من كوكي واحدة؛ تجاوز مدة الصلاحية إلى ما لا نهاية |
-| 5 | **تسريب in-flight وهمي + عواصف إعادة إرسال**: بايتات ACK-only تُقيَّد ولا يُعترف بها؛ `on_timeout` يعيد الجدولة دون إزالة السجلات ولا تراجع أُسّي للـ PTO | عالٍ | خنق الإرسال تدريجياً حتى التوقف؛ تسليم مكرر للتطبيق في `ReliableUnordered` |
+| 1 | **Cross-direction nonce reuse**: one key/IV pair for both peers + a nonce derived only from the CID and the low bits of the packet number → the first packet in each direction shares the same key and nonce (an RFC 8439 violation) | Critical | Confidentiality break and potential forgery; the existing test at `handshake.rs:155-163` asserts key equality — i.e., it tests the dangerous state as if it were correct |
+| 2 | **Control frames double-wrapped**: `Ping`/`PathChallenge`/`Close`/`AckFrequency`/`MtuProbe` are encoded, then wrapped inside `Frame::Data` → the peer never executes their handlers | Critical | **Path migration, NAT rebinding, graceful close, and Ping are dead features end-to-end**, although each is unit-tested in isolation |
+| 3 | **Replay window updated before AEAD authentication**: a single forged datagram with a huge packet number permanently burns the number space | Critical | Permanent connection DoS with one packet, for anyone who knows the CID |
+| 4 | **Forgeable handshake cookie**: a simple XOR construction instead of HMAC, with an unauthenticated, plaintext timestamp | Critical | 24 bytes of the secret recoverable from one cookie; lifetime bypass to infinity |
+| 5 | **Phantom in-flight leak + retransmission storms**: ACK-only bytes are charged and never acknowledged; `on_timeout` re-enqueues without removing records and with no exponential PTO backoff | High | Progressively throttles sending until stall; duplicate application delivery in `ReliableUnordered` |
 
-### 1.3 خلاصة التحقق من الترابط الوظيفي
+### 1.3 Functional integration verdict
 
-الاختبارات الحالية تغطي **المسارات النظيفة فقط** (datagram سليم بلا فقدان، مصافحة حية برسالة واحدة، جبر تشفيري، فقدان 20% لرسائل ordered في المحاكاة). **لا يوجد أي اختبار** لأي من نقاط الالتحام التالية — وهي مواقع العيوب الفعلية:
+The current tests cover **only the happy paths** (a clean datagram with no loss, a live handshake with one message, crypto algebra, 20% loss for ordered messages in the simulator). **There is no test at all** for any of the following seams — which are exactly where the real defects live:
 
-- مسار PTO عند فقدان جميع الـ ACKs
-- ترحيل المسار عبر البروتوكول (وليس عبر استدعاء `PathValidator` مباشرة)
-- استقبال إطارات التحكم والتفاعل معها طرف-لطرف
-- تفعيل الـ key ratchet منتصف الجلسة (كان سيفشل — النظير لا يدور المفتاح)
-- رزم فاسدة/مُعاد تشغيلها/بـ CID خاطئ عبر الاتصال الكامل
-- حمولات أكبر من MTU (كانت ستكشف الانسداد الدائم لرأس الصف)
+- The PTO path when all ACKs are lost
+- Path migration through the protocol (not by calling `PathValidator` directly)
+- Receiving control frames and reacting to them end-to-end
+- Triggering the key ratchet mid-session (it would fail — the peer never rotates)
+- Corrupted/replayed/wrong-CID datagrams through the full connection
+- Payloads larger than MTU (which would expose the permanent tier-head blockage)
 
 ---
 
-## 2. منهجية التدقيق ونطاقه
+## 2. Audit Methodology and Scope
 
-### 2.1 ما تم تدقيقه
+### 2.1 What was audited
 
-- **قراءة كاملة** لملفات المصدر في الحزم: `gtp-types`, `gtp-wire`, `gtp-recovery`, `gtp-cc`, `gtp-scheduler`, `gtp-path`, `gtp-crypto`, `gtp-core`, `gtp-io`, `gtp-runtime-tokio`, `gtp-sim`, `gtp`, `gtp-cli`
-- **الاختبارات**: اختبارات الوحدة المضمّنة (`#[cfg(test)]`)، اختبارات التكامل في `crates/*/tests/*.rs`، الـ fuzz targets في `fuzz/fuzz_targets/`، والـ benches
-- **المطابقة المعيارية**: RFC 8439 (AEAD)، RFC 8312 (CUBIC)، RFC 9002 (استرداد الفقدان)، RFC 9000 (مفاهيم QUIC ذات الصلة)، RFC 1982 (حساب المتتاليات)، ومواصفة `GTP_1_1_Comprehensive_Technical_Specification.md` الداخلية ومواصفات `docs/specs/GTP-SEC-01.md` و`GTP-RUST-01.md`
-- **التحقق التجريبي**: تشغيل `cargo test --workspace` على أداة Rust 1.85.0 (المطابقة لـ `rust-toolchain.toml`)
+- **Full read** of the source files in: `gtp-types`, `gtp-wire`, `gtp-recovery`, `gtp-cc`, `gtp-scheduler`, `gtp-path`, `gtp-crypto`, `gtp-core`, `gtp-io`, `gtp-runtime-tokio`, `gtp-sim`, `gtp`, `gtp-cli`
+- **Tests**: embedded unit tests (`#[cfg(test)]`), integration tests in `crates/*/tests/*.rs`, the fuzz targets in `fuzz/fuzz_targets/`, and the benchmarks
+- **Standards conformance**: RFC 8439 (AEAD), RFC 8312 (CUBIC), RFC 9002 (loss recovery), RFC 9000 (related QUIC concepts), RFC 1982 (serial arithmetic), the internal `GTP_1_1_Comprehensive_Technical_Specification.md` spec, and `docs/specs/GTP-SEC-01.md` / `GTP-RUST-01.md`
+- **Empirical verification**: `cargo test --workspace` on Rust toolchain 1.85.0 (matching `rust-toolchain.toml`)
 
-### 2.2 تصنيف الخطورة
+### 2.2 Severity classification
 
-| المستوى | التعريف |
+| Level | Definition |
 | :--- | :--- |
-| **حرج (Critical)** | قابل للاستغلال عن بُعد أو يكسر ضماناً أمنياً/وظيفياً أساسياً أو يعطّل ميزة معلنة كلياً |
-| **عالٍ (High)** | فساد بيانات، تدهور أداء تصاعدي، انتهاك RFC ملزم، أو DoS مشروط |
-| **متوسط (Medium)** | سلوك خاطئ في حالات حدّية، كود ميت لضمانات معلنة، انحراف مواصفة |
-| **منخفض (Low)** | جودة كود، تناقضات توثيق، تحسينات |
+| **Critical** | Remotely exploitable, or breaks a fundamental security/functional guarantee, or fully disables an advertised feature |
+| **High** | Data corruption, escalating performance degradation, a binding RFC violation, or conditional DoS |
+| **Medium** | Incorrect edge-case behavior, dead code behind advertised guarantees, spec deviation |
+| **Low** | Code quality, documentation inconsistencies, improvements |
 
-> **ملاحظة تحقق**: المواضع `file:line` في هذه الوثيقة مُتحقَّق منها ضد شجرة العمل عند التثبيت `e1c9ef7`. العناوين الأربعة الحرجة الأولى (القسم 1.2) تمت مراجعتها سطراً بسطر يدوياً بالإضافة إلى تقارير التحليل الآلي.
+> **Verification note**: the `file:line` locations in this paper were verified against the working tree at commit `e1c9ef7`. The four critical items in §1.2 were additionally reviewed line-by-line by hand, on top of the automated analysis reports.
 
 ---
 
-## 3. المعمارية العامة وبنية البروتوكول
+## 3. Overall Architecture and Protocol Structure
 
-### 3.1 خريطة الحزم (13 crate)
+### 3.1 Crate map (13 crates)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  gtp (واجهة SDK الموحدة)   gtp-cli (أدوات سطر أوامر)            │
-│  gtp-runtime-tokio (نقطة نهاية Tokio غير متزامنة)               │
+│  gtp (unified SDK facade)   gtp-cli (command-line tools)        │
+│  gtp-runtime-tokio (async Tokio endpoint)                       │
 ├─────────────────────────────────────────────────────────────────┤
-│  gtp-core ──── محرك GtpConnection: خطوط RX/TX + Control API     │
-│      ├── gtp-scheduler ── DRR خماسي الطبقات + StateTable        │
-│      ├── gtp-recovery ──── RTT/ACK/كشف الفقدان (RFC 9002)       │
-│      ├── gtp-cc ─────────── CUBIC (RFC 8312) + pacing + ضغط ظهر │
-│      ├── gtp-crypto ─────── AEAD + HKDF + X25519 + نافذة إعادة  │
-│      ├── gtp-path ──────── آلة حالة + anti-amp + كوكي + مسارات  │
-│      ├── gtp-io ────────── تجريد UDP (⚠ كود ميت — انظر §9.5)    │
-│      └── gtp-sim ───────── محاكاة زمن افتراضي حتمية              │
+│  gtp-core ──── GtpConnection engine: RX/TX pipelines + Control  │
+│      ├── gtp-scheduler ── 5-tier DRR + StateTable              │
+│      ├── gtp-recovery ──── RTT/ACK/loss detection (RFC 9002)   │
+│      ├── gtp-cc ─────────── CUBIC (RFC 8312) + pacing + backp. │
+│      ├── gtp-crypto ─────── AEAD + HKDF + X25519 + replay wnd. │
+│      ├── gtp-path ──────── state machine + anti-amp + cookies  │
+│      ├── gtp-io ────────── UDP abstraction (⚠ dead code — §9.5)│
+│      └── gtp-sim ───────── deterministic virtual-time simulator │
 ├─────────────────────────────────────────────────────────────────┤
-│  gtp-wire ─── ترويسات طويلة/قصيرة + 14 إطار TLV + PacketBuilder │
-│  gtp-types ── معرفات + زمن أحادي + حساب RFC 1982 + أخطاء        │
+│  gtp-wire ─── long/short headers + 14 TLV frames + builder     │
+│  gtp-types ── identifiers + monotonic time + RFC 1982 + errors │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 تنسيق السلك (Wire Format) كما هو مُنفَّذ
+### 3.2 Wire format as implemented
 
-**ترويسة قصيرة — 24 بايت** (`gtp-wire/src/header.rs:4`)، جميع الحقول big-endian ثابتة العرض:
+**Short header — 24 bytes** (`gtp-wire/src/header.rs:4`), all fields fixed-width big-endian:
 
-| الإزاحة | الحجم | الحقل |
+| Offset | Size | Field |
 | :--- | :--- | :--- |
-| 0 | 1 | flags (بت7: ترويسة طويلة، بت6: KEY_PHASE، بت5: ACK_PRESENT، بت3-4: ECN) |
+| 0 | 1 | flags (bit7: long header, bit6: KEY_PHASE, bit5: ACK_PRESENT, bits3-4: ECN) |
 | 1 | 1 | header_len (u8) |
-| 2 | 10 | connection_id (u64 BE) |
-| 10 | 8 | packet_number (u64 BE — **كامل، بدون varint أو اقتطاع**) |
+| 2 | 8 | connection_id (u64 BE) |
+| 10 | 8 | packet_number (u64 BE — **full, no varint or truncation**) |
 | 18 | 4 | timestamp_micros (u32 BE) |
 | 22 | 2 | payload_len (u16 BE) |
 
-**ترويسة طويلة — 28 بايت** (`header.rs:5`): نفس الحقول + 4 بايت `version` عند الإزاحة 1.
+**Long header — 28 bytes** (`header.rs:5`): same fields + a 4-byte `version` at offset 1.
 
-**ملاحظات جوهرية على التنسيق**:
+**Core format notes**:
 
-- بتات 0-2 المحجوزة في flags **لا يُتحقق من كونها صفراً عند الفك** — لا بوابة توافق أمامي.
-- حقلا `payload_len` و`header_len` لهما **دلالة مزدوجة متناقضة**: `PacketBuilder::finish` يكتب `payload_len` كعدد بايتات الإطارات النصية، ثم `gtp-core` **يستبدل البايتات 22-24 من الرسالة المختومة** يدوياً بـ `plaintext_len + AEAD_TAG_LEN` (`gtp-core/src/connection.rs:651-656`) لتطابق الـ AAD، ولا أحد يقرأه عند الاستقبال إطلاقاً.
-- وحدة `VarInt` (RFC 9000 2-bit prefix) **مُنفَّذة بشكل صحيح لكنها كود ميت** — لا حقل يستخدمها، بينما يعلن README عنها كميزة. البنية الثابتة تعني عبئاً ~5.6% على datagram بحجم 300 بايت (رأس 24 بايت + PN بـ 8 بايتات).
-- حقل `version` **لا يُتحقق منه في أي مسار استقبال**؛ الأسوأ أن `gtp-runtime-tokio/src/endpoint.rs:113` يرسل نسخة `1` بينما الثابت `GTP_V1_1 = 0x00010001` (`header.rs:3`) — التنفيذان الداخليان غير متفقين ولا يلاحظ أحد.
+- Reserved flag bits 0-2 are **never validated as zero on decode** — no forward-compatibility gate.
+- The `payload_len` and `header_len` fields have **contradictory dual semantics**: `PacketBuilder::finish` writes `payload_len` as the plaintext frame byte count, then `gtp-core` **overwrites bytes 22-24 of the sealed datagram** by hand with `plaintext_len + AEAD_TAG_LEN` (`gtp-core/src/connection.rs:651-656`) so the AAD matches; nobody reads it on receive.
+- The `VarInt` unit (RFC 9000 2-bit prefix) is **implemented correctly but is dead code** — no field uses it, while the README advertises it as a feature. The fixed layout means ~5.6% overhead on a 300-byte gameplay datagram.
+- The `version` field is **never validated on any receive path**; worse, `gtp-runtime-tokio/src/endpoint.rs:113` sends version `1` while the constant `GTP_V1_1 = 0x00010001` (`header.rs:3`) — the two in-repo implementations disagree and nobody notices.
 
-**إطارات TLV الأربعة عشر** (`gtp-wire/src/frame.rs:8-23`): النوع `0x00..=0x0D` — Padding, Ack, Data, ReliableData, Retx, Ping, PathChallenge, PathResponse, MtuProbe, Close, AckFrequency, ClientHello, ServerHello, HandshakeFinish. تم التحقق من اتساق كل فروع `encode` الأربعة عشر داخلياً (حساب `needed` مقابل البايتات المكتوبة فعلاً) — **لا يوجد تجاوز كتابة في جانب الترميز** عدا حالتا الفيض الحرجتان W-1 أدناه.
+**The fourteen TLV frames** (`gtp-wire/src/frame.rs:8-23`): types `0x00..=0x0D` — Padding, Ack, Data, ReliableData, Retx, Ping, PathChallenge, PathResponse, MtuProbe, Close, AckFrequency, ClientHello, ServerHello, HandshakeFinish. All fourteen `encode` branches were verified internally consistent (the `needed` precomputation versus the bytes actually written) — **no encode-side buffer overrun exists** apart from the two critical overflow cases, W-1 below.
 
-### 3.3 مسار الاستقبال (RX) — الترتيب الفعلي في الكود
+### 3.3 Receive (RX) path — actual order in the code
 
 `GtpConnection::handle_incoming_datagram` — `gtp-core/src/connection.rs:212-471`:
 
 ```
-1. عدادات باردة + رصيد anti-amplification        (218-222)  ← قبل أي تحقق/فك تشفير ⚠
-2. فك الترويسة PacketHeader::decode               (225)
-3. فحص مطابقة CID                                 (228-230)
-4. نافذة منع إعادة التشغيل check_and_update       (232-235)  ← قبل المصادقة ⚠ حرج
-5. فك تشفير + مصادقة AEAD (open)                  (238-256)
-6. حلقة توزيع الإطارات:                            (263-449)
-     Ack → loss_detector + cc + حقن إعادة الإرسال   (283-327)
-     Data/ReliableData/Retx → تسليم                 (330-385)
-     PathChallenge → رد تلقائي                      (389-406)
-     PathResponse → ترحيل المسار                    (408-421)
-     AckFrequency → تعديل GtpConfig فقط (ميت)       (423-432)
-     Close → انتقال حالة + return Err               (434-445)
-7. تحديث متتبع ACK                                  (452-457)
-8. حدث تغيّر مستوى ضغط الظهر                        (460-468)
+1. Cold counters + anti-amplification credit       (218-222)  ← before any validation ⚠
+2. Header decode PacketHeader::decode               (225)
+3. CID match check                                  (228-230)
+4. Replay window check_and_update                   (232-235)  ← before authentication ⚠ CRITICAL
+5. AEAD decrypt + authenticate (open)               (238-256)
+6. Frame dispatch loop:                             (263-449)
+     Ack → loss_detector + cc + retx re-enqueue     (283-327)
+     Data/ReliableData/Retx → delivery              (330-385)
+     PathChallenge → automatic echo                 (389-406)
+     PathResponse → path migration                  (408-421)
+     AckFrequency → GtpConfig only (dead)           (423-432)
+     Close → state transition + return Err          (434-445)
+7. ACK tracker update                                (452-457)
+8. Backpressure level-change event                   (460-468)
 ```
 
-**انحرافات عن الترتيب الصحيح**:
+**Deviations from the correct order**:
 
-- الخطوة 4 قبل الخطوة 5: **العيوب C-9** (قسم 5) — حرق فضاء أرقام الحزم قبل إثبات الأصالة.
-- **لا توجد بوابة حالة مسار إطلاقاً**: `src_addr` لا يُقارن بـ `active_path`، ولا توجد بوابة `ConnectionState` — اتصال في حالة Closed/Draining يعالج إطارات بيانات كاملة.
-- الرصيد في الخطوة 1 يُحتسب **قبل فك الترويسة والمصادقة وفحص CID** — حزم القمامة تُضخّم ميزانية الإرسال 3x.
-- حزمة بإطار فاسد (الخطأ عند 266-269 يكسر الحلقة) **تظل تُعترف بها كـ مستلمة** في الخطوة 7.
-- `Close` يقاطع المحاسبة: `return Err` عند 444 يتخطى الخطوة 7 — حزمة الإغلاق لا يُعترف بها.
+- Step 4 before step 5: the **SEC-3 critical defect** (§5) — burning packet-number space before proving authenticity.
+- **No path-state gate at all**: `src_addr` is never compared against `active_path`, and there is no `ConnectionState` gate — a Closed/Draining connection still fully processes data frames.
+- The credit in step 1 is counted **before header decode, authentication, and the CID check** — junk datagrams inflate the 3x send budget.
+- A datagram with a corrupt frame (the error at 266-269 breaks the loop) **is still acknowledged as received** in step 7.
+- `Close` interrupts bookkeeping: the `return Err` at 444 skips step 7 — the peer's Close packet is never acknowledged.
 
-### 3.4 مسار الإرسال (TX) — الترتيب الفعلي في الكود
+### 3.4 Transmit (TX) path — actual order in the code
 
 `GtpConnection::produce_outgoing_datagram` — `gtp-core/src/connection.rs:477-698`:
 
 ```
-1. بوابة الحالة is_active()                        (482-486)
-2. فحص PTO + حقن إعادة الإرسال                      (489-528)
-3. تقليم العناصر منتهية الصلاحية prune_stale        (531)
-4. تحديث رموز pacing + send_budget = min(cwnd−inflight, tokens)  (535-541)
-5. بوابة should_ack/has_data                        (543-551)
-6. ترويسة + PacketBuilder                           (554-558)
-7. إلحاق إطار ACK                                   (564-567)
-8. سحب عناصر المجدول + ترميز ضمن الميزانية           (571-647)  ← let _ = append_frame ⚠
-9. finish + ترقيع payload_len للطول المختوم          (650-656)
-10. ختم AEAD                                        (660-666)
-11. فحص anti-amplification                          (671-676)  ← بعد السحب ⚠
-12. محاسبة in-flight/CC/pacing/رقم الحزمة           (679-695)
+1. State gate is_active()                           (482-486)
+2. PTO check + retransmission injection              (489-528)
+3. Stale-item pruning prune_stale                    (531)
+4. Pacing token update + send_budget = min(cwnd−inflight, tokens)  (535-541)
+5. should_ack / has_data gates                       (543-551)
+6. Header + PacketBuilder                            (554-558)
+7. ACK frame attach                                  (564-567)
+8. Scheduler pop + encode within budget              (571-647)  ← let _ = append_frame ⚠
+9. finish() + patch payload_len to sealed length     (650-656)
+10. AEAD seal                                        (660-666)
+11. Anti-amplification check                         (671-676)  ← after the pop ⚠
+12. In-flight/CC/pacing/packet-number bookkeeping    (679-695)
 ```
 
-**مواضع الحقن لإعادة الإرسال**: اثنان — فقدان مدفوع بالـ ACK (RX عند 302-327) ومسحة PTO (500-525)، كلاهما يعيد الجدولة بأولوية P3.
+**Retransmission injection points**: two — ACK-driven loss (RX at 302-327) and the PTO sweep (500-525); both re-enqueue at P3 priority.
 
-**انحرافات حرجة**:
+**Critical deviations**:
 
-- الخطوة 8: `let _ = builder.append_frame(&frame)` عند `585/599/611/633` — إطار لا يتسع يُسقط بصمت بينما يُسجَّل كـ in-flight للفئات الموثوقة (`612-619, 634-641`) — بايتات وهمية تحرّف CC وكشف الفقدان (العيب D-2).
-- الخطوة 11 بعد السحب: رفض `can_send` يُسقط عناصر سُحبت فعلاً من المجدول — **فقدان صامت لرسائل موثوقة**.
-- **لا تقطيع (fragmentation)**: `fragment_id=0` و`total_fragments=1` دائماً (`605-606, 627-628`) — حمولة أكبر من ~1400 بايت تُرجع لرأس صفّها وتسده **للأبد** (انسداد رأس صف HOL داخل الصف).
+- Step 8: `let _ = builder.append_frame(&frame)` at `585/599/611/633` — a frame that does not fit is silently dropped while still being recorded as in-flight for reliable classes (`612-619, 634-641`) — phantom bytes that skew CC and loss detection (defect D-2).
+- Step 11 after the pop: a `can_send` rejection drops items already popped from the scheduler — **silent loss of reliable messages**.
+- **No fragmentation**: `fragment_id=0` and `total_fragments=1` always (`605-606, 627-628`) — a payload larger than ~1400 bytes is pushed back to its tier head and blocks it **forever** (head-of-line blockage inside the tier).
 
-### 3.5 بنية المهام والوقت في طبقة التشغيل
+### 3.5 Task and timer structure of the runtime layer
 
-- مهمة RX واحدة لكل endpoint (`endpoint.rs:245-458`) تعالج **جميع** الاتصالات تسلسلياً وتمرر الرسائل لقنوات التطبيق بـ `.await` — مستهلك بطيء واحد (قناة 1024 ممتلئة) يجمّد الـ endpoint كله.
-- مهمة TX لكل اتصال بنبض 500µs (`endpoint.rs:464`) — N اتصال = N مهمة تستيقظ 2000 مرة/ثانية حتى عند الخمول.
-- جدول توجيه CID: `Arc<RwLock<FxHashMap<ConnectionId, (Arc<Mutex<GtpConnection>>, Sender)>>>` — **لا إخلاء عند الإغلاق**؛ CID مكرر يستبدل مدخل اتصال حي بصمت.
-- لا توجد إشارة إيقاف أو إغلاق مهذب للـ endpoint؛ حلقة RX **تموت صامتة عند أول خطأ socket** (`endpoint.rs:247`).
+- One RX task per endpoint (`endpoint.rs:245-458`) processes **all** connections serially and forwards messages to application channels with `.await` — one slow consumer (a full 1024-slot channel) freezes the whole endpoint.
+- One TX task per connection ticking every 500µs (`endpoint.rs:464`) — N connections = N tasks waking 2000 times/second even when idle.
+- CID routing table: `Arc<RwLock<FxHashMap<ConnectionId, (Arc<Mutex<GtpConnection>>, Sender)>>>` — **never evicted on close**; a duplicate CID silently replaces a live connection's entry.
+- No shutdown signal or graceful endpoint close exists; the RX loop **dies silently on the first socket error** (`endpoint.rs:247`).
 
 ---
 
-## 4. نتائج التحقق من الترابط والتكامل الوظيفي
+## 4. Functional Integration and Interlocking Verification Results
 
-### 4.1 نتيجة تشغيل الاختبارات
+### 4.1 Test run results
 
 ```
 $ cargo test --workspace    (rustc 1.85.0)
-الإجمالي: 48 ناجحاً / 0 فاشلاً / 1 متجاهَلاً
+Total: 48 passed / 0 failed / 1 ignored
 ```
 
-| ملف الاختبار | ما يغطيه فعلياً |
+| Test file | What it actually covers |
 | :--- | :--- |
-| `crates/gtp/tests/integration_test.rs` | فئات الإرسال الأربع → datagram واحد سليم → تسليم. الالتحام: مجدول→سلك→تشفير→فك→تسليم |
-| `crates/gtp-runtime-tokio/tests/handshake_e2e_test.rs` | مصافحة X25519 حية عبر UDP (اختباران) + 10 عملاء متزامنين برسالة واحدة لكل |
-| `crates/gtp-crypto/tests/crypto_security_test.rs` | عزل HKDF لكل CID، رفض المتنصت، تميز ratchet، رفض إثبات مُحرَّف |
-| `crates/gtp-wire/tests/malformed_inputs_test.rs` | اقتطاعات + 1000 مخزن عشوائي (≤64 بايت فقط) |
-| `crates/gtp-sim/src/sim_runner.rs:109-173` | **الاختبار الوحيد** لحلقة إعادة الإرسال مجدول→استرداد: 20% فقدان لرسائل ordered (بذرة واحدة حتمية) |
+| `crates/gtp/tests/integration_test.rs` | The four send classes → one clean datagram → delivery. Seam: scheduler→wire→crypto→decrypt→deliver |
+| `crates/gtp-runtime-tokio/tests/handshake_e2e_test.rs` | Live X25519 handshake over UDP (two tests) + 10 concurrent clients with one message each |
+| `crates/gtp-crypto/tests/crypto_security_test.rs` | HKDF per-CID isolation, eavesdropper rejection, ratchet distinctness, tampered-proof rejection |
+| `crates/gtp-wire/tests/malformed_inputs_test.rs` | Truncations + 1000 pseudo-random buffers (≤64 bytes only) |
+| `crates/gtp-sim/src/sim_runner.rs:109-173` | **The only** test of the scheduler→recovery retransmission loop: 20% loss for ordered messages (one deterministic seed) |
 
-### 4.2 مصفوفة نقاط الالتحام — مختبَر مقابل غير مختبَر
+### 4.2 Seam matrix — tested versus untested
 
-| نقطة الالتحام | الحالة | ملاحظة |
+| Seam | Status | Note |
 | :--- | :--- | :--- |
-| مجدول → سلك → تشفير → تسليم (مسار نظيف) | ✅ مختبَر | |
-| مصافحة تشفير → توجيه CID → قناة التطبيق | ✅ مختبَر | رسالة واحدة فقط، بلا ACK/RTT |
-| جبر تشفيري (HKDF/X25519/proof) | ✅ مختبَر | معظمه "مساواة/عدم مساواة" بلا متجهات إجابة معروفة (KAT) |
-| متانة فك السلك | ✅ مختبَر جزئياً | مخازن ≤64 بايت فقط — الترويسات الطويلة وإطارات المصافحة غير مؤَمَّاة |
-| **تشفير ↔ سلك تحت الفساد** (رزمعبث بها/مكررة/CID خاطئ عبر الاتصال) | ❌ غير مختبَر | كان سيمسك C-9 |
-| **PTO عند فقدان كل الـ ACKs** | ❌ غير مختبَر | كان سيمسك عاصفة إعادة الإرسال |
-| **إطارات تحكم طرف-لطرف** (Ping/Close/PathChallenge/AckFrequency/MtuProbe) | ❌ غير مختبَر | كان سيمسك Core-C1 (الميزات ميتة) |
-| **ترحيل مسار عبر البروتوكول** | ❌ غير مختبَر | الاختبار الوحيد يستدعي `PathValidator` مباشرة متجاوزاً البروتوكول |
-| **ratchet منتصف الجلسة** | ❌ غير مختبَر | كان سيكشف أن النظير لا يستطيع فك شيء بعده |
-| **بوابة anti-amplification عبر produce** | ❌ غير مختبَر | بما فيها إسقاط العناصر المسحوبة |
-| **حمولة > MTU / تقطيع** | ❌ غير مختبَر | كان سيمسك انسداد رأس الصف الدائم |
-| **دورة حياة Draining → Closed** | ❌ غير مختبَر | لا مؤقت أصلاً |
-| **gtp-io PacketIo مع runtime/sim** | ❌ غير مختبَر | الكود ميت أصلاً |
-| **تفاوض إيقاع ACK** | ❌ غير مختبَر | كان سيمسك أن الآلية no-op |
+| scheduler → wire → crypto → delivery (clean path) | ✅ tested | |
+| handshake crypto → CID routing → app channel | ✅ tested | One message only, no ACK/RTT |
+| crypto algebra (HKDF/X25519/proof) | ✅ tested | Mostly equality/inequality; no known-answer vectors |
+| wire decode robustness | ✅ partially tested | Buffers ≤64 bytes only — long headers and handshake frames never fuzzed |
+| **crypto ↔ wire under corruption** (tampered/replayed/wrong-CID through the connection) | ❌ untested | Would have caught SEC-3 |
+| **PTO under 100% ACK loss** | ❌ untested | Would have caught the retransmission storm |
+| **Control frames end-to-end** (Ping/Close/PathChallenge/AckFrequency/MtuProbe) | ❌ untested | Would have caught Core-C1 (dead features) |
+| **Path migration through the protocol** | ❌ untested | The only test calls `PathValidator` directly, bypassing the protocol |
+| **Mid-session ratchet** | ❌ untested | Would have exposed that the peer cannot decrypt afterwards |
+| **Anti-amplification gate through produce** | ❌ untested | Including the popped-item drop |
+| **Payload > MTU / fragmentation** | ❌ untested | Would have caught the permanent tier-head blockage |
+| **Draining → Closed lifecycle** | ❌ untested | No timeout exists at all |
+| **gtp-io PacketIo with runtime/sim** | ❌ untested | The code is dead to begin with |
+| **ACK cadence negotiation** | ❌ untested | Would have caught the no-op mechanism |
 
-### 4.3 خلاصة الترابط
+### 4.3 Integration verdict
 
-آلية الانتقال بين الطبقات **تعمل ككيان متكامل في المسار السعيد فقط**. تحت أي انحراف (فقدان، فساد، تكرار، ترحيل، إغلاق، حمولة كبيرة، دورة مفاتيح) ينكسر التكامل — والاختبارات الحالية مصممة بحيث لا تمرّ بهذه الحالات. البنية التحتية للمحاكاة (`gtp-sim`) موجودة وقادرة على معظم هذه السيناريوهات لكنها غير مستغلة إلا في سيناريو واحد.
-
----
-
-## 5. التدقيق الأمني — طبقة التشفير والمسار
-
-### 5.1 البنية المُنفَّذة
-
-- **AEAD**: ChaCha20-Poly1305 (RFC 8439) عبر RustCrypto `chacha20poly1305` 0.10، بمفاتيح 256-بت، nonce 96-بت، وسم 128-بت — استخدام صحيح لواجهة detached in-place (بلا تخصيص كومة).
-- **اشتقاق المفاتيح**: X25519 → IKM = `shared ‖ client_nonce ‖ server_nonce` (96 بايت) → HKDF-SHA256 بملح ثابت → مفتاح رئيسي → `derive_session_keys` (تسمية `gtp_key_`/`gtp__iv_` + CID).
-- **الـ nonce**: `nonce = IV ⊕ (CID_be[0..8] ‖ PN_be[4..8])` — `aead.rs:21-33`.
-- **AAD**: الترويسة القصيرة كاملة (24 بايت) — يستدعيها core وليس مفروضاً من gtp-crypto.
-- **نافذة إعادة التشغيل**: خريطة بتات منزلقة 128-بت (كلمتان u64) — حساب الإزاحة صحيح رياضياً لكل الحالات (1-63، 64، 65-127، ≥128).
-- **جدولة المصافحة**: ClientHello(مفتاح عميل+nonce) → ServerHello(مفتاح خادم+nonce+كوكي+CID) → HandshakeFinish(كوكي+إثبات HMAC) — كلها **نص صريح** على السلك.
-
-### 5.2 النتائج الحرجة
-
-**SEC-1 (حرج) — إعادة استخدام nonce فورية بين الاتجاهين.**
-`derive_handshake_session_keys` (`handshake.rs:58-84`) تُرجع زوجاً واحداً (مفتاح، IV) **لكلا الطرفين بلا أي فصل اتجاهي أو دور**. كلا الطرفين يبدآن من PN=1 (`state.rs:49-133`)، و`derive_nonce` حتمية من (IV, CID, PN). العميل والخادم يتقاسمان CID — إذن حزمة العميل رقم 1 وحزمة الخادم رقم 1 تستخدمان **نفس المفتاح ونفس الnonce**. النتيجة: تسريب `P_client ⊕ P_server` من XOR الشفرتين، وإمكانية تزوير مصادقة Poly1305. الاختبار `handshake.rs:155-163` يعلن `assert_eq!(client_key, server_key)` — أي أن الحالة الخطرة مثبَّتة كـ "سلوك صحيح".
-**الإصلاح**: اشتقاق مفتاحين وIV-ين بتسميتي اتجاه (`"gtp client tx"`/`"gtp server tx"`) واختيارهما حسب الدور + اختبار يمنع التساوي.
-
-**SEC-2 (عالٍ) — البتات العليا الـ 32 لرقم الحزمة مهملة في الـ nonce.**
-`aead.rs:29-31` ترفض `pn_bytes[0..4]` — الحزمة رقم 1 والحزمة رقم 2³²+1 تنتجان الـ nonce نفسه تحت نفس المفتاح. لا حارس يمنع بلوغ 2³².
-**الإصلاح**: استخدام كامل الـ 64 بت (مثلاً `IV ⊕ PN_be[0..8]` في البايتات 4..12) أو تحديد PN بـ 32 بت مع إلزام دورة مفاتيح قبل النفاد.
-
-**SEC-3 (حرج) — نافذة إعادة التشغيل تُحدَّث قبل المصادقة.**
-`connection.rs:232-235` قبل `open()` عند `240`. الـ CID وPN نص صريح — مهاجم يعرف الـ CID يرسل PN=u64::MAX: النافذة تقفز وتُمسح الخريطة، وكل الحزم الشرعية اللاحقة تُرفض كإعادة تشغيل **دائماً**. مواصفة الأمان الداخلية `GTP-SEC-01.md:16-19` تشترط صراحة الالتزام بعد نجاح AEAD — الكود يخالف مواصفته.
-**الإصلاح**: مصادقة أولاً ثم تحديث؛ أو نسخ النافذة وتحديث النسخة وإثباتها عند النجاح.
-
-**SEC-4 (حرج) — كوكي بلا HMAC حقيقي.**
-`stateless_token.rs:24-35`: `cookie[i] = secret[i%32] ^ (addr_byte + ts_byte + i) mod 256` ثم **الكتابة فوق البايتات 0..8 بالطابع الزمني نصاً**. كل المدخلات غير السرية معروفة للمهاجم (الطابع داخل الكوكي، والعنوان عنوانه) → استرجاع `secret[8..32]` (24 بايتاً من 32) من كوكي واحدة، وتزوير كوكيز لأي عنوان وأي زمن، وتحديث صلاحية كوكي قديم إلى ما لا نهاية. المقارنة constant-time موجودة (`subtle`) لكنها بلا قيمة فوق بنية قابلة للتفكيك. الإنقاذ الحالي: إثبات HMAC في HandshakeFinish يعتمد على X25519 الذي لا يراه المهازم المتنصت — أي أن حماية العنوان المعلنة غير موجودة والاعتماد كله على طبقة أخرى.
-**الإصلاح**: `HMAC-SHA256(secret, "gtp cookie" ‖ addr ‖ ts)` + رفض `ts > now + skew`.
-
-**SEC-5 (عالٍ) — المصافحة مجهولة الهوية بلا مصادقة خادم.**
-لا شهادة ولا PSK ولا مفتاح ثابت ولا إثبات Finished من الخادم — DH مجهول قابل لـ MITM نشط يقدم نفسه كخادم. الاختبار المسمى `test_active_mitm_key_tamper_rejected` يختبر فقط فشل إثبات مُحرَّف، لا انتحال خادم. مقبول كنسخة أولى **شرط توثيقه** — لكن المشروع يقدّم نفسه كـ "production-grade".
-
-**SEC-6 (عالٍ) — الـ key ratchet غير منسّق على السلك.**
-`ratchet_key` سلسلة هاش باتجاه واحد فقط: بت `KEY_PHASE` في الترويسة موجود ولا يُضبط أبداً؛ الاستقبال لا يقرؤه؛ `key_rotation_interval_packets` في الإعداد لا يُنفَّذ؛ `packets_since_ratchet` يُزد ولا يُقرأ. بعد `ratchet_key()` **لا يستطيع النظير فك أي شيء** (ولا اختبار يمرّ بهذا المسار). كما أن السلسلة أحادية الاتجاه لا توفر أماناً بعد الاختراق (لا DH دوري)، والمفاتيح القديمة لا تُصفَّر.
-
-### 5.3 نتائج أمنية إضافية
-
-| المعرف | الخطورة | الموضع | الوصف |
-| :--- | :--- | :--- | :--- |
-| SEC-7 | عالٍ | `Cargo.toml:50` | تعطيل ميزة `zeroize` لـ x25519-dalek → المفاتيح الخاصة المؤقتة **لا تُمحى من الذاكرة** إطلاقاً |
-| SEC-8 | عالٍ | `kdf.rs:32-55`, `state.rs:94-108` | المسار الثابت المُهمَل حتمي (نفس secret+CID ⇒ نفس المفتاح/IV وكل تسلسل الـ nonce) وما زال عامّاً؛ المحاكاة تستخدمه بسّر رئيسي ثابت منشور في الكود `sim_runner.rs:24-25` |
-| SEC-9 | متوسط | `handshake.rs:104-119` | إثبات HMAC يعيد استخدام مفتاح AEAD نفسه (خلط أدوار بلا فصل مفاتيح) |
-| SEC-10 | متوسط | `aead.rs:45-47` | فيض عدد صحيح في فحص `payload_len + AEAD_TAG_LEN` → انهيار فهرسة عند `payload_len = usize::MAX` (واجهة عامة) |
-| SEC-11 | متوسط | `endpoint.rs:280,290` | مقيّد معدل ClientHello: التعليق "20/ثانية" والكود `<= 1000` — ×50 عن المقصود؛ وClientHello بلا طازجية (replay يولّد عمل تشفير) |
-| SEC-12 | متوسط | `handshake.rs:49-54` | لا فحص `was_contributory()` لنتيجة X25519 (مفاتيح منخفضة الرتبة/صفرية) |
-| SEC-13 | متوسط | `header.rs`, `endpoint.rs:113` | النسخة لا تُفاوض ولا تُربط بالـ transcript — لا حماية تخفيض عند إضافة نسخة ثانية |
-| SEC-14 | متوسط | `aead.rs:9-13`, `kdf.rs:13-27` | `Debug` مشتق على حاويات المفاتيح → احتمال طباعة المفاتيح في سجلات/ذعر |
-| SEC-15 | متوسط | `connection.rs:218-222` | رصيد anti-amplification يُحتسب قبل فك الترويسة/فحص CID/المصادقة |
-| SEC-16 | متوسط | `anti_amplification.rs` | لا واجهة إعادة ضبط — الميزانية ليست مرتبطة بالمسار عند الترحيل (تخالف دلالات QUIC)؛ والتحقق يُرفع بفك التشفير لا بالتحقق من العنوان |
-| SEC-17 | متوسط | `identifiers.rs:50-52` | `PacketNumber::next` جمع غير محفوظ — ذعر في debug عند u64::MAX والتفاف غير آمن في release مع رفض دائم من نافذة إعادة التشغيل |
-| SEC-18 | منخفض | `config.rs` مقابل `state.rs:73-75` | `replay_window_size` في الإعداد يُتجاهل (ثابت 128 دائماً) |
-| SEC-19 | منخفض | `plaintext.rs:8-18` | حامي النص الصريح لا يتحقق من `payload_len` أصلاً |
+The inter-layer machinery **works as one entity on the happy path only**. Under any deviation (loss, corruption, duplication, migration, close, large payload, key rotation) the integration breaks — and the current tests are constructed so they never pass through those states. The simulation infrastructure (`gtp-sim`) exists and is capable of most of these scenarios, but is exercised in exactly one.
 
 ---
 
-## 6. تدقيق خوارزميات الاسترداد والتحكم بالازدحام
+## 5. Security Audit — Crypto and Path Layers
 
-### 6.1 تقدير RTT (RFC 9002) — `gtp-recovery/src/rtt.rs`
+### 5.1 Implemented construction
 
-**الصحيح**: معاملات EWMA (rttvar 3/4+1/4، SR 7/8+1/8)، فرع العينة الأولى (SR=عينة، rttvar=نصفها)، تقييد ack_delay بـ max_ack_delay، عمليات Duration مُشبعة لا تنهار عند الصفر/السالب.
+- **AEAD**: ChaCha20-Poly1305 (RFC 8439) via RustCrypto `chacha20poly1305` 0.10, 256-bit keys, 96-bit nonces, 128-bit tags — correct use of the detached in-place API (no heap allocation).
+- **Key derivation**: X25519 → IKM = `shared ‖ client_nonce ‖ server_nonce` (96 bytes) → HKDF-SHA256 with a fixed salt → master key → `derive_session_keys` (labels `gtp_key_`/`gtp__iv_` + CID).
+- **Nonce**: `nonce = IV ⊕ (CID_be[0..8] ‖ PN_be[4..8])` — `aead.rs:21-33`.
+- **AAD**: the full short header (24 bytes) — supplied by core, not enforced by gtp-crypto.
+- **Replay window**: a 128-bit sliding bitmap (two u64 words) — the shift arithmetic is mathematically correct for all cases (1-63, 64, 65-127, ≥128).
+- **Handshake schedule**: ClientHello(client pk+nonce) → ServerHello(server pk+nonce+cookie+CID) → HandshakeFinish(cookie+HMAC proof) — all in **plaintext** on the wire.
 
-**العيوب**:
+### 5.2 Critical findings
 
-| المعرف | الخطورة | الموضع | الوصف |
+**SEC-1 (Critical) — immediate cross-direction nonce reuse.**
+`derive_handshake_session_keys` (`handshake.rs:58-84`) returns a single (key, IV) pair **for both peers with no direction or role separation whatsoever**. Both peers start at PN=1 (`state.rs:49-133`), and `derive_nonce` is deterministic in (IV, CID, PN). The client and server share the CID — so the client's packet 1 and the server's packet 1 use **the same key and the same nonce**. Consequence: `P_client ⊕ P_server` leaks from the ciphertext XOR, and Poly1305 one-time-key forgery becomes possible. The test at `handshake.rs:155-163` declares `assert_eq!(client_key, server_key)` — the dangerous state is enshrined as "correct behavior".
+**Fix**: derive two key/IV pairs with direction labels (`"gtp client tx"`/`"gtp server tx"`) and select by role, plus a test forbidding equality.
+
+**SEC-2 (High) — the top 32 bits of the packet number are ignored in the nonce.**
+`aead.rs:29-31` discards `pn_bytes[0..4]` — packet 1 and packet 2³²+1 produce the same nonce under the same key. No guard prevents reaching 2³².
+**Fix**: use all 64 bits (e.g., `IV ⊕ PN_be[0..8]` in bytes 4..12) or cap the PN at 32 bits with a mandatory rekey before exhaustion.
+
+**SEC-3 (Critical) — replay window updated before authentication.**
+`connection.rs:232-235` runs before `open()` at `240`. The CID and PN are plaintext — an attacker who knows the CID sends PN=u64::MAX: the window jumps, the bitmap clears, and every subsequent legitimate packet is rejected as a replay **forever**. The internal security spec `GTP-SEC-01.md:16-19` explicitly requires the bit to be set only after successful AEAD — the code violates its own spec.
+**Fix**: authenticate first, then update; or copy the window, update the copy, and commit only on success.
+
+**SEC-4 (Critical) — the cookie is not a real MAC.**
+`stateless_token.rs:24-35`: `cookie[i] = secret[i%32] ^ (addr_byte + ts_byte + i) mod 256`, then **the timestamp is written in plaintext into bytes 0..8**. Every non-secret input is known to an attacker (the timestamp is inside the cookie; the address is their own) → `secret[8..32]` (24 of 32 bytes) is recoverable from a single cookie, cookies can be forged for any address and any time, and an old cookie's lifetime can be refreshed forever. The constant-time comparison (`subtle`) exists but is pointless over a dismantlable construction. The current savior: the HandshakeFinish HMAC proof depends on X25519, which a spoofed-source attacker never sees — meaning the advertised address-ownership protection does not actually exist and the burden falls entirely on another layer.
+**Fix**: `HMAC-SHA256(secret, "gtp cookie" ‖ addr ‖ ts)` + reject `ts > now + skew`.
+
+**SEC-5 (High) — anonymous handshake with no server authentication.**
+No certificate, no PSK, no static key, no server Finished proof — anonymous DH vulnerable to an active MITM who presents itself as the server. The test named `test_active_mitm_key_tamper_rejected` only exercises a tampered proof, not server impersonation. Acceptable for a first version **if documented** — but the project markets itself as "production-grade".
+
+**SEC-6 (High) — the key ratchet is uncoordinated on the wire.**
+`ratchet_key` is a one-way hash chain only: the `KEY_PHASE` header bit exists but is never set; the receive path never reads it; `key_rotation_interval_packets` is configured but unenforced; `packets_since_ratchet` is incremented and never read. After `ratchet_key()` **the peer cannot decrypt anything** (and no test passes through this path). The one-way chain also provides no post-compromise security, and old keys are never zeroized.
+
+### 5.3 Additional security findings
+
+| ID | Severity | Location | Description |
 | :--- | :--- | :--- | :--- |
-| REC-1 | عالٍ | `rtt.rs:36-48` | طرح ack_delay **بلا شرط** `latest_rtt > min_rtt + ack_delay` ومن العينة الأولى — قيمة غير موثوقة من السلك تدفع SR وmin_rtt نحو الصفر (حلقة تغذية راجعة) |
-| REC-2 | متوسط | `rtt.rs:43-44` | min_rtt يُحدَّث من العينة **المعدَّلة** لا الخام — ينجرف تحت RTT الحقيقي ويضخّم حسابات الكشف الزمني وضغط الظهر |
-| REC-3 | متوسط | `rtt.rs:23` | قيمة الحارس `u64::MAX µs` تتسرب للعبة عبر `DetailedMetrics.min_rtt` حتى أول عينة، وتجعل backpressure=`Low` دائماً قبلها |
-| REC-4 | منخفض | `rtt.rs:68-70` | لا حد أدنى بجسامة الساعة (kGranularity) للـ PTO |
+| SEC-7 | High | `Cargo.toml:50` | The `x25519-dalek` `zeroize` feature is disabled → ephemeral private keys are **never wiped from memory** |
+| SEC-8 | High | `kdf.rs:32-55`, `state.rs:94-108` | The deprecated static path is deterministic (same secret+CID ⇒ same key/IV and the whole nonce sequence) and still public; the simulator uses it with a hardcoded published master secret (`sim_runner.rs:24-25`) |
+| SEC-9 | Medium | `handshake.rs:104-119` | The HMAC confirmation proof reuses the AEAD traffic key itself (role mixing, no key separation) |
+| SEC-10 | Medium | `aead.rs:45-47` | Integer overflow in the `payload_len + AEAD_TAG_LEN` check → slice-index panic at `payload_len = usize::MAX` (public API) |
+| SEC-11 | Medium | `endpoint.rs:280,290` | ClientHello rate limiter: the comment says "20/s" while the code allows `<= 1000` — 50x the documented intent; and ClientHello has no freshness token (replay forces crypto work) |
+| SEC-12 | Medium | `handshake.rs:49-54` | No `was_contributory()` check on the X25519 result (low-order/all-zero keys accepted) |
+| SEC-13 | Medium | `header.rs`, `endpoint.rs:113` | The version is neither negotiated nor bound into the transcript — no downgrade protection once a second version exists |
+| SEC-14 | Medium | `aead.rs:9-13`, `kdf.rs:13-27` | Derived `Debug` on key containers → keys can leak through logs/panic messages |
+| SEC-15 | Medium | `connection.rs:218-222` | Anti-amplification credit counted before header decode/CID check/authentication |
+| SEC-16 | Medium | `anti_amplification.rs` | No reset API — the budget is not path-scoped on migration (contrary to QUIC semantics); validation is lifted by decryption rather than address validation |
+| SEC-17 | Medium | `identifiers.rs:50-52` | `PacketNumber::next` is an unchecked add — debug panic at u64::MAX, unsafe wrap in release with permanent replay rejection |
+| SEC-18 | Low | `config.rs` vs `state.rs:73-75` | `replay_window_size` in the config is ignored (hardcoded 128) |
+| SEC-19 | Low | `plaintext.rs:8-18` | The plaintext protector does not validate `payload_len` at all |
 
-### 6.2 متتبع ACK — `ack_tracker.rs`
+---
 
-**الصحيح**: مجموعة فترات مرتبة تنازلياً مع دمج المجاورة؛ دلالات ترميز الفترات مطابقة لـ QUIC؛ ACK فوري عند الفجوة + بالعدد + مؤقت max_ack_delay؛ ترميز إطار ACK صفر تخصيص (مصفوفة على المكدس).
+## 6. Loss Recovery and Congestion Control Algorithm Audit
 
-**العيوب**:
+### 6.1 RTT estimation (RFC 9002) — `gtp-recovery/src/rtt.rs`
 
-| المعرف | الخطورة | الموضع | الوصف |
+**Correct**: the EWMA coefficients (rttvar 3/4+1/4, SR 7/8+1/8), the first-sample branch (SR=sample, rttvar=half), the ack_delay clamp to max_ack_delay, and saturating `Duration` arithmetic that cannot panic on zero/negative.
+
+**Defects**:
+
+| ID | Severity | Location | Description |
 | :--- | :--- | :--- | :--- |
-| REC-5 | عالٍ | `ack_tracker.rs:148-188` | **الفترات لا تُقلَّم أبداً** — كل فجوة مرّت تبقى في الـ Vec للجلسة كلها؛ نمو غير محدود + إعادة تسلسل أقدم الفترات في كل ACK |
-| REC-6 | عالٍ | `ack_tracker.rs:166` | سقف 32 فترة **يسقط الإقرارات بصمت** بلا دمج — حزم مستلمة بعد السقف لا يُعترف بها أبداً فيضطر النظير لإعادة إرسال عبر PTO |
-| REC-7 | عالٍ | `ack_tracker.rs:35-36` مقابل `config.rs` | `ack_frequency`/`max_ack_delay` **صلبة** (2 و25ms) ولا تُغذّى من `GtpConfig` إطلاقاً — إطار AckFrequency الوارد يعدّل الإعداد فقط (`connection.rs:423-432`) الذي لا يقرؤه أحد؛ **آلية التفاوض المعلنة no-op كلياً** |
-| REC-8 | متوسط | `connection.rs:543-568` | بعد البوابة المبكرة، الشرط `should_ack || has_queued_data` دائماً صحيح → **إطار ACK في كل datagram صادر** (~53 بايت + 8/فترة) حتى بلا جديد يُقرّ — يتجاوز تكيّف التردد كلياً |
-| REC-9 | منخفض | `ack_tracker.rs:150` | اقتطاع `ack_delay_us` إلى u32 (>71 دقيقة) |
+| REC-1 | High | `rtt.rs:36-48` | ack_delay subtracted **unconditionally** and on the first sample — an untrusted wire value drives SR/min_rtt toward zero (a feedback loop) |
+| REC-2 | Medium | `rtt.rs:43-44` | min_rtt is updated from the **adjusted** sample rather than the raw one — drifts below the true path RTT and inflates time-threshold and backpressure computations |
+| REC-3 | Medium | `rtt.rs:23` | The `u64::MAX µs` sentinel leaks to the game through `DetailedMetrics.min_rtt` until the first sample, keeping backpressure `Low` meanwhile |
+| REC-4 | Low | `rtt.rs:68-70` | No timer-granularity floor (kGranularity) on PTO |
 
-### 6.3 كاشف الفقدان — `loss_detector.rs`
+### 6.2 ACK tracker — `ack_tracker.rs`
 
-**الصحيح**: عتبة الحزم k=3 (`:185`)، العتبة الزمنية 9/8×max(SR, latest) (`:169-177`)، عينة RTT فقط من أكبر PN معترف به حديثاً (مطابق RFC 9002 §5)، معالجة ACK والفقدان في مسحة واحدة.
+**Correct**: a descending sorted interval set with adjacent merging; range encoding semantics matching QUIC; immediate ACK on gap + count-based + max_ack_delay timer; zero-allocation ACK frame encoding (stack array).
 
-**العيوب**:
+**Defects**:
 
-| المعرف | الخطورة | الموضع | الوصف |
+| ID | Severity | Location | Description |
 | :--- | :--- | :--- | :--- |
-| REC-10 | حرج | `loss_detector.rs:100-113` + `frame.rs:483-515` | **توسيع يتحكم به الخصم**: فك إطار Ack يتحقق من *عدد* الفترات لا *محتواها* (`gap`/`length` قيم u32 مهاجِمة) ثم `(start..=current_pn).rev()` يبني vec — فترة واحدة بـ `length=0xFFFFFFFF` ⇒ تخصيص **~34GB** قبل أي بحث في sent_packets. يتطلب مفتاح الجلسة (خصم خبيث لا إنترنت) لكن طبقة السلك تسلّم دلالات غير مُتحقَّرة كلياً |
-| REC-11 | عالٍ | `loss_detector.rs:219-233` + `connection.rs:489-528` | `on_timeout` يعيد كل غير المعترف به **دون إزالة من sent_packets**، بلا حدّ للإرسالات، وبلا تراجع أُسّي للـ PTO (`pto_count` يُحسب ويُهمَل، `pto_max_duration` إعداد ميت) — **عاصفة إعادة إرسال دورية ثابتة الدور** + تسليم مكرر للتطبيق |
-| REC-12 | عالٍ | البنية كلها | **لا آلة حالة مؤقتات**: لا تسليح/إلغاء؛ كشف الفقدان يعمل فقط داخل `on_ack_received` والـ PTO فقط داخل `produce` — تطبيق يتوقف عن الإنتاج = لا PTO إطلاقاً؛ فقدان كل الـ ACKs = لا إعلان فقدان زمني أبداً |
-| REC-13 | متوسط | `loss_detector.rs:142-162` | `DeliveryRateSample` يُحسب في كل ACK ويُهمَل (`connection.rs:283` يرميه) — وزن ميت |
-| REC-14 | متوسط | `loss_detector.rs:76-82` مقابل `cubic.rs:124-126` | عدم تماثل محاسبة in-flight: الكاشف يحصي ack-eliciting فقط وCC يحصي كل بايت — المقياسان يتباعدان |
+| REC-5 | High | `ack_tracker.rs:148-188` | **Intervals are never pruned** — every gap ever seen stays in the Vec for the whole session; unbounded growth + re-serialization of the oldest ranges in every ACK |
+| REC-6 | High | `ack_tracker.rs:166` | The 32-range cap **silently drops acknowledgements** with no coalescing — packets received beyond the cap are never ACKed, forcing needless PTO retransmissions |
+| REC-7 | High | `ack_tracker.rs:35-36` vs `config.rs` | `ack_frequency`/`max_ack_delay` are **hardcoded** (2 and 25ms) and never fed from `GtpConfig`; the incoming AckFrequency frame only mutates the config (`connection.rs:423-432`) which nothing reads; **the advertised negotiation is a complete no-op** |
+| REC-8 | Medium | `connection.rs:543-568` | After the early gate, `should_ack || has_queued_data` is always true → **an ACK frame in every outgoing datagram** (~53 B + 8/range) even with nothing new — bypassing frequency adaptation entirely |
+| REC-9 | Low | `ack_tracker.rs:150` | `ack_delay_us` truncated to u32 (>71 minutes) |
+
+### 6.3 Loss detector — `loss_detector.rs`
+
+**Correct**: packet threshold k=3 (`:185`), time threshold 9/8×max(SR, latest) (`:169-177`), RTT sampling only from the largest newly-acked PN (RFC 9002 §5), one-pass ACK+loss processing.
+
+**Defects**:
+
+| ID | Severity | Location | Description |
+| :--- | :--- | :--- | :--- |
+| REC-10 | Critical | `loss_detector.rs:100-113` + `frame.rs:483-515` | **Attacker-controlled expansion**: Ack decoding validates the range *count* but not the *contents* (`gap`/`length` are attacker u32s), then `(start..=current_pn).rev()` builds a vec — one range with `length=0xFFFFFFFF` allocates **~34 GB** before any sent-packet lookup. Requires the session key (a malicious peer, not the internet), but the wire layer hands over completely unvalidated semantics |
+| REC-11 | High | `loss_detector.rs:219-233` + `connection.rs:489-528` | `on_timeout` returns all unacknowledged retransmittables **without removing them from sent_packets**, with no per-message cap and no exponential PTO backoff (`pto_count` is computed and ignored; `pto_max_duration` is dead config) — a **fixed-period retransmission storm** + duplicate application delivery |
+| REC-12 | High | the design as a whole | **No timer state machine**: no arming/cancelling API; loss detection only runs inside `on_ack_received` and the PTO check only inside `produce` — an application that stops producing gets no PTO; total ACK loss means no time-based loss declaration ever |
+| REC-13 | Medium | `loss_detector.rs:142-162` | `DeliveryRateSample` is computed on every ACK and discarded (`connection.rs:283` throws it away) — dead weight |
+| REC-14 | Medium | `loss_detector.rs:76-82` vs `cubic.rs:124-126` | Asymmetric in-flight accounting: the detector counts ack-eliciting bytes only, CC counts every byte — the two gauges diverge |
 
 ### 6.4 CUBIC (RFC 8312) — `cubic.rs`
 
-**الصحيح** (تم التحقق رياضياً ضد نص RFC): دالة النمو `W_cubic(t)=C(t−K)³·SMSS+W_max` بالبايت بأبعاد صحيحة؛ `K=cbrt(W_max(1−β)/(C·SMSS))`؛ `W_tcp` بصيغة Eq.4؛ β=0.7 وC=0.4؛ الإنقاص الضربي بأرضية 2·SMSS مع حد مرة/RTT؛ التقارب السريع مكافئ دلالياً لـ §4.6؛ slow start قياسي؛ معالجة الفقدان وECN بنفس الإنقاص.
+**Correct** (verified mathematically against the RFC text): the growth function `W_cubic(t)=C(t−K)³·SMSS+W_max` in byte domain with correct dimensions; `K=cbrt(W_max(1−β)/(C·SMSS))`; `W_tcp` per Eq. 4; β=0.7 and C=0.4; multiplicative decrease floored at 2·SMSS with a once-per-RTT guard; fast convergence semantically equivalent to §4.6; standard slow start; identical loss and ECN handling.
 
-**العيوب**:
+**Defects**:
 
-| المعرف | الخطورة | الموضع | الوصف |
+| ID | Severity | Location | Description |
 | :--- | :--- | :--- | :--- |
-| CC-1 | عالٍ | `cubic.rs:154-158` + `:84` | `on_timeout` لا يصفّر `k`/`origin_point`/`w_max` (خلاف §4.7 الذي يشترط K=0 وW_max=cwnd) — لحظة الخروج من slow start بعد المهلة يُحسب W_cubic على مسار ما قبل المهلة و`max()` **يستعيد النافذة القديمة فوراً**؛ slow start بعد المهوة مُفرَّغ |
-| CC-2 | عالٍ | `cubic.rs:128-134` | النافذة تنمو حتى على ACK مكرر/فارغ (`bytes_acked=0`) — انعكاس حركة ACK أو خصم ينفخ cwnd بلا بيانات مسلّمة |
-| CC-3 | عالٍ | `connection.rs:689` + `cubic.rs:124-126` | **تسريب in-flight الوهمي**: بايتات حزم ACK-only تُقيَّد في `cc.inflight` والنظير لا يعترف عليها بتصميمه → نمو رتيب حتى استهلاك `cwnd−inflight` **وتوقف الإرسال**؛ نفس السجلات تتراكم للأبد في sent_packets |
-| CC-4 | متوسط | `cubic.rs:150` | "smoothed_rtt" في CC هو **العينة الخام الأخيرة** بلا EWMA — حد مرة/RTT وrate الـ pacing وW_tcp كلها ترتجف بعينة واحدة |
-| CC-5 | متوسط | `cubic.rs:68` | W_tcp تستخدم min_rtt بدلاً من RTT الجاري — يُعظّم حد النمو (عدواني)؛ وmin_rtt بلا نافذة انتهاء صلاحية |
-| CC-6 | متوسط | `state.rs:70,120` مقابل `config.rs` | **كل معاملات CC ميتة**: `cubic_beta`/`cubic_c`/`initial_cwnd_packets`/`min_cwnd_packets`/`shss`/`pacing_gain`/`max_pacing_burst_bytes` لا تصل للمُنشئ (يُستدعى بـ Default) — إعدادات LAN/Mobile المسبقة تجميلية |
-| CC-7 | منخفض | `cubic.rs:84` | المرشح لكل ACK هو W_cubic(t) لا W_cubic(t+RTT) (§4.1) — نمو أخف من المعياري |
-| CC-8 | منخفض | — | لا HyStart (جائز، MAY)، لا إعادة تشغيل بعد الخمول، لا سقف أقصى لـ cwnd |
+| CC-1 | High | `cubic.rs:154-158` + `:84` | `on_timeout` does not reset `k`/`origin_point`/`w_max` (contrary to §4.7, which requires K=0 and W_max=cwnd) — the moment slow start exits after a timeout, W_cubic is computed against the pre-timeout trajectory and `max()` **restores the old window instantly**; post-timeout slow start is gutted |
+| CC-2 | High | `cubic.rs:128-134` | The window grows even on a duplicate/empty ACK (`bytes_acked=0`) — reflected ACK traffic or a peer can inflate cwnd with no data delivered |
+| CC-3 | High | `connection.rs:689` + `cubic.rs:124-126` | **Phantom in-flight leak**: ACK-only datagram bytes are charged to `cc.inflight` while the peer never acknowledges them by design → monotonic growth until `cwnd−inflight` is consumed and **sending stalls**; the same records accumulate forever in sent_packets |
+| CC-4 | Medium | `cubic.rs:150` | The CC's "smoothed_rtt" is the **raw last sample** with no EWMA — the once-per-RTT loss guard, pacing rate, and W_tcp all jitter with single observations |
+| CC-5 | Medium | `cubic.rs:68` | W_tcp uses min_rtt instead of the connection RTT — maximizes the growth bound (aggressive); min_rtt has no expiry window |
+| CC-6 | Medium | `state.rs:70,120` vs `config.rs` | **Every CC knob is dead**: `cubic_beta`/`cubic_c`/`initial_cwnd_packets`/`min_cwnd_packets`/`smss`/`pacing_gain`/`max_pacing_burst_bytes` never reach the constructor (built with `Default`) — the LAN/Mobile presets are cosmetic |
+| CC-7 | Low | `cubic.rs:84` | The per-ACK candidate is W_cubic(t), not W_cubic(t+RTT) (§4.1) — milder than the RFC |
+| CC-8 | Low | — | No HyStart (allowed, a MAY), no idle restart, no max-cwnd clamp |
 
-### 6.5 الـ Pacing وضغط الظهر
+### 6.5 Pacing and backpressure
 
-| المعرف | الخطورة | الموضع | الوصف |
+| ID | Severity | Location | Description |
 | :--- | :--- | :--- | :--- |
-| CC-9 | متوسط | `pacing.rs:33-38` | اقتطاع كسري في `(rate*elapsed) as u64` مع تقديم `last_update_time` دائماً — خصم منهجي تراكمي بلا مراكم باقٍ؛ والتعبئة تحدث فقط عند استدعاء produce — نوم 100ms = دفعة 12KB كاملة دفعة واحدة (حبيبية الـ pacing = معدل الاستقصاء) |
-| CC-10 | متوسط | `backpressure.rs` | **بلا هستيريس** — دالة نقية قد تتذبذب المستوى لكل حزمة (core يزيل تكرار الحدث لا المستوى)؛ وتُحدَّث فقط عند ورود datagram — مرسل صِرف يرى مستوى متقادماً |
-| CC-11 | منخفض | `handle.rs:211-228` | مقاييس تُكذب على المشغّل: `pacing_tokens_remaining=0`، `queue_bytes_per_tier=[0;5]`، عدادات ECN=0 — **مصلّبة يدوياً** رغم وجود البيانات (بلا getter أصلاً) |
-| CC-12 | منخفض | `controller.rs:14` | `on_ecn` معرَّف ومُنفَّذ ولا يستدعيه أحد — عدادات ECN تُفك من السلك وتُحمل في ACK وتُرمى (`connection.rs:281`) — **لا حلقة ECN إطلاقاً** رغم وجود بتاتها في الترويسة |
+| CC-9 | Medium | `pacing.rs:33-38` | Fractional truncation in `(rate*elapsed) as u64` while `last_update_time` always advances — a systematic accumulating under-credit with no remainder accumulator; refill happens only inside `produce` — a 100ms sleep earns a full 12KB burst at once (pacing granularity = poll rate) |
+| CC-10 | Medium | `backpressure.rs` | **No hysteresis** — a pure function that can flap the level per packet (core dedupes the event, not the level); recomputed only on incoming datagrams — a pure sender sees stale backpressure |
+| CC-11 | Low | `handle.rs:211-228` | Metrics lie to operators: `pacing_tokens_remaining=0`, `queue_bytes_per_tier=[0;5]`, ECN counters=0 — **hardcoded** although the data exists (no getter at all) |
+| CC-12 | Low | `controller.rs:14` | `on_ecn` is defined and implemented but never called — ECN counters are decoded off the wire, carried in ACK frames, and dropped (`connection.rs:281`) — **no ECN loop whatsoever** despite the header bits |
 
 ---
 
-## 7. تدقيق خوارزمية الجدولة ودلالات التسليم
+## 7. Scheduling Algorithm and Delivery Semantics Audit
 
-### 7.1 مجدول DRR الخماسي — `scheduler.rs`
+### 7.1 The 5-tier DRR scheduler — `scheduler.rs`
 
-**البنية**: 5 صفوف `VecDeque` + `deficits:[usize;5]` + سقف بايت لكل صف (512KB افتراضياً). P0 أولوية صارمة لا يلمس العجوز؛ P1-P4 كوانتم/زيارة: 3500/3000/1500/500 بايت.
+**Structure**: 5 `VecDeque` tiers + `deficits:[usize;5]` + a per-tier byte cap (512KB default). P0 is strict-priority and never touches the deficit; P1-P4 receive 3500/3000/1500/500 bytes per visit.
 
-| المعرف | الخطورة | الموضع | الوصف |
+| ID | Severity | Location | Description |
 | :--- | :--- | :--- | :--- |
-| SCH-1 | عالٍ | `scheduler.rs:109-134` | **DRR تنحل إلى أولوية صارمة**: `pop_next` يفحص الصفوف بترتيب ثابت، يضيف الكوانتم لكل صف غير فارغ، يعيد عنصراً واحداً؛ المستدعي (`connection.rs:573`) يعاود الاستدعاء فيبدأ المسح من P1 مجدداً ويضيف كوانتمه كل مرة — كوانتم P1 (3500) يتجاوز أي إطار واقعي (<~1400) فـ P1 مؤهل دوماً ⇒ **الأوزان المعلنة لا تتحقق أبداً تحت الحمل** وP2-P4 يُجاعون حتى فراغ P1 — مخالفة لمتطلب المواصفة (§476 من ملف GTP_1_1) "منع التجويع بخدمة موزونة" |
-| SCH-2 | عالٍ | `scheduler.rs:109-117` | **عجز غير مسقف ومضخَّم ×4**: كل استدعاء يضيف حتى 4 كوانتم لكل صف غير فارغ (بما فيه الاستدعاءات العائدة بـ None عند ميزانية صغيرة — بوابة pacing تسمح بـ 64 بايت) بلا سقف (القياسي: quantum+MTU) — صف محجوز يراكم رصيداً غير محدود وينفجر دفعة غير عادلة عند التحرر |
-| SCH-3 | متوسط | `scheduler.rs:88-99` | P0 بلا سقف حصة — عاصفة PathChallenge تُجوّع كل الطبقات (سقف الصف 512KB هو الميبض الوحيد) |
-| SCH-4 | متوسط | `scheduler.rs:47,74` | enqueue بـ O(n) (جمع الصف كله لكل عنصر) + retain O(n) للإزاحة ⇒ O(n²) تراكمياً — عدّاد جارٍ يجعله O(1) |
-| SCH-5 | منخفض | `scheduler.rs:47` مقابل `:149-156` | سعة الصف تشمل العناصر منتهية الصلاحية غير المقلمة — تشغل admission |
-| SCH-6 | منخفض | `semantics.rs:36` | تسكير P4 أولاً تحت الضغط معلن ولا آلية له (المواعيد والسقوف فقط) |
+| SCH-1 | High | `scheduler.rs:109-134` | **DRR degenerates into strict priority**: `pop_next` scans tiers in fixed order, adds the quantum to every non-empty tier, and returns after one item; the caller (`connection.rs:573`) immediately calls again, restarting the scan at P1 and re-adding P1's quantum — P1's quantum (3500) exceeds any realistic frame (<~1400), so P1 is essentially always eligible ⇒ **the advertised weights never materialize under load** and P2-P4 starve until P1 empties — violating the spec requirement ("starvation must be prevented using weighted service") |
+| SCH-2 | High | `scheduler.rs:109-117` | **Uncapped deficit accrual, amplified ×4**: each call adds up to 4 quanta to every non-empty tier (including calls returning None under small budgets — the pacing gate allows 64 bytes) with no cap (the classic: quantum+MTU) — a budget-blocked tier accumulates unlimited credit and bursts unfairly once freed |
+| SCH-3 | Medium | `scheduler.rs:88-99` | P0 has no share cap — a PathChallenge echo storm starves every tier (the 512KB queue cap is the only brake) |
+| SCH-4 | Medium | `scheduler.rs:47,74` | enqueue is O(n) (sums the whole tier per item) + O(n) `retain` for eviction ⇒ O(n²) cumulative — a running byte counter makes it O(1) |
+| SCH-5 | Low | `scheduler.rs:47` vs `:149-156` | Tier capacity counts expired-but-unpruned items — they consume admission |
+| SCH-6 | Low | `semantics.rs:36` | "P4 shed first under congestion" is advertised with no mechanism (deadlines and caps only) |
 
-**الصحيح**: إسقاط المنتهية عند السحب، تصفير العجز عند فراغ الصف، تفادي HOL عبر إعادة الدفع وكسر الصف عند تجاوز الميزانية (يسمح للصفوف الدنيا بحشو ذيل الـ datagram).
+**Correct**: expired-item dropping at pop, deficit reset on empty queue, HOL avoidance via push-front + tier break when an item exceeds the budget (letting lower tiers fill the datagram tail).
 
-### 7.2 جدولة الحالة وsupersession — `state_table.rs`
+### 7.2 State scheduling and supersession — `state_table.rs`
 
-| المعرف | الخطورة | الموضع | الوصف |
+| ID | Severity | Location | Description |
 | :--- | :--- | :--- | :--- |
-| SEM-1 | عالٍ | `identifiers.rs:170-172` | `GenerationId::is_newer_than` مقارنة `>` بسيطة **ليست RFC 1982** — التفاف u32 بعد 2³² لقطة يكسر supersession نهائياً لذلك المفتاح؛ وفي نفس الملف `StateSequence` معالجة صحيحاً (141-144) — نظامان ترتيبان متناقضان لعدّادين يسافران في نفس الإطار |
-| SEM-2 | عالٍ | `connection.rs:330-345` | **لا drop-late استقبالاً**: StateTable تعمل عند الإرسال فقط؛ كل `Frame::Data` يُسلَّم للتطبيق بلا فحص حداثة — نصف دلالات UnreliableSequenced فقط منفَّذ، والمستقبل قد يرى حالة قديمة بعد حديثة (خاصة مع T4 أدناه) |
-| SEM-3 | متوسط | `scheduler.rs:55-76` | علم `supersedable` يُكتب في كل مكان **ولا يُقرأ في أي مكان** — منتج يعلّم لقطة غير قابلة للإزاحة تُزاح بصمت |
-| SEM-4 | متوسط | `scheduler.rs:74` | الإزاحة تبحث في صف العنصر الجديد فقط — تحديث أقدم في صف آخر (تغيّرت الأولوية) ⇒ يُرسلان معاً ومع SEM-2 يصل القديم بعد الجديد |
-| SEM-5 | منخفض | `state_table.rs:7` | الجدول لا يُقلَّم — نمو بلا حدود لعمر الاتصال + بحث مزدوج لكل enqueue |
+| SEM-1 | High | `identifiers.rs:170-172` | `GenerationId::is_newer_than` is a plain `>` — **not RFC 1982**: a u32 generation wrap permanently breaks supersession for that key; in the same file `StateSequence` is handled correctly (141-144) — two contradictory ordering disciplines for two counters traveling in the same frame |
+| SEM-2 | High | `connection.rs:330-345` | **No receive-side drop-late**: the StateTable runs at TX only; every `Frame::Data` is delivered to the application with no freshness check — half of the UnreliableSequenced semantics is missing, and the receiver can observe stale state after fresh state (especially with T4) |
+| SEM-3 | Medium | `scheduler.rs:55-76` | The `supersedable` flag is written everywhere **and read nowhere** — a producer marking a snapshot non-supersedable still has it evicted silently |
+| SEM-4 | Medium | `scheduler.rs:74` | Eviction searches only the new item's tier — an older update in another tier (priority changed) means both transmit, and with SEM-2 the stale one lands after the fresh one |
+| SEM-5 | Low | `state_table.rs:7` | The table is never pruned — unbounded growth for the connection lifetime + a double lookup per enqueue |
 
-### 7.3 المجموعات المرتبة — `ordered_group.rs`
+### 7.3 Ordered groups — `ordered_group.rs`
 
-| المعرف | الخطورة | الموضع | الوصف |
+| ID | Severity | Location | Description |
 | :--- | :--- | :--- | :--- |
-| ORD-1 | عالٍ | `ordered_group.rs:29` | مقارنة `order_seq < next_expected` **بصيغة أعداد بسيطة** — التفاف u32 يجعل السوابق تُخزَّن كخارج الترتيب **للأبد**؛ يتجمد الصف وتُحتجز ذاكرة إعادة الترتيب نهائياً (order_seq لم ينل معاملة RFC 1982 كـ StateSequence) |
-| ORD-2 | عالٍ | `connection.rs:367` | امتلاء مخزن المجموعة (256KB) يعيد الخطأ بـ `?` فيجهض **بقية الـ datagram كاملاً بما فيه إطارات ACK التي يحتاجها النظير** ويتخطى `ack_tracker.on_packet_received` (452) — الحزمة لا يُعترف بها فيُعاد إرسالها وتفشل بنفس الطريقة: **livelock محتمل** |
-| ORD-3 | عالٍ | `connection.rs:326` | `let _ = scheduler.enqueue(item)` لإعادة إرسال الرسائل "الموثوقة" — صف P3 ممتلئ (`ResourceLimitExceeded`) أو عنصر منتهٍ ⇒ **فقدان صامت لرسالة بعقد تسليم مضمون** بلا حتى عدّاد |
-| ORD-4 | عالٍ | `connection.rs:347-358` | `ReliableUnordered` (group 0) يُسلَّم **بلا إزالة تكرار** — إعادات الإرسال (المدفوعة بالفقدان REC-11 أو PTO) تعيد استخدام نفس message_id فتصل الحمولة مرات عديدة للتطبيق؛ المجموعات المرتبة تحمي نفسها بـ `next_expected` — غير المرتبة لا شيء يحميها |
-| ORD-5 | متوسط | `state.rs:24` + `connection.rs:361-365` | عدد المجموعات غير محدود — خصم يفتح حتى 65,536 مجموعة × 256KB = **16GB** مخازن متجمدة (مع ORD-1/ORD-2) |
-| ORD-6 | متوسط | البنية | لا تتبّع فواصل ناقصة، لا NACK، لا إخلاء بالمهلة — سدّة الفجوة تعتمد كلياً على كشف الفقدان لدى المرسل |
-| ORD-7 | منخفض | `connection.rs:367-376` | عناصر الدفعة المسلَّمة تُوسم بـ order_seq الخاص بالإطار المُطلِّق لا الخاص بها |
+| ORD-1 | High | `ordered_group.rs:29` | The `order_seq < next_expected` comparison is a **plain integer compare** — a u32 wrap makes predecessors buffer as out-of-order **forever**; the group freezes and pins its reorder memory permanently (order_seq never received the RFC 1982 treatment) |
+| ORD-2 | High | `connection.rs:367` | A full reorder buffer (256KB) propagates the error with `?`, aborting **the rest of the datagram including the ACK frames the peer needs**, and skipping `ack_tracker.on_packet_received` (452) — the packet is never acknowledged, is retransmitted, and fails the same way: a **potential livelock** |
+| ORD-3 | High | `connection.rs:326` | `let _ = scheduler.enqueue(item)` for "reliable" retransmissions — a full P3 tier (`ResourceLimitExceeded`) or an expired item ⇒ **silent loss of a guaranteed-delivery message** without even a counter |
+| ORD-4 | High | `connection.rs:347-358` | `ReliableUnordered` (group 0) is delivered **with no deduplication** — retransmissions (loss-driven REC-11 or PTO) reuse the same message_id and the payload reaches the application multiple times; ordered groups protect themselves via `next_expected` — nothing protects the unordered path |
+| ORD-5 | Medium | `state.rs:24` + `connection.rs:361-365` | Unbounded group count — a peer can open up to 65,536 groups × 256KB = **16 GB** of frozen buffers (with ORD-1/ORD-2) |
+| ORD-6 | Medium | the design | No missing-sequence tracking, no NACK, no timeout eviction — gap filling depends entirely on sender-side loss detection |
+| ORD-7 | Low | `connection.rs:367-376` | Batch-delivered items are labeled with the triggering frame's order_seq rather than their own |
 
-### 7.4 آلة حالة المسار، الـ anti-amplification، والتحقق من المسار
+### 7.4 Path state machine, anti-amplification, and path validation
 
-| المعرف | الخطورة | الموضع | الوصف |
+| ID | Severity | Location | Description |
 | :--- | :--- | :--- | :--- |
-| PATH-1 | متوسط | `state_machine.rs:30-42` | `Initial → Closed` غير مسموح — `force_close()` على اتصال لم يصافح يعيد خطأ بدلاً من الإغلاق: **إغلاق اتصال فشل مصافحته مستحيل** |
-| PATH-2 | متوسط | `endpoint.rs:183-190, 408-415` + `connection.rs:36` | **الـ anti-amplification معطّل فعلياً**: كل مسارات إنشاء الاتصال الحية تمرر `pre_validated: true` — البوابة الوحيدة القابلة للتفعيل (`connect_with_session_keys(..., false)`) غير مستخدمة |
-| PATH-3 | متوسط | `path_validator.rs` | مؤقت التحدي 3 ثوانٍ يُستشار **فقط عند وصول رد** — لا مؤقت يُطلق فشلاً ولا إعادة محاولة ولا تنظيف؛ تحدٍّ مهجور يبقى قابلاً للمطابقة؛ ولا حدث `PathValidationFailed` يُصدر أبداً |
-| PATH-4 | منخفض | `state.rs:19` مقابل `path_validator.rs` | مصدرا حقيقة للمسار النشط (`ConnectionHot.active_path` و`PathValidator.active_path`) يتحدثان في موضعين بلا تنسيق قسري |
-| PATH-5 | منخفض | `connection.rs:389-406` | رد PathChallenge يُوجَّه نحو `active_path` لا نحو `src_addr` للمتحدّي — **NAT rebinding لا يمكن أن ينجح حتى لو وصل الإطار** (يتراكب مع Core-C1)؛ وتقطيع `b[..9].to_vec()` مُصلَّب على تخطيط الإطار |
+| PATH-1 | Medium | `state_machine.rs:30-42` | `Initial → Closed` is not permitted — `force_close()` on a never-handshaked connection returns an error instead of closing: **closing a failed handshake is impossible** |
+| PATH-2 | Medium | `endpoint.rs:183-190, 408-415` + `connection.rs:36` | **Anti-amplification is effectively disabled**: every live connection-creation path passes `pre_validated: true`; the only path that could engage the gate (`connect_with_session_keys(..., false)`) is unused |
+| PATH-3 | Medium | `path_validator.rs` | The 3-second challenge timeout is consulted **only when a response happens to arrive** — no timer fires a failure, no retry, no cleanup; an abandoned challenge remains matchable; a `PathValidationFailed` event is never emitted |
+| PATH-4 | Low | `state.rs:19` vs `path_validator.rs` | Two sources of truth for the active path (`ConnectionHot.active_path` and `PathValidator.active_path`) updated in two places with no enforced coordination |
+| PATH-5 | Low | `connection.rs:389-406` | The PathChallenge echo is enqueued toward `active_path`, not the challenger's `src_addr` — **NAT rebinding can never succeed even if the frame arrives** (compounds with Core-C1); the `b[..9].to_vec()` slicing is hardcoded to the frame layout |
 
 ---
 
-## 8. تدقيق طبقة السلك (Wire Format)
+## 8. Wire Format Layer Audit
 
-### 8.1 نقاط القوة
+### 8.1 Strengths
 
-- `FrameIterator` استعارة صفريّة التخصيص فعلياً؛ الحزمة `no_std` بلا `alloc` — الخاصية بنيوية لا عرضية.
-- `PacketBuilder` يكتب في مخزن المستدعي ويعيد ترميز الترويسة في الموضع.
-- مسار الفك خالٍ من الانهيارات: كل مساعدات القراءة تتحقق من الطول مسبقاً (`frame.rs:110-175`)، والترويسات محمية بفحص `min_len` (`header.rs:167,184`)، و`unreachable!()` في varint غير قابل للوصول فعلاً.
-- `StateSequence::is_newer_than` تنفيذ RFC 1982 صحيح تماماً مع معالجة محافظة لنقطة المنتصف.
+- `FrameIterator` is genuinely zero-allocation zero-copy; the crate is `no_std` with no `alloc` — the property is structural.
+- `PacketBuilder` writes into a caller-provided buffer and re-encodes the header in place.
+- The decode path is panic-free: every read helper pre-checks lengths (`frame.rs:110-175`), headers are guarded by the `min_len` check (`header.rs:167,184`), and the `unreachable!()` in varint is genuinely unreachable.
+- `StateSequence::is_newer_than` is a fully correct RFC 1982 implementation with the conservative midpoint treatment.
 
-### 8.2 العيوب
+### 8.2 Defects
 
-| المعرف | الخطورة | الموضع | الوصف |
+| ID | Severity | Location | Description |
 | :--- | :--- | :--- | :--- |
-| WIR-1 | عالٍ | `frame.rs:378, 467` | **فيض عدد صحيح في فحوص الحدود عند الترميز**: `offset + 4 + padding_len` مع `padding_len = usize::MAX` (حقل عام) يلتف في release فيمر الفحص ثم ينهر تقطيع الشريحة؛ نفس النمط لـ `Padding{len}` — قابل للتفعيل عبر API عامة بلا unsafe (ليس عن بُعد: الفك لا يولّد قيماً بلا حدود، لكنه ذعر في مكتبة) |
-| WIR-2 | عالٍ | `frame.rs:219 مقابل :231` | **عدم تماثل ترميز ACK**: الحجم والحلقة مقيّدان بـ 32 فترة لكن بايت `range_count` يُكتب خاماً — إطار بـ 40 فترة يرمّز 32 ويعلن 40 فيرفضه فاكّه الخاص بـ `ResourceLimitExceeded` (مسار غير مختبَر إطلاقاً) |
-| WIR-3 | متوسط | `codec.rs:90` + `connection.rs:653` | `payload_len as u16` **اقتطاع صامت** لحمولة >65535 (قابلة للبناء: ثلاثة إطارات 30KB في مخزن 128KB) — يجب أن يعيد `BufferOverflow` |
-| WIR-4 | متوسط | `frame.rs:389` | سبب Close يُقتطع لـ 255 بايت بصمت بلا خطأ أو إشارة |
-| WIR-5 | متوسط | `frame.rs:604-605, 704-705` | فك `MtuProbe`/`Padding` **يستهلك بقية الحزمة** — أي إطار يليهما يُفسَّر حشواً ويُدمَّر بصمت؛ والمُرمِّز يُصدر Padding وسط الحزمة بلا منع — **المرمّز يولّد datagrams يسيء فاكّه تفسيرها**؛ الثابتة "الحشو طرفي" مفترضة وغير مفروضة |
-| WIR-6 | متوسط | `header.rs:131,136,151` + `codec.rs:53-57` | `header_len` يُكتب ولا يُحترم: encode يكتب دائماً 24/28 بايت ويختم قيمة المستدعي التعسفية؛ PacketBuilder يعيد حسابه متجاهلاً الحقل — ترويسة يدوية بـ header_len=100 تنتج datagram يفكّه المستقبل بـ consumed=100 فيقفز 76 بايت من الإطارات كـ "امتدادات" صامتة؛ مسار الامتدادات نفسه بصفر تغطية اختبار |
-| WIR-7 | متوسط | `frame.rs:34,39` + `connection.rs:263-275` | `Frame` ≈ **288 بايت** بسبب `[AckRange;32]` مضمّنة (`large_enum_variant` مُكمَّم) وتُنقل **مرتين** لكل إطار في حلقة التوزيع (~576 بايت memcpy حتى لإطار Padding بحجم بايت واحد) |
-| WIR-8 | منخفض | `connection.rs:651-656` | ترقيع بايتات الترويسة يدوياً خارج gtp-wire — تكرار معرفة التخطيط عبر الحزم؛ أي تعديل تخطيط في gtp-wire يفسد الـ AAD بصمت |
-| WIR-9 | منخفض | `identifiers.rs:50-52, 80-82` مقابل `:116-118` | `+1` غير محفوظ لـ PacketNumber/MessageId بينما `TransmissionId` يستخدم `saturating_add` — تضارب في نفس الملف |
-| WIR-10 | منخفض | `header.rs:3` مقابل `endpoint.rs:113,167` | النسخة لا تُتحقق أبداً + القيمتان الداخليتان مختلفتان (1 مقابل 0x00010001) — لا تفاوض نسخة رغم اشتراط المواصفة |
-| WIR-11 | توثيقي | `varint.rs` + `README.md:49` | VarInt مُعلَنة كميزة وهي **كود ميت** (لا مرجع سوى إعادة التصدير) |
-| WIR-12 | متوسط | `Cargo.toml:2-16` + `.github/workflows` | حزمة fuzz **خارج أعضاء workspace** — لا تُبنى في `cargo test/clippy --workspace` ولا خطوة fuzz في CI — تتعفن بصمت |
+| WIR-1 (W-1) | High | `frame.rs:378, 467` | **Integer overflow in encode-side bounds checks**: `offset + 4 + padding_len` with `padding_len = usize::MAX` (a public field) wraps in release, passes the check, then panics on the slice range; the same pattern for `Padding{len}` — reachable through the public API without unsafe (not remotely: decode never produces unbounded `usize`, but it is a library panic) |
+| WIR-2 (W-2) | High | `frame.rs:219` vs `:231` | **Asymmetric ACK encoding**: the size and the range loop are clamped to 32, but the `range_count` byte is written raw — an ACK with 40 ranges encodes 32 and declares 40, which its own decoder rejects (`ResourceLimitExceeded`, a completely untested path) |
+| WIR-3 | Medium | `codec.rs:90` + `connection.rs:653` | Silent `payload_len as u16` truncation for payloads >65535 (constructible: three 30KB frames in a 128KB buffer) — must return `BufferOverflow` |
+| WIR-4 | Medium | `frame.rs:389` | The Close reason is silently truncated to 255 bytes with no error or signal |
+| WIR-5 | Medium | `frame.rs:604-605, 704-705` | Decoding `MtuProbe`/`Padding` **consumes the rest of the packet** — any frame appended after them is silently destroyed; the encoder happily emits mid-packet Padding — **the encoder can produce datagrams its own decoder misparses**; the "padding is terminal" invariant exists only implicitly |
+| WIR-6 | Medium | `header.rs:131,136,151` + `codec.rs:53-57` | `header_len` is written but never honored: encode always writes 24/28 bytes while stamping the caller's arbitrary value; PacketBuilder recomputes and ignores the field — a hand-built header with header_len=100 yields a datagram the receiver decodes with consumed=100, **silently skipping 76 bytes of frames as "extensions"**; the extension path has zero test coverage |
+| WIR-7 | Medium | `frame.rs:34,39` + `connection.rs:263-275` | `Frame` is ≈ **288 bytes** due to the inline `[AckRange;32]` (`large_enum_variant` suppressed) and is moved **twice** per frame in the dispatch loop (~576 bytes of memcpy even for a 1-byte Padding) |
+| WIR-8 | Low | `connection.rs:651-656` | Manual header-byte patching outside gtp-wire — layout knowledge duplicated across crates; any gtp-wire layout change silently corrupts the AAD |
+| WIR-9 | Low | `identifiers.rs:50-52, 80-82` vs `:116-118` | Unchecked `+1` for PacketNumber/MessageId while `TransmissionId` uses `saturating_add` — inconsistent within one file |
+| WIR-10 | Low | `header.rs:3` vs `endpoint.rs:113,167` | The version is never validated and the two internal values disagree (1 vs 0x00010001) — no version negotiation despite the spec requiring it |
+| WIR-11 | Doc | `varint.rs` + `README.md:49` | VarInt is advertised as a feature and is **dead code** (no reference beyond the re-export) |
+| WIR-12 | Medium | `Cargo.toml:2-16` + CI | The fuzz crate is **outside the workspace members** — never built by `cargo test/clippy --workspace`, no fuzz step in CI — it rots silently |
 
-### 8.3 تغطية الاختبارات في طبقة السلك
+### 8.3 Wire-layer test coverage
 
-اختبارات roundtrip تغطي 9 من 14 نوع إطار (لا شيء لـ Retx/PathResponse/MtuProbe/AckFrequency/Padding)؛ مسارات `ResourceLimitExceeded` و`MalformedFrame` (سبب Close غير UTF-8) **غير مُستهدفة في أي اختبار**؛ عشوائية المدخلات ≤64 بايت فلا تلمس الترويسات الطويلة ولا إطارات المصافحة ولا ACK كاملاً؛ وfuzz لـ varint مطلوب بنص المواصفة (§372) وغير موجود.
+Round-trip tests cover 9 of 14 frame types (nothing for Retx/PathResponse/MtuProbe/AckFrequency/Padding); the `ResourceLimitExceeded` and `MalformedFrame` (non-UTF-8 Close reason) branches are **never exercised by any test**; the input fuzzing is capped at ≤64 bytes, never touching long headers, handshake frames, or a full ACK; spec-mandated varint fuzzing (§372) is absent.
 
 ---
 
-## 9. تدقيق محرك النواة وطبقة التشغيل (Runtime)
+## 9. Core Engine and Runtime Layer Audit
 
-### 9.1 العيب الحرج المُكوَّن — إطارات التحكم الميتة (Core-C1)
+### 9.1 The composed critical defect — dead control frames (Core-C1)
 
-السلسلة الكاملة:
+The complete chain:
 
-1. `ConnectionControl::send_ping/trigger_path_challenge/trigger_mtu_probe/set_ack_frequency/graceful_close` (`control/handle.rs:47-172`) تُرمّز إطار تحكم وتضعه كحمولة عنصر `MessageClass::Unreliable` بأولوية P0.
-2. مسار TX (`connection.rs:576-586`) يلفّ **كل** عنصر Unreliable داخل `Frame::Data`.
-3. النظير يرى إطار Data حمولته بايتات إطار خام — لا معالج يفكّ الإطار المضمّن؛ معالجات `PathChallenge/PathResponse/AckFrequency/Close/Ping` (`connection.rs:387-445`) **لا تنطلق أبداً لحركة محلية المنشأ**.
-4. التتويج: `graceful_close` ينقل الحالة إلى Draining **قبل** الإرسال، وحلقة TX تتوقف عند `!is_active()` (`endpoint.rs:471-473`) — **إغلاق مهذب لا يرسل بايتاً واحداً إطلاقاً**.
+1. `ConnectionControl::send_ping/trigger_path_challenge/trigger_mtu_probe/set_ack_frequency/graceful_close` (`control/handle.rs:47-172`) encode a control frame and enqueue it as the payload of a `MessageClass::Unreliable` item at P0.
+2. The TX path (`connection.rs:576-586`) wraps **every** Unreliable item inside `Frame::Data`.
+3. The peer sees a Data frame whose payload is raw frame bytes — no handler decodes the embedded frame; the `PathChallenge/PathResponse/AckFrequency/Close/Ping` handlers (`connection.rs:387-445`) **never fire for locally originated traffic**.
+4. The crowning touch: `graceful_close` transitions to Draining **before** sending, while the TX loop refuses to produce unless `is_active()` (`endpoint.rs:471-473`) — **graceful close never transmits a single byte**.
 
-النتيجة الصافية: **ترحيل المسار، NAT rebinding، الإغلاق المهذب، keepalive/Ping، واكتشاف PMTU — كلها معطلة من طرف إلى طرف** بينما كل مكوّن منفصل (PathValidator، آلة الحالة، المُرمّز) سليم ومُختبر وحدة-بوحدة. هذا النمط — طبقات سليمة والتحام مكسور — هو الثيمة المكررة في هذا التدقيق.
+Net result: **path migration, NAT rebinding, graceful close, keepalive/Ping, and PMTU discovery are all disabled end-to-end**, while every individual component (PathValidator, state machine, encoder) is sound and unit-tested. This pattern — sound layers, broken seam — is the recurring theme of this audit.
 
-**الإصلاح**: تمرير `Frame` خام إلى الـ builder (مسار مستقل عن فئات الرسائل) + السماح بإرسال إطار Close قبل الخروج.
+**Fix**: pass raw `Frame`s to the builder (a path independent of message classes) + allow the Close frame to be sent before exiting Draining.
 
-### 9.2 عيوب النواة الأخرى
+### 9.2 Other core defects
 
-| المعرف | الخطورة | الموضع | الوصف |
+| ID | Severity | Location | Description |
 | :--- | :--- | :--- | :--- |
-| CORE-2 | عالٍ | `connection.rs:571-647` | **لا تقطيع** — حمولة >MTU تسد رأس صفها للأبد (HOL داخل الصف)؛ إن كانت reliable فلن تُرسل ولن يُعترف بها ولن تُعلن مفقودة (سجّلت أصلاً بلا إرسال؟ لا — لا تُسجّل، تُسحب وترجع كل مرة... دورة أبدية بلا تقدم) |
-| CORE-3 | عالٍ | `endpoint.rs:247` | حلقة RX `while let Ok(..)` **تنخر عند أول خطأ socket** — يموت الـ endpoint كله (كل الاتصالات والمؤقتات) صامتة |
-| CORE-4 | متوسط | `endpoint.rs:223,421` | مدخلات جدول CID لا تُخلى أبداً عند الإغلاق؛ CID مكرر يستبدل مدخل اتصال حي بصمت — تسريب مهام وأقفال وقنوات، وتوجيه لموتى |
-| CORE-5 | متوسط | `endpoint.rs:448-455` | تمرير الرسائل لقنوات التطبيق بـ `.await` داخل حلقة RX التسلسلية الوحيدة — مستهلك بطيء واحد يجوّع كل الاتصالات (HOL على مستوى الـ endpoint) |
-| CORE-6 | متوسط | `state.rs:12` + `connection.rs:218-219,253,694-695` | ادعاء "فصل ساخن/بارد المحسّن لخط الذاكرة" **شكلي**: لا `#[repr(align)]` ولا تحكم تخطيط؛ العدادات الباردة تُكتب في كل حزمة؛ حقل `next_send_time` ميت |
-| CORE-7 | متوسط | `endpoint.rs:320-323` | `s_hdr.encode(&mut resp_buf).unwrap_or(32)` — تخفيف فشل ترميز ترويسة بطول سحري؛ الـ `unwrap_or` الوحيد خارج الاختبارات |
-| CORE-8 | منخفض | `connection.rs:580-590` مقابل `:337-344` | الإرسال غير الموثوق يُرمَّز بـ `StateKey::default()/StateSequence(0)/GenerationId(0)` والاستقبال يفسّر كل Data كـ sequenced — كل حركة Unreliable تتقاسم مفتاحاً واحداً عند تسلسل صفر؛ أي فلتر حداثة مستقبلي (SEM-2) سيبتلع رسائل مشروعة، والتطبيق لا يستطيع تمييز الدلالة عند الاستقبال |
-| CORE-9 | منخفض | `endpoint.rs:134-159 مقابل :291-297` | تنظيف المصافحات المعلقة للخادم يحدث **فقط عند وصول ClientHello التالي** — لا مؤقت مستقل |
+| CORE-2 | High | `connection.rs:571-647` | **No fragmentation** — a payload >MTU blocks its tier head forever (intra-tier HOL); if reliable, it is never sent, never acknowledged, never declared lost |
+| CORE-3 | High | `endpoint.rs:247` | The RX loop `while let Ok(..)` **dies on the first socket error** — the whole endpoint (all connections, all timers) silently freezes |
+| CORE-4 | Medium | `endpoint.rs:223,421` | CID table entries are never evicted on close; a duplicate CID silently replaces a live connection's routing entry — leaked tasks, locks, and channels, plus routing to the dead |
+| CORE-5 | Medium | `endpoint.rs:448-455` | Messages are forwarded to application channels with `.await` inside the single serial RX loop — one slow consumer starves every connection (endpoint-level HOL) |
+| CORE-6 | Medium | `state.rs:12` + `connection.rs:218-219,253,694-695` | The "cache-line-optimized hot/cold separation" claim is **cosmetic**: no `#[repr(align)]`, no layout control; the cold counters are written on every packet; the `next_send_time` field is dead |
+| CORE-7 | Medium | `endpoint.rs:320-323` | `s_hdr.encode(&mut resp_buf).unwrap_or(32)` — masking a header-encode failure with a magic length; the only non-test `unwrap_or` in the runtime |
+| CORE-8 | Low | `connection.rs:580-590` vs `:337-344` | Plain unreliable sends are encoded with `StateKey::default()/StateSequence(0)/GenerationId(0)` while RX interprets every Data frame as sequenced — all Unreliable traffic shares one key at sequence zero; any future freshness filter (SEM-2) would swallow legitimate messages, and the application cannot distinguish semantics on receive |
+| CORE-9 | Low | `endpoint.rs:134-159` vs `:291-297` | Server pending-handshake cleanup happens **only when the next ClientHello arrives** — no independent timer |
 
-### 9.3 جدول المؤقتات — من يسوق كل مؤقت؟
+### 9.3 Timer table — who drives each timer?
 
-| المؤقت | التعريف | من يستقصيه | العلة |
+| Timer | Defined | Who polls it | The flaw |
 | :--- | :--- | :--- | :--- |
-| PTO | `rtt.rs:68-70` | نبضة TX (500µs) أو استدعاء produce من التطبيق | لا يشتعل إلا إذا كان `inflight>0` **و** استمر الإنتاج؛ تطبيق متوقف = لا PTO؛ لا تراجع أُسّي (REC-11) |
-| الفقدان الزمني (9/8 RTT) | `loss_detector.rs:169-199` | داخل `on_ack_received` فقط | **لا مؤقت مستقل** — فقدان كل الـ ACKs = لا إعلان فقدان أبداً |
-| التحقق من المسار (3s) | `path_validator.rs:4` | **لا أحد** — يُستشار فقط عند وصول رد | تحدٍّ مهجور لا ينتهي ولا يعاد ولا يُعلم عنه (PATH-3) |
-| Draining → Closed | لا يوجد | لا أحد | الانتقال لا يحدث تلقائياً أبداً |
-| Keepalive | يدوي فقط | التطبيق | Ping نفسه ميت (Core-C1) |
-| إعادة إرسال المصافحة | 400ms × 8 (عميل) | مهمة connect | سليمة؛ تنظيف الخادم مشروط (CORE-9) |
-| max_ack_delay | `ack_tracker.rs:140-144` | نبضة TX | يتجمد أيضاً عند توقف الإنتاج |
+| PTO | `rtt.rs:68-70` | the TX tick (500µs) or the app calling produce | Fires only when `inflight>0` **and** production continues; a stopped app gets no PTO; no exponential backoff (REC-11) |
+| Time-threshold loss (9/8 RTT) | `loss_detector.rs:169-199` | inside `on_ack_received` only | **No standalone timer** — total ACK loss means no loss declaration ever |
+| Path validation (3s) | `path_validator.rs:4` | **nobody** — consulted only when a response arrives | An abandoned challenge never expires, retries, or reports (PATH-3) |
+| Draining → Closed | none | nobody | The transition never happens automatically |
+| Keepalive | manual only | the app | Ping itself is dead (Core-C1) |
+| Handshake retransmit | 400ms × 8 (client) | the connect task | sound; server cleanup is conditional (CORE-9) |
+| max_ack_delay | `ack_tracker.rs:140-144` | the TX tick | Also freezes when production stops |
 
-**لا توجد حلقة أحداث موحّدة** — مؤقتات موزعة عبر مهام بلا تنسيق، ثلاثة منها لا يقودها أحد فعلياً.
+**There is no unified event loop** — timers scattered across tasks with no coordination, three of them driven by nobody at all.
 
-### 9.4 التخصيصات في المسار الساخن (المطالبة مقابل الواقع)
+### 9.4 Hot-path allocations (claim versus reality)
 
-الادعاء (`docs/specs/GTP-RUST-01.md:29-32`, README): "استراتيجية صفر تخصيص في المسار الساخن". الواقع:
+The claim (`docs/specs/GTP-RUST-01.md:29-32`, README): "zero-allocation strategy on the hot path". Reality:
 
-- ✅ `gtp-wire`: صفر تخصيص (بنيوياً) — الادعاء صادق هنا فقط.
-- ✅ AEAD: صفر تخصيص كومة (detached in-place)، بلا `Box<dyn>` (تعداد `Protector` بتفريق ثابت).
-- ❌ RX في core: `payload.to_vec()` لكل إطار بيانات (`connection.rs:341,352,376`)؛ `delivered_messages: Vec` لكل datagram؛ نسخة كاملة لكل datagram وارد في الـ endpoint (`endpoint.rs:447`)؛ `to_vec()` للمجموعات المرتبة؛ `retransmittable_frames.clone()` لكل مسحة فقدان؛ نسخ سجل كامل لكل PTO.
-- ❌ معالجة ACK: خمسة `Vec` لكل إطار ACK + استنساخ الإطارات.
-- ⚠ إنشاء `ChaCha20Poly1305` (جدولة المفتاح) **لكل ختم/فتح** بدلاً من تخزين المُحكى (`aead.rs:50,75`) — بلا كومة لكن بعمل بلا داعٍ لكل حزمة.
+- ✅ `gtp-wire`: zero allocation (structurally) — the claim is honest only here.
+- ✅ AEAD: zero heap allocation (detached in-place), no `Box<dyn>` (the `Protector` enum dispatches statically).
+- ❌ RX in core: `payload.to_vec()` per data frame (`connection.rs:341,352,376`); a `delivered_messages: Vec` per datagram; a full datagram copy per receive in the endpoint (`endpoint.rs:447`); `to_vec()` for ordered groups; `retransmittable_frames.clone()` per loss sweep; a full record clone per PTO.
+- ❌ ACK processing: five `Vec`s per ACK frame + frame clones.
+- ⚠ A `ChaCha20Poly1305` key schedule is created **per seal/open** instead of caching the cipher (`aead.rs:50,75`) — not heap, but wasted work per packet.
 
-### 9.5 gtp-io كود ميت
+### 9.5 gtp-io is dead code
 
-`PacketIo`/`RecvDatagram`/التجميع المعلن **غير مستورد من أي مسار حي**: الـ runtime تستخدم `tokio::net::UdpSocket` بمخاطبات مفردة؛ الاعتمادية معلنة في `gtp-runtime-tokio` بلا استخدام. لا `sendmmsg`/`recvmmmg` ولا GSO/GRO (تُدرجها الورقة التقنية العربية §E.1 كتوصية مستقبلية). الوحيد الذي يمرر عبره بايتات هو اختبار الوحدة الخاص به.
+`PacketIo`/`RecvDatagram`/the advertised batching are **not imported by any live path**: the runtime uses `tokio::net::UdpSocket` with single datagrams; the dependency is declared in `gtp-runtime-tokio` but unused. No `sendmmsg`/`recvmmsg`, no GSO/GRO (the internal technical paper lists them as future recommendations). The only bytes flowing through it are its own unit test.
 
-### 9.6 المحاكاة وCLI
+### 9.6 Simulation and CLI
 
-- `gtp-sim`: البنية سليمة (زمن افتراضي حتمي، إعاقات شبكة قابلة للضبط) لكنها مستغلة بسيناريوهين فقط (فقدان 20% ordered + تدفق 60fps sequenced) بسحرة واحدة — تحت مستوى ما تحتاجه مصفوفة §4.2.
-- `gtp-cli`: أداة `StressSuite` (`main.rs:445-1013`) **بلا تأكيدات** — مطبوعة تقارير فقط، ومرحلة "nat-rebind" فيها تبني `PathValidator` مباشرة متجاوزة البروتوكول (984-989) فتختبر شيئاً غير الذي يدّعي.
-- المحاكاة تنشئ الاتصالات عبر المسار الثابت المُهمَل بسّر رئيسي ثابت منشور (`sim_runner.rs:24-25`).
+- `gtp-sim`: the infrastructure is sound (deterministic virtual time, configurable impairments) but is exercised by only two scenarios (20% ordered loss + a 60fps sequenced stream) with one seed — below what the §4.2 seam matrix requires.
+- `gtp-cli`: the `StressSuite` tool (`main.rs:445-1013`) has **no assertions** — report printing only, and its "nat-rebind" stage constructs a `PathValidator` directly (984-989), bypassing the protocol and testing something other than what it claims.
+- The simulator builds connections through the deprecated static path with a published hardcoded master secret (`sim_runner.rs:24-25`).
 
 ---
 
-## 10. تحليل الأداء والكفاءة
+## 10. Performance and Efficiency Analysis
 
-### 10.1 المواطن الإيجابية
+### 10.1 Genuine strengths
 
-1. **فك السلك صفري التخصيص بنيوياً** — استعارة شرائح من مخزن الاستقبال، no_std بلا alloc.
-2. **AEAD بلا كومة** وبتفريق ثابت بلا vtable.
-3. **إطار ACK يُبنى على المكدس** (مصفوفة `[AckRange;32]`) — لا تخصيص في توليده.
-4. **إعادة استخدام مخازن TX/RX** في حلقات الإرسال/الاستقبال الرئيسية (`[u8;1500]` و`[u8;2048]`).
-5. **عبء الترويسة محدود** (24 بايت قصيرة) — مقبول لألعاب.
+1. **Structurally zero-allocation wire decoding** — slices borrowed straight from the receive buffer, no_std without alloc.
+2. **Heap-free AEAD** with static dispatch and no vtable.
+3. **Stack-built ACK frames** (a `[AckRange;32]` array) — no allocation to generate.
+4. **TX/RX buffer reuse** in the main loops (`[u8;1500]` and `[u8;2048]`).
+5. **Modest header overhead** (24-byte short header) — acceptable for games.
 
-### 10.2 القيود البنيوية على الإنتاجية (مرتبة بالأثر)
+### 10.2 Structural throughput ceilings (ordered by impact)
 
-1. **مهمة RX واحدة لكل endpoint تعالج كل شيء تسلسلياً** (فك+مصادقة+توزيع+تمرير بـ await) — سقف الإنتاجية ونقطة HOL واحدة (CORE-5).
-2. **نبض TX 500µs لكل اتصال** — 2000 استيقاظ/ثانية/اتصال حتى عند الخمول، مع `MissedTickBehavior::Burst` الافتراضي الذي ينفجر دفعات بعد التعثر.
-3. **التخصيصات لكل حزمة/إطار** في core وruntime (§9.4) — الادعاء الإعلاني ينكسر فوق طبقة السلك.
-4. **نقل ~288 بايت ×2 لكل إطار** في حلقة التوزيع (WIR-7).
-5. **enqueue بـ O(n)** في المجدول (SCH-4) — تربيعي تراكمياً تحت الحمل.
-6. **لا syscalls مجمّعة** (لا sendmmsg/recvmmsg/GSO) وطبقة التجريد المخصصة لذلك ميتة (§9.5).
-7. **جدولة المفتاح لكل حزمة** في ChaCha20Poly1305 (§9.4).
-8. **مساعدو القراءة ينسخون إلى مصفوفات مكدس** ثم `from_be_bytes` بدل `try_into` مباشر — نسخة زائدة في الحلقة الأعمق.
+1. **One serial RX task per endpoint does everything** (decrypt+authenticate+dispatch+await-forward) — a throughput ceiling and a single HOL point (CORE-5).
+2. **A 500µs TX tick per connection** — 2000 wakeups/second/connection even idle, with the default `MissedTickBehavior::Burst` bursting after stalls.
+3. **Per-packet/per-frame allocations** in core and runtime (§9.4) — the advertised claim breaks above the wire layer.
+4. **~288 bytes ×2 moved per frame** in the dispatch loop (WIR-7).
+5. **O(n) enqueue** in the scheduler (SCH-4) — quadratic cumulatively under load.
+6. **No batched syscalls** (no sendmmsg/recvmmsg/GSO) and the abstraction built for it is dead (§9.5).
+7. **Per-packet ChaCha key scheduling** (§9.4).
+8. **Read helpers copy into stack arrays** then `from_be_bytes` instead of a direct `try_into` — one redundant copy in the innermost loop.
 
-### 10.3 جودة المعايير (Benchmarks)
+### 10.3 Benchmark quality
 
-- bench فك التشفير يستنسخ المخزن **داخل** كل تكرار مقاس — يقيس تخصيص+memcpy مع AEAD (`crypto_bench.rs:28-39`)؛ وbench الـ DH يولّد زوج مفاتيح في كل تكرار فيقيس keygen+DH.
-- لا تغطية لـ: derive_nonce، HKDF، ratchet، نافذة إعادة التشغيل، إطار ACK (الأثقل)، FrameIterator، PacketBuilder، ولا أي bench في gtp-recovery/gtp-cc/gtp-scheduler/gtp-core.
+- The open benchmark clones its buffer **inside** each measured iteration — it measures allocation+memcpy along with AEAD (`crypto_bench.rs:28-39`); the DH benchmark generates a key pair per iteration, measuring keygen+DH.
+- No coverage of: derive_nonce, HKDF, ratchet, the replay window, the ACK frame (the heaviest), FrameIterator, PacketBuilder — and no benchmarks at all in gtp-recovery/gtp-cc/gtp-scheduler/gtp-core.
 
 ---
 
-## 11. تحليل الاستقرارية
+## 11. Stability Analysis
 
-### 11.1 مسارات التدهور الذاتي (تظهر مع الزمن/الحمل)
+### 11.1 Self-degrading paths (emerge with time/load)
 
-| المسار | الميكانيزم | النتيجة |
+| Path | Mechanism | Outcome |
 | :--- | :--- | :--- |
-| **خنق ACK-only** | بايتات ACK تقيَّد في cc.inflight ولا يُعترف بها أبداً (CC-3) | الميزانية `cwnd−inflight` تتقلص رتيباً حتى توقف الإرسال الكامل |
-| **عاصفة PTO** | on_timeout يعيد الجدولة بلا إزالة/حد/تراجع (REC-11) | إرسال مكرر متصاعد تحت فقدان مستمر + تسليم مكرر للتطبيق (ORD-4) |
-| **livelock المخزن الممتلئ** | امتلاء مجموعة مرتبة يجهض datagram فيها ACK (ORD-2) | يعاد إرسال نفس الحزمة وتفشل بنفس الطريقة — حلقة لا تنتهي |
-| **انسداد صف بحمولة كبيرة** | لا تقطيع (CORE-2) | الصف المعني لا يتقدم أبداً؛ reliable منه لا يكتمل أبداً |
-| **تجمد المجموعة عند الالتفاف** | order_seq بلا RFC 1982 (ORD-1) | بعد 2³² رسالة للمجموعة تتوقف نهائياً وتحتجز الذاكرة |
-| **موت RX الصامت** | أول خطأ socket ينهي الحلقة (CORE-3) | endpoint ميت ظاهرياً حي — كل الاتصالات تتجمد بلا إشعار |
+| **ACK-only throttling** | ACK bytes charged to cc.inflight and never acknowledged (CC-3) | The `cwnd−inflight` budget shrinks monotonically until sending stalls completely |
+| **PTO storm** | on_timeout re-enqueues without removal/cap/backoff (REC-11) | Escalating duplicate sending under sustained loss + duplicate application delivery (ORD-4) |
+| **Full-buffer livelock** | A full ordered group aborts the datagram with its ACKs (ORD-2) | The same packet is retransmitted and fails the same way — an unbounded loop |
+| **Large-payload tier blockage** | No fragmentation (CORE-2) | The tier never advances; its reliable traffic never completes |
+| **Group freeze on wrap** | order_seq without RFC 1982 (ORD-1) | After 2³² messages per group it halts permanently, pinning memory |
+| **Silent RX death** | The first socket error ends the loop (CORE-3) | An apparently-alive dead endpoint — every connection frozen with no signal |
 
-### 11.2 نمو الذاكرة غير المحدود (ستة مواضع)
+### 11.2 Unbounded memory growth (six sites)
 
-1. فترات ACK لا تُقلَّم (REC-5).
-2. سجلات ACK-only في `sent_packets` للأبد (CC-3).
-3. عدد المجموعات المرتبة بلا حد مع مخازن 256KB لكل منها (ORD-5) — حتى 16GB سماً بمقابل.
-4. جدول توجيه CID بلا إخلاء (CORE-4).
-5. `StateTable` بلا تقليم (SEM-5).
-6. تخصيص مهاجِم-متحكَّم حتى ~34GB من فترة ACK واحدة (REC-10).
+1. ACK intervals never pruned (REC-5).
+2. ACK-only records in `sent_packets` forever (CC-3).
+3. Ordered-group count uncapped with 256KB buffers each (ORD-5) — up to 16GB from a peer.
+4. The CID routing table without eviction (CORE-4).
+5. `StateTable` without pruning (SEM-5).
+6. Attacker-controlled allocation up to ~34GB from a single ACK range (REC-10).
 
-### 11.3 عوامل الاستقرار الإيجابية
+### 11.3 Positive stability factors
 
-- لا انهيارات في مسار البيانات (تحقق مباشر — لا unwrap/expect/panic خارج الاختبارات في connection/endpoint/state/async_connection/udp).
-- كل عمليات الزمن مُشبعة (saturating) — لا ذعر عند التراجع أو الصفر.
-- فك الترميز بلا ذعر مع فحوص طول شاملة.
-- المحاكاة الحتمية موجودة وقابلة لإعادة الإنتاج 100%.
-
----
-
-## 12. سجل العيوب الموحّد (Findings Registry)
-
-السجل الكامل المرتب حسب الخطورة ثم الموضع. المعرفات تُستخدم للإحالة في خطة المعالجة.
-
-### حرج (Critical) — 6
-
-| المعرف | الموضع | الملخص |
-| :--- | :--- | :--- |
-| SEC-1 | `gtp-crypto/src/handshake.rs:58-84` + `aead.rs:21-33` + `gtp-core/src/state.rs:49-133` | مفتاح/IV واحد للاتجاهين + nonce حتمي ⇒ إعادة استخدام nonce فورية (RFC 8439) |
-| SEC-3 | `gtp-core/src/connection.rs:232-235` (قبل `:240`) | نافذة إعادة التشغيل تُحدَّث قبل مصادقة AEAD — DoS دائم بحزمة واحدة |
-| SEC-4 | `gtp-path/src/stateless_token.rs:24-35` | كوكي XOR قابل للتفكيك: استرجاع الـ secret وتزوير مدى الحياة |
-| Core-C1 | `gtp-core/src/control/handle.rs:47-172` + `connection.rs:576-586` + `endpoint.rs:471-473` | إطارات تحكم مزدوجة التغليف ⇒ Ping/Close/PathChallenge/MtuProbe/AckFrequency ميتة طرف-لطرف |
-| REC-10 | `gtp-wire/src/frame.rs:483-515` + `gtp-recovery/src/loss_detector.rs:100-113` | فترات ACK غير مُتحقَّرة المحتوى ⇒ تخصيص ~34GB بخصم مصادَق |
-| ORD-2 | `gtp-core/src/connection.rs:367` (مع `:452`) | امتلاء مجموعة يجهض datagram بـ ACKs ⇒ livelock إعادة إرسال |
-
-### عالٍ (High) — 17
-
-| المعرف | الموضع | الملخص |
-| :--- | :--- | :--- |
-| SEC-2 | `gtp-crypto/src/aead.rs:29-31` | إهمال 32-بت العليا من PN في الـ nonce — تكرار عند 2³² |
-| SEC-5 | `gtp-runtime-tokio/src/endpoint.rs` (المصافحة كلها) | DH مجهول بلا مصادقة خادم ولا Finished خادم — MITM نشط |
-| SEC-6 | `gtp-core/src/state.rs:86-92` + `gtp-wire/src/header.rs:13` | ratchet غير منسّق (KEY_PHASE بلا استخدام) ⇒ النظير لا يفك بعده |
-| SEC-7 | `Cargo.toml:50` | مفاتيح X25519 الخاصة لا تُصفَّر (ميزة zeroize معطلة) |
-| SEC-8 | `gtp-crypto/src/kdf.rs:32-55` + `gtp-sim/src/sim_runner.rs:24-25` | المسار الثابت حتمي وما زال عاماً/مستخدماً بسّر منشور |
-| REC-1 | `gtp-recovery/src/rtt.rs:36-48` | طرح ack_delay غير مشروط ومن العينة الأولى — قيم مهاجِم تُفسد RTT |
-| REC-5 | `gtp-recovery/src/ack_tracker.rs:148-188` | فترات ACK بلا تقليم — نمو غير محدود |
-| REC-6 | `gtp-recovery/src/ack_tracker.rs:166` | سقف 32 فترة يُسقط إقرارات بصمت ⇒ إرسال قسري عبر PTO |
-| REC-7 | `ack_tracker.rs:35-36` + `connection.rs:423-432` | تكيّف/تفاوض ACK ميت كلياً (قيم صلبة، إعداد بلا قرّاء) |
-| REC-11 | `loss_detector.rs:219-233` + `connection.rs:489-528` | PTO بلا تراجع أُسّي/حد/إزالة سجلات ⇒ عواصف وتكرار تسليم |
-| REC-12 | `gtp-recovery/src/loss_detector.rs` (بنيوياً) | لا آلة مؤقتات: كشف زمني مشروط بـ ACK وPTO مشروط بالإنتاج |
-| CC-1 | `gtp-cc/src/cubic.rs:154-158` + `:84` | CUBIC بعد المهلة يستعيد النافذة القديمة فوراً (خلاف RFC 8312 §4.7) |
-| CC-2 | `gtp-cc/src/cubic.rs:128-134` | نمو النافذة على ACKs مكررة/فارغة |
-| CC-3 | `connection.rs:689` + `cubic.rs:124-126` | تسريب inflight على ACK-only ⇒ توقف إرسال تدريجي |
-| SCH-1 | `gtp-scheduler/src/scheduler.rs:109-134` | DRR تنحل لأولوية صارمة — الأوزان بلا أثر، تجويع P2-P4 |
-| SEM-1 | `gtp-types/src/identifiers.rs:170-172` | GenerationId بلا RFC 1982 — كسر supersession عند الالتفاف |
-| ORD-4 | `connection.rs:347-358` | ReliableUnordered بلا إزالة تكرار — تسليم مكرر للتطبيق |
-
-### متوسط (Medium) — 34
-
-| المعرف | الموضع | الملخص |
-| :--- | :--- | :--- |
-| WIR-2 | `frame.rs:219/231` | range_count بلا تثبيت عند الترميز — إطار يرفضه فاكّه |
-| WIR-3 | `codec.rs:90` + `connection.rs:653` | اقتطاع u16 صامت لـ payload_len |
-| WIR-4 | `frame.rs:389` | سبب Close يُقتطع لـ 255 بصمت |
-| WIR-5 | `frame.rs:604-605, 704-705` | Padding/MtuProbe تبتلع ما يليها بصمت |
-| WIR-6 | `header.rs:131-151` + `codec.rs:53-57` | header_len مكتوب لا محترم — قفز إطارات كامتدادات |
-| WIR-7 | `frame.rs:34,39` + `connection.rs:263-275` | Frame ≈288 بايت، نقل مزدوج لكل إطار |
-| WIR-12 | `Cargo.toml` + CI | fuzz خارج workspace — لا بناء ولا تشغيل |
-| SEC-9 | `handshake.rs:104-119` | إثبات HMAC بمفتاح AEAD نفسه |
-| SEC-10 | `aead.rs:45-47` | فيض في فحص الطول ⇒ ذعر بواجهة عامة |
-| SEC-11 | `endpoint.rs:280,290` | مقيّد المعدل 1000/ث المعلن 20/ث + ClientHello بلا طازجية |
-| SEC-12 | `handshake.rs:49-54` | لا فحص contributory لـ X25519 |
-| SEC-13 | `endpoint.rs:113` + `handshake.rs` | النسخة لا تُفاوض/تُربط بالـ transcript |
-| SEC-14 | `aead.rs:9-13`, `kdf.rs:13-27` | Debug مشتق على مفاتيح |
-| SEC-15 | `connection.rs:218-222` | رصيد anti-amp قبل أي تحقق |
-| SEC-16 | `anti_amplification.rs` | لا reset مساري؛ التحقق يُرفع بفك التشفير |
-| SEC-17 | `identifiers.rs:50-52` | `next()` غير محفوظ — ذعر debug/التفاف release |
-| REC-2 | `rtt.rs:43-44` | min_rtt من العينة المعدَّلة |
-| REC-3 | `rtt.rs:23` | تسرب قيمة الحارس u64::MAX للمقاييس |
-| REC-8 | `connection.rs:543-568` | ACK في كل datagram صادر — تجاوز التكيّف |
-| REC-13 | `loss_detector.rs:142-162` | DeliveryRateSample يُحسب ويُرمى |
-| REC-14 | `loss_detector.rs:76-82` مقابل `cubic.rs:124-126` | عدّا inflight غير متكافئين |
-| CC-4 | `cubic.rs:150` | "smoothed_rtt" في CC هو عينة خام |
-| CC-5 | `cubic.rs:68` | W_tcp بـ min_rtt (عدواني) بلا انتهاء صلاحية |
-| CC-6 | `config.rs` مقابل `state.rs:70,120` | كل معاملات CC/الإعدادات المسبقة ميتة |
-| CC-9 | `pacing.rs:33-38` | انجراف كسري + تعبئة مشروطة بالإنتاج |
-| CC-10 | `backpressure.rs` | بلا هستيريس؛ تحديث استقبالاً فقط |
-| CC-12 | `controller.rs:14` | on_ecn بلا مستدعٍ — لا حلقة ECN |
-| SCH-2 | `scheduler.rs:109-117` | عجز غير مسقف مضخَّم ×4 |
-| SCH-3 | `scheduler.rs:88-99` | P0 بلا سقف حصة |
-| SCH-4 | `scheduler.rs:47,74` | enqueue O(n) ⇒ O(n²) |
-| SEM-2 | `connection.rs:330-345` | لا drop-late استقبالاً — نصف دلالات sequenced |
-| SEM-3/4 | `scheduler.rs:55-76`/`:74` | supersedable مُهمَل؛ إزاحة داخل الصف فقط |
-| ORD-1 | `ordered_group.rs:29` | order_seq بلا التفاف — تجمد دائم للمجموعة |
-| ORD-3 | `connection.rs:326` | `let _` على enqueue موثوق — فقدان مضمون |
-| ORD-5 | `state.rs:24` | مجموعات بلا حد (16GB سماً) |
-| ORD-6 | البنية | لا NACK/إخلاء بالفجوة/مهلة |
-| PATH-1 | `state_machine.rs:30-42` | Initial→Closed غير قانوني — إغلاق الفاشل مستحيل |
-| PATH-2 | `endpoint.rs:183-190` | anti-amp معطّل فعلياً (pre_validated دوماً) |
-| PATH-3 | `path_validator.rs` | مؤقت تحدي لا يقوده أحد |
-| CORE-2 | `connection.rs:571-647` | لا تقطيع — HOL دائم لما >MTU |
-| CORE-3 | `endpoint.rs:247` | موت RX الصامت عند خطأ socket |
-| CORE-4 | `endpoint.rs:223,421` | جدول CID بلا إخلاء/استبدال مكرر |
-| CORE-5 | `endpoint.rs:448-455` | HOL للـ endpoint على مستهلك بطيء |
-| CORE-6 | `state.rs:12` | فصل ساخن/بارد شكلي |
-| D-2 | `connection.rs:566-641` | `let _ = append_frame` — إطارات مسقطة تُسجَّل in-flight |
-| CC-11 | `handle.rs:211-228` | مقاييس مصلَّبة (tokens/tiers/ECN = 0) |
-| CORE-7 | `endpoint.rs:323` | `unwrap_or(32)` سحري |
-
-### منخفض (Low) — 12
-
-WIR-1 (فيض حدود الترميز لـ padding — عالٍ تقنياً كذعر مكتبة لكن يتطلب API محلي)، WIR-8 (ترقيع ترويسة خارج gtp-wire)، WIR-9 (+1 غير محفوظ)، WIR-10 (نسخة بلا تحقق/تضارب قيم)، WIR-11 (VarInt ميت معلن)، REC-4 (لا kGranularity)، REC-9 (اقتطاع u32)، CC-7/CC-8 (W_cubic(t)، لا HyStart/سقف)، SEC-18 (حجم نافذة الإعداد مُتجاهَل)، SEC-19 (حامي النص لا يفحص الطول)، SCH-5/6، SEM-5، ORD-7، PATH-4/5، CORE-8/9، CC-20/21/22 (جودة benches)، T-3.
-
-> ملاحظة تصنيفية: WIR-1 مُصنَّف "عالٍ" من منظور مكتبة (ذعر API عامة) لكنه غير قابل للتفعيل عن بُعد؛ أُدرج هنا منخفضاً من منظور خدمة شبكية لأن مسار الفك لا يولّد قيماً مُطلقة.
+- No panics in the data path (verified directly — no unwrap/expect/panic outside tests in connection/endpoint/state/async_connection/udp).
+- All time arithmetic is saturating — no panic on regression or zero.
+- Panic-free decoding with comprehensive length checks.
+- The deterministic simulator exists and is 100% reproducible.
 
 ---
 
-## 13. خطة المعالجة المرتبة بالأولوية
+## 12. Unified Findings Registry
 
-### المرحلة 0 — إيقاف النزيف الأمني (فوري، قبل أي نشر)
+The full registry, ordered by severity then location. IDs are referenced by the remediation plan.
 
-| # | الإجراء | يعالج | جهد تقديري |
+### Critical — 6
+
+| ID | Location | Summary |
+| :--- | :--- | :--- |
+| SEC-1 | `gtp-crypto/src/handshake.rs:58-84` + `aead.rs:21-33` + `gtp-core/src/state.rs:49-133` | One key/IV for both directions + a deterministic nonce ⇒ immediate nonce reuse (RFC 8439) |
+| SEC-3 | `gtp-core/src/connection.rs:232-235` (before `:240`) | Replay window updated before AEAD authentication — permanent DoS with one packet |
+| SEC-4 | `gtp-path/src/stateless_token.rs:24-35` | A dismantlable XOR cookie: secret recovery and lifetime forgery |
+| Core-C1 | `gtp-core/src/control/handle.rs:47-172` + `connection.rs:576-586` + `endpoint.rs:471-473` | Double-wrapped control frames ⇒ Ping/Close/PathChallenge/MtuProbe/AckFrequency dead end-to-end |
+| REC-10 | `gtp-wire/src/frame.rs:483-515` + `gtp-recovery/src/loss_detector.rs:100-113` | Unvalidated ACK range contents ⇒ ~34GB allocation by an authenticated peer |
+| ORD-2 | `gtp-core/src/connection.rs:367` (with `:452`) | A full group aborts the datagram with its ACKs ⇒ a retransmission livelock |
+
+### High — 17
+
+| ID | Location | Summary |
+| :--- | :--- | :--- |
+| SEC-2 | `gtp-crypto/src/aead.rs:29-31` | Top 32 PN bits ignored in the nonce — collision at 2³² |
+| SEC-5 | `gtp-runtime-tokio/src/endpoint.rs` (the whole handshake) | Anonymous DH with no server authentication or server Finished — active MITM |
+| SEC-6 | `gtp-core/src/state.rs:86-92` + `gtp-wire/src/header.rs:13` | Uncoordinated ratchet (KEY_PHASE unused) ⇒ the peer cannot decrypt afterwards |
+| SEC-7 | `Cargo.toml:50` | X25519 private keys never zeroized (the zeroize feature is disabled) |
+| SEC-8 | `gtp-crypto/src/kdf.rs:32-55` + `gtp-sim/src/sim_runner.rs:24-25` | The static path is deterministic, still public, and used with a published secret |
+| REC-1 | `gtp-recovery/src/rtt.rs:36-48` | Unconditional ack_delay subtraction incl. the first sample — attacker-corrupted RTT |
+| REC-5 | `gtp-recovery/src/ack_tracker.rs:148-188` | ACK intervals never pruned — unbounded growth |
+| REC-6 | `gtp-recovery/src/ack_tracker.rs:166` | The 32-range cap silently drops acknowledgements ⇒ forced PTO retransmission |
+| REC-7 | `ack_tracker.rs:35-36` + `connection.rs:423-432` | ACK adaptation/negotiation completely dead (hardcoded values, config with no readers) |
+| REC-11 | `loss_detector.rs:219-233` + `connection.rs:489-528` | PTO without exponential backoff/cap/record removal ⇒ storms and duplicate delivery |
+| REC-12 | `gtp-recovery/src/loss_detector.rs` (structural) | No timer state machine: time-threshold conditioned on ACKs, PTO on production |
+| CC-1 | `gtp-cc/src/cubic.rs:154-158` + `:84` | Post-timeout CUBIC instantly restores the old window (contrary to RFC 8312 §4.7) |
+| CC-2 | `gtp-cc/src/cubic.rs:128-134` | Window growth on duplicate/empty ACKs |
+| CC-3 | `connection.rs:689` + `cubic.rs:124-126` | In-flight leak on ACK-only traffic ⇒ gradual send stall |
+| SCH-1 | `gtp-scheduler/src/scheduler.rs:109-134` | DRR degenerates to strict priority — weights have no effect, P2-P4 starve |
+| SEM-1 | `gtp-types/src/identifiers.rs:170-172` | GenerationId without RFC 1982 — supersession breaks on wrap |
+| ORD-4 | `connection.rs:347-358` | ReliableUnordered without dedup — duplicate application delivery |
+
+### Medium — 34
+
+| ID | Location | Summary |
+| :--- | :--- | :--- |
+| WIR-2 | `frame.rs:219/231` | range_count unclamped on encode — a frame its own decoder rejects |
+| WIR-3 | `codec.rs:90` + `connection.rs:653` | Silent u16 payload_len truncation |
+| WIR-4 | `frame.rs:389` | Close reason silently truncated to 255 |
+| WIR-5 | `frame.rs:604-605, 704-705` | Padding/MtuProbe silently swallow trailing frames |
+| WIR-6 | `header.rs:131-151` + `codec.rs:53-57` | header_len written but unenforced — frames silently skipped as extensions |
+| WIR-7 | `frame.rs:34,39` + `connection.rs:263-275` | Frame ≈288 bytes, double move per frame |
+| WIR-12 | `Cargo.toml` + CI | fuzz outside the workspace — never built or run |
+| SEC-9 | `handshake.rs:104-119` | HMAC proof keyed by the AEAD key itself |
+| SEC-10 | `aead.rs:45-47` | Overflow in the length check ⇒ a public-API panic |
+| SEC-11 | `endpoint.rs:280,290` | Rate limiter 1000/s versus a documented 20/s + no ClientHello freshness |
+| SEC-12 | `handshake.rs:49-54` | No X25519 contributory check |
+| SEC-13 | `endpoint.rs:113` + `handshake.rs` | The version is not negotiated/bound into the transcript |
+| SEC-14 | `aead.rs:9-13`, `kdf.rs:13-27` | Derived Debug on key containers |
+| SEC-15 | `connection.rs:218-222` | Anti-amp credit before any validation |
+| SEC-16 | `anti_amplification.rs` | No path-scoped reset; validation lifted by decryption |
+| SEC-17 | `identifiers.rs:50-52` | Unchecked `next()` — debug panic / unsafe release wrap |
+| REC-2 | `rtt.rs:43-44` | min_rtt from the adjusted sample |
+| REC-3 | `rtt.rs:23` | The u64::MAX sentinel leaks into metrics |
+| REC-8 | `connection.rs:543-568` | An ACK in every outgoing datagram — adaptation bypassed |
+| REC-13 | `loss_detector.rs:142-162` | DeliveryRateSample computed and discarded |
+| REC-14 | `loss_detector.rs:76-82` vs `cubic.rs:124-126` | Two unequal in-flight gauges |
+| CC-4 | `cubic.rs:150` | The CC "smoothed_rtt" is a raw sample |
+| CC-5 | `cubic.rs:68` | W_tcp on min_rtt (aggressive), no expiry |
+| CC-6 | `config.rs` vs `state.rs:70,120` | All CC knobs/presets dead |
+| CC-9 | `pacing.rs:33-38` | Fractional drift + production-conditioned refill |
+| CC-10 | `backpressure.rs` | No hysteresis; receive-side-only refresh |
+| CC-12 | `controller.rs:14` | on_ecn has no caller — no ECN loop |
+| SCH-2 | `scheduler.rs:109-117` | Uncapped, ×4-amplified deficit accrual |
+| SCH-3 | `scheduler.rs:88-99` | P0 without a share cap |
+| SCH-4 | `scheduler.rs:47,74` | O(n) enqueue ⇒ O(n²) |
+| SEM-2 | `connection.rs:330-345` | No receive-side drop-late — half of sequenced semantics |
+| SEM-3/4 | `scheduler.rs:55-76`/`:74` | supersedable ignored; same-tier-only eviction |
+| ORD-1 | `ordered_group.rs:29` | order_seq without wrap handling — permanent group freeze |
+| ORD-3 | `connection.rs:326` | `let _` on reliable enqueue — guaranteed loss |
+| ORD-5 | `state.rs:24` | Uncapped groups (16GB from a peer) |
+| ORD-6 | the design | No NACK/gap eviction/timeout |
+| PATH-1 | `state_machine.rs:30-42` | Initial→Closed illegal — closing a failed handshake impossible |
+| PATH-2 | `endpoint.rs:183-190` | Anti-amp effectively disabled (always pre_validated) |
+| PATH-3 | `path_validator.rs` | A challenge timeout nobody drives |
+| CORE-2 | `connection.rs:571-647` | No fragmentation — permanent HOL for >MTU |
+| CORE-3 | `endpoint.rs:247` | Silent RX death on a socket error |
+| CORE-4 | `endpoint.rs:223,421` | CID table without eviction/duplicate replacement |
+| CORE-5 | `endpoint.rs:448-455` | Endpoint-level HOL on one slow consumer |
+| CORE-6 | `state.rs:12` | Hot/cold separation is cosmetic |
+| D-2 | `connection.rs:566-641` | `let _ = append_frame` — dropped frames still recorded in-flight |
+| CC-11 | `handle.rs:211-228` | Hardcoded metrics (tokens/tiers/ECN = 0) |
+| CORE-7 | `endpoint.rs:323` | The magic `unwrap_or(32)` |
+
+### Low — 12
+
+WIR-1 (encode overflow — technically high as a library panic but requires local API use), WIR-8 (header patching outside gtp-wire), WIR-9 (unchecked +1), WIR-10 (unvalidated version/value mismatch), WIR-11 (dead advertised VarInt), REC-4 (no kGranularity), REC-9 (u32 truncation), CC-7/CC-8 (W_cubic(t), no HyStart/clamp), SEC-18 (configured window size ignored), SEC-19 (plaintext protector skips the length check), SCH-5/6, SEM-5, ORD-7, PATH-4/5, CORE-8/9, CC-20/21/22 (bench quality), T-3.
+
+> Classification note: WIR-1 is rated "high" from a library perspective (a public-API panic) but is not remotely triggerable; it is listed here as low from a networked-service perspective since the decode path never produces unbounded values.
+
+---
+
+## 13. Prioritized Remediation Plan
+
+### Phase 0 — stop the security bleeding (immediate, before any deployment)
+
+| # | Action | Fixes | Effort |
 | :--- | :--- | :--- | :--- |
-| 0.1 | اشتقاق مفتاحين/IV-ين بتسمية اتجاه في `derive_handshake_session_keys` واختيارهما بالدور + اختبار يمنع التساوي ويثبت فشل فك المتقاطع | SEC-1 | صغير |
-| 0.2 | عكس ترتيب المصادقة/النافذة في `handle_incoming_datagram` (مصادقة أولاً أو نسخة+إثبات) + اختبار: حزمة مزيفة بـ PN ضخم لا تحرق النافذة | SEC-3 | صغير |
-| 0.3 | استبدال الكوكي بـ `HMAC-SHA256(secret, "gtp cookie"‖addr‖ts)` + رفض الطوابع المستقبلية + اختبار تزوير/إعادة صلاحية | SEC-4 | صغير |
-| 0.4 | تضمين كامل الـ 64 بت من PN في الـ nonce + اختبار PN=1 مقابل PN=2³²+1 | SEC-2 | صغير |
-| 0.5 | تفعيل `x25519-dalek/zeroize` + Debug محجوب يدوياً للمفاتيح + فحص `was_contributory` | SEC-7, SEC-14, SEC-12 | صغير |
-| 0.6 | تحقق دلالي من فترات ACK عند الفك (سقف بايتات/عدد معقول، تناسق مع largest_acked) | REC-10 | صغير |
+| 0.1 | Derive two direction-labeled key/IV pairs in `derive_handshake_session_keys` and select by role + a test forbidding equality and proving cross-decryption fails | SEC-1 | Small |
+| 0.2 | Reverse the authentication/replay order in `handle_incoming_datagram` (authenticate first, or copy-then-commit) + a test: a forged high-PN packet must not burn the window | SEC-3 | Small |
+| 0.3 | Replace the cookie with `HMAC-SHA256(secret, "gtp cookie"‖addr‖ts)` + reject future timestamps + forgery/lifetime tests | SEC-4 | Small |
+| 0.4 | Include all 64 PN bits in the nonce + a test of PN=1 versus PN=2³²+1 | SEC-2 | Small |
+| 0.5 | Enable `x25519-dalek/zeroize` + manually redacted Debug for keys + the `was_contributory` check | SEC-7, SEC-14, SEC-12 | Small |
+| 0.6 | Semantic ACK-range validation on decode (a sane byte/count cap, consistency with largest_acked) | REC-10 | Small |
 
-### المرحلة 1 — إحياء التكامل الوظيفي (أعلى عائد لكل سطر معدَّل)
+### Phase 1 — revive functional integration (highest return per line changed)
 
-| # | الإجراء | يعالج |
+| # | Action | Fixes |
 | :--- | :--- | :--- |
-| 1.1 | تمرير إطارات التحكم كـ `Frame` خام إلى الـ builder (مسار مستقل عن فئات الرسائل) + السماح بإرسال Close في Draining + اختبارات طرف-لطرف لـ Ping/Close/PathChallenge/AckFrequency | **Core-C1, PATH-5, PATH-3 جزئياً** |
-| 1.2 | ربط `GtpConfig` فعلياً: AckTracker (تكرار/تأخير) وCubic (β/C/IW/سقوف) وPacing (gain/burst) — وحذف الحقول الميتة أو توصيلها | REC-7, CC-6, SEC-18 |
-| 1.3 | ألا تُقيَّد بايتات ACK-only في cc.inflight + إزالة سجلاتها من sent_packets فوراً | CC-3, REC-14 |
-| 1.4 | علاج حالة اكتمال PTO: إزالة السجلات المُعاد جدولتها + تراجع أُسّي `PTO×2^pto_count` + سقف إرسالات + مفتاح إزالة تكرار ReliableUnordered (مجموعة messageId/fragment مرئية) | REC-11, ORD-4 |
-| 1.5 | حماية انتقال SEM-2/ORD-1: معاملة RFC 1982 لـ order_seq وGenerationId + drop-late استقبالاً عبر StateTable على جانب RX | ORD-1, SEM-1, SEM-2 |
+| 1.1 | Pass control frames as raw `Frame`s to the builder (independent of message classes) + allow Close to be sent in Draining + end-to-end tests for Ping/Close/PathChallenge/AckFrequency | **Core-C1, PATH-5, part of PATH-3** |
+| 1.2 | Actually wire `GtpConfig`: AckTracker (frequency/delay) and Cubic (β/C/IW/clamps) and Pacing (gain/burst) — delete the dead fields or connect them | REC-7, CC-6, SEC-18 |
+| 1.3 | Do not charge ACK-only bytes to cc.inflight + drop their records from sent_packets immediately | CC-3, REC-14 |
+| 1.4 | Fix the PTO completion path: remove re-enqueued records + exponential `PTO×2^pto_count` + a transmission cap + a ReliableUnordered message-id dedup ledger | REC-11, ORD-4 |
+| 1.5 | Guard the SEM-2/ORD-1 transitions: RFC 1982 for order_seq and GenerationId + receive-side drop-late via an RX-side StateTable | ORD-1, SEM-1, SEM-2 |
 
-### المرحلة 2 — الاستقرار التشغيلي
+### Phase 2 — operational stability
 
-- مؤقت loss مستقل مسلّح/ملغى + مؤقت path-validation يقوده نبض TX + مهلة Draining→Closed (REC-12, PATH-3).
-- معالجة أخطاء socket في حلقة RX (سجل+استمرار/إعادة بناء) + إخلاء جدول CID عند الإغلاق + رفض CID المكرر (CORE-3, CORE-4).
-- إصلاح ORD-2: عزل خطأ المجموعة الممتلئة دون إجهاض ACKs (قبول الحمولة الزائدة كعنصر مسقوط مع تسليم باقي الإطارات) + سقف عدد مجموعات LRU.
-- CUBIC بعد المهلة (تصفير k/origin/w_max) + بوابة نمو على bytes_acked>0 + EWMA حقيقي (CC-1, CC-2, CC-4) وmin_rtt خام مع نافذة انتهاء (REC-2, CC-5).
-- تقطيع الحمولات >MTU أو رفضها عند الإدخال برسالة صريحة — لا انسداد صامت (CORE-2).
-- ترميز أخطاء `append_frame` بدل `let _` مع إسقاط سجل in-flight المقابل (D-2) وبوابة anti-amp قبل السحب (قسم 3.4 خطوة 11).
+- A standalone armed/cancelled loss timer + a TX-tick-driven path-validation timer + a Draining→Closed timeout (REC-12, PATH-3).
+- Handle socket errors in the RX loop (log+continue/rebuild) + CID-table eviction on close + duplicate-CID rejection (CORE-3, CORE-4).
+- Fix ORD-2: isolate the full-group error without aborting the ACKs (accept the overflow as a dropped item and deliver the remaining frames) + an LRU cap on group count.
+- Post-timeout CUBIC (reset k/origin/w_max) + a growth gate on `bytes_acked>0` + a real EWMA (CC-1, CC-2, CC-4) and raw min_rtt with an expiry window (REC-2, CC-5).
+- Fragment >MTU payloads or reject them at admission with an explicit error — no silent blockage (CORE-2).
+- Propagate `append_frame` errors instead of `let _`, dropping the matching in-flight record (D-2), and gate anti-amp before the pop (§3.4 step 11).
 
-### المرحلة 3 — عدالة الجدولة والذاكرة
+### Phase 3 — scheduler fairness and memory
 
-- DRR حقيقي: صرف متعدد العناصر لكل زيارة (الاستمرار في الصف حتى نفاد عجزه) + سقف عجز quantum+MTU (SCH-1, SCH-2).
-- تقليم فترات ACK المتقادمة + دمج عند السقف بدل الإسقاط (REC-5, REC-6).
-- عدّاد بايت جارٍ لكل صف (enqueue O(1)) + إزاحة supersession عبر الصفوف + احترام `supersedable` (SCH-4, SEM-3/4).
+- Real DRR: multi-item service per visit (keep draining a tier until its deficit is exhausted) + a quantum+MTU deficit cap (SCH-1, SCH-2).
+- Prune stale ACK intervals + coalesce at the cap instead of dropping (REC-5, REC-6).
+- A per-tier running byte counter (O(1) enqueue) + cross-tier supersession eviction + honoring `supersedable` (SCH-4, SEM-3/4).
 
-### المرحلة 4 — بنية اختبار التكامل (تمنع تكرار كل ما سبق)
+### Phase 4 — the integration test harness (prevents a repeat of everything above)
 
-اختبارات الالتحام المفقودة تحديداً — كل واحد كان سيكشف عيباً قائماً:
+The specifically missing seam tests — each would have caught an existing defect:
 
-1. PTO مع فقدان 100% من ACKs (يكشف REC-11/ORD-4).
-2. ترحيل مسار عبر البروتوكول تحت فقدان (يكشف Core-C1/PATH-3/PATH-5).
-3. إطارات تحكم طرف-لطرف (يكشف Core-C1).
-4. ratchet منتصف الجلسة ثم بيانات (يكشف SEC-6).
-5. رزم مُعبثة/مكررة/CID-خاطئة عبر الاتصال الكامل مع تأكيد سلامة النافذة (يكشف SEC-3).
-6. حمولة >MTU (يكشف CORE-2).
-7. مجموعة ممتلئة مع تدفق ACK متزامن (يكشف ORD-2).
-8. عدالة طويلة المدى: حصص بايت لكل طبقة تحت تشبع (يكشف SCH-1/2).
-9. جسر المحاكاة: إعادة استخدام gtp-sim كسرير لهذه السيناريوهات ببذور متعددة.
-10. إدخال fuzz في workspace + CI (WIR-12) + متجهات إجابة معروفة (KAT) لـ RFC 8439 وHKDF.
+1. PTO under 100% ACK loss (catches REC-11/ORD-4).
+2. Path migration through the protocol under loss (catches Core-C1/PATH-3/PATH-5).
+3. Control frames end-to-end (catches Core-C1).
+4. Mid-session ratchet followed by data (catches SEC-6).
+5. Tampered/replayed/wrong-CID datagrams through the full connection with window-integrity assertions (catches SEC-3).
+6. A payload >MTU (catches CORE-2).
+7. A full group with concurrent ACK flow (catches ORD-2).
+8. Long-run fairness: per-tier byte shares under saturation (catches SCH-1/2).
+9. A simulation bridge: reuse gtp-sim as the bed for these scenarios across multiple seeds.
+10. Bring the fuzz crate into the workspace + CI (WIR-12) + known-answer vectors (KAT) for RFC 8439 and HKDF.
 
-### المرحلة 5 — الأداء (بعد الصحة)
+### Phase 5 — performance (after correctness)
 
-- إزالة `to_vec()` من مسار التسليم (تسليم بالإعارة أو مخازن مسبقة) + إيقاف نسخة datagram في الـ endpoint.
-- تقليص `Frame` (Box/SmallVec لفترات ACK أو تقسيم enum) وتقليص النقل المزدوج في حلقة التوزيع.
-- تخزين مُحكى ChaCha بدل إعادة الجدولة لكل حزمة.
-- تفعيل gtp-io (sendmmsg/recvmmsg) أو حذفها؛ موازنة حمل RX عبر SO_REUSEPORT/مهام متعددة.
-- إيقاظ TX بحدّ أدنى للفجوة بدل نبض 500µs ثابت عند الخمول.
+- Remove `to_vec()` from the delivery path (borrowed delivery or preallocated pools) + stop the per-datagram copy in the endpoint.
+- Shrink `Frame` (Box/SmallVec for ACK ranges or split the enum) and the double move in the dispatch loop.
+- Cache the ChaCha cipher instead of rescheduling per packet.
+- Activate gtp-io (sendmmsg/recvmmsg) or delete it; shard RX across SO_REUSEPORT/multiple tasks.
+- Wake TX with a minimum-gap deadline instead of a fixed 500µs idle tick.
 
 ---
 
-## 14. الملاحق
+## 14. Appendices
 
-### ملحق أ — بيئة التحقق
+### Appendix A — verification environment
 
-| البند | القيمة |
+| Item | Value |
 | :--- | :--- |
-| نظام | CachyOS Linux (kernel 7.2.2-1-cachyos) x86_64 |
-| الأداة | rustc/cargo 1.85.0 (المطابقة لـ `rust-toolchain.toml`) — ملاحظة: استدعاء rustup عبر الوكلاء في هذه البيئة يفشل (`argv[0]` مشوّه: `unknown proxy name: 'ZCode-3.8.1-linux-x64'`)؛ تمت المحاولة بنجاح عبر المسار المباشر `~/.rustup/toolchains/1.85.0-.../bin`. يُنصح بإصلاح تثبيت rustup أو استخدام المسار المباشر في سكربتات CI المحلية. |
-| أمر التحقق | `cargo test --workspace` |
-| النتيجة | نجاح كامل: 48 ناجحاً / 0 فاشلاً / 1 متجاهَلاً |
+| System | CachyOS Linux (kernel 7.2.2-1-cachyos) x86_64 |
+| Toolchain | rustc/cargo 1.85.0 (matching `rust-toolchain.toml`) — note: invoking rustup through the system proxies fails in this environment (mangled `argv[0]`: `unknown proxy name: 'ZCode-3.8.1-linux-x64'`); the direct path `~/.rustup/toolchains/1.85.0-.../bin` was used successfully. Fixing the rustup installation or using the direct path in local CI scripts is recommended. |
+| Verification command | `cargo test --workspace` |
+| Result | Full pass: 48 passed / 0 failed / 1 ignored |
 
-### ملحق ب — مطابقة RFC الملزمة
+### Appendix B — binding RFC conformance
 
-| المعيار | الحالة | الانحرافات الرئيسة |
+| Standard | Status | Main deviations |
 | :--- | :--- | :--- |
-| RFC 8439 (AEAD) | ❌ مخالف | SEC-1 (تفرّد nonce)، SEC-2 |
-| RFC 8312 (CUBIC) | ⚠ جزئي | الرياضيات صحيحة؛ CC-1 (§4.7)، CC-2، CC-4/5، لا HyStart/سقف |
-| RFC 9002 (استرداد) | ⚠ جزئي | EWMA/عتبات صحيحة؛ REC-1 (§5.2/5.3)، REC-11/12 (backoff/آلة المؤقتات) |
-| RFC 1982 (متتاليات) | ⚠ متقطع | StateSequence صحيحة؛ GenerationId وorder_seq لا (SEM-1, ORD-1) |
-| RFC 9000 (مفاهيم QUIC) | ⚠ ملهم لا ملتزم | مضاد التضخيم ليس مسارياً (SEC-16)، لا مساحات مفاتيح، لا تفاوض نسخة |
+| RFC 8439 (AEAD) | ❌ violated | SEC-1 (nonce uniqueness), SEC-2 |
+| RFC 8312 (CUBIC) | ⚠ partial | The math is correct; CC-1 (§4.7), CC-2, CC-4/5, no HyStart/clamp |
+| RFC 9002 (recovery) | ⚠ partial | EWMA/thresholds correct; REC-1 (§5.2/5.3), REC-11/12 (backoff/timer state machine) |
+| RFC 1982 (serials) | ⚠ patchy | StateSequence correct; GenerationId and order_seq are not (SEM-1, ORD-1) |
+| RFC 9000 (QUIC concepts) | ⚠ inspired, not bound | Anti-amplification not path-scoped (SEC-16), no key spaces, no version negotiation |
 
-### ملحق ج — توزيع العيوب حسب الحزمة
+### Appendix C — defect distribution per crate
 
-| الحزمة | حرج | عالٍ | متوسط | منخفض |
+| Crate | Critical | High | Medium | Low |
 | :--- | :--- | :--- | :--- | :--- |
 | gtp-crypto | 2 | 4 | 5 | 3 |
 | gtp-path | 1 | — | 4 | 3 |
@@ -769,14 +769,14 @@ WIR-1 (فيض حدود الترميز لـ padding — عالٍ تقنياً ك�
 | gtp-types | — | 1 | 1 | 1 |
 | gtp-core | 1 | 2 | 8 | 3 |
 | gtp-runtime-tokio | 1 | — | 4 | 2 |
-| gtp-io / gtp-sim / gtp-cli | — | — | 3 (كود ميت/سيناريو وحيد) | 2 |
+| gtp-io / gtp-sim / gtp-cli | — | — | 3 (dead code/single scenario) | 2 |
 
-*(الأرقام تقريبية للعناصر المتقاطعة بين الحزم — انظر السجل التفصيلي في §12؛ العناصر الحرجة الموزعة على حزمتين تُحسب لكلتيهما لأن إصلاحها يمس الالتحام بينهما.)*
+*(Counts are approximate for items spanning two crates — see the detailed registry in §12; cross-crate criticals are counted for both since fixing them touches the seam.)*
 
-### ملحق د — الثيمة المركزية للتدقيق
+### Appendix D — the central theme of the audit
 
-النمط المتكرر عبر الاكتشافات كلها: **الطبقات مبنية ومُختبرة داخلياً، ونقاط انتقال السيطرة بينها غير مُلكَمة**. إطارات تُرمَّز في طبقة وتُفسَّر في أخرى بدلالة مختلفة (Core-C1, WIR-5/6)؛ عدادات تُحدَّث في طبقة على افتراض ضمان من طبقة أخرى لا توفره (SEC-3, CC-3, D-2)؛ خوارزميات صحيحة رياضياً تُغذّى بقيم غير مُتحقَّرة من السلك (REC-1, REC-10)؛ وإعدادات معلنة تُكتب ولا تُقرأ (REC-7, CC-6, SEC-18). لذلك فإن أعلى استثمار ممكن في هذا الكود ليس إصلاح أياً من هذه حدةً بحدة، بل **بناء طبقة اختبار الالتحام (المرحلة 4)** التي تجعل كل درز مستقبلاً بين الطبقات مُختبراً بالآلية نفسها التي كان غيابها سيغطي العيوب الستة الحرجة الحالية.
+The pattern recurring across every finding: **the layers are built and internally tested, but the control-transfer points between them are unsoldered**. Frames encoded in one layer and interpreted in another with different semantics (Core-C1, WIR-5/6); counters updated in one layer assuming a guarantee another layer does not provide (SEC-3, CC-3, D-2); mathematically correct algorithms fed unvalidated wire values (REC-1, REC-10); and advertised settings written but never read (REC-7, CC-6, SEC-18). The highest-leverage investment in this codebase is therefore not fixing any single defect but **building the seam-test harness (Phase 4)** that would have caught all six current criticals — and will hold every future inter-layer seam.
 
 ---
 
-*نهاية الوثيقة — GTP-rs Architecture & Protocol Audit Paper v1.0*
+*End of document — GTP-rs Architecture & Protocol Audit Paper v1.0*

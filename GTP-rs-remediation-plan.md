@@ -1,69 +1,69 @@
-# خطة شاملة لإصلاح وتطوير مشروع GTP-rs
+# A Comprehensive Plan for Fixing and Developing the GTP-rs Project
 
-**النطاق:** جميع كرايتات الـ workspace الثلاثة عشر
-**المرجعية:** فحص مباشر للكود المصدري (وليس التوثيق التسويقي)
-**المبدأ الحاكم:** كل تعديل يجب أن يحافظ على — أو يحسّن — الأداء والكفاءة والاستقرار، وأن ينسجم مع بنية الاعتماد الحالية بين الكرايتات (dependency graph) ومع فلسفة Rust في معالجة الأخطاء والتخصيص (allocation) والتزامن.
+**Scope:** all thirteen workspace crates
+**Reference:** direct inspection of the source code (not the marketing documentation)
+**Governing principle:** every change must preserve — or improve — performance, efficiency, and stability, and must respect the existing dependency graph between the crates, along with Rust's philosophy of error handling, allocation, and concurrency.
 
 ---
 
-## 0. خريطة الاعتماد الحالية (يجب احترامها في ترتيب التنفيذ)
+## 0. The current dependency map (must be respected in execution order)
 
 ```
-gtp-types  (no_std قابل، لا يعتمد على شيء)
-   └─▶ gtp-wire        (ترميز/فك ترميز الحزم)
-          ├─▶ gtp-recovery    (RTT / فقد الحزم)
-          ├─▶ gtp-scheduler   (DRR / الترتيب)
-          └─▶ gtp-path        (حالة المسار / DoS)
-gtp-crypto (مستقل، لا يعتمد على gtp-wire)
-   └─▶ (يُستهلك من) gtp-core
-gtp-cc     (يعتمد على gtp-recovery + gtp-types)
-   └─▶ (يُستهلك من) gtp-core
+gtp-types  (no_std-capable, depends on nothing)
+   └─▶ gtp-wire        (packet encode/decode)
+          ├─▶ gtp-recovery    (RTT / packet loss)
+          ├─▶ gtp-scheduler   (DRR / ordering)
+          └─▶ gtp-path        (path state / DoS)
+gtp-crypto (standalone, does not depend on gtp-wire)
+   └─▶ (consumed by) gtp-core
+gtp-cc     (depends on gtp-recovery + gtp-types)
+   └─▶ (consumed by) gtp-core
 
 gtp-core  = gtp-types + gtp-wire + gtp-recovery + gtp-cc + gtp-scheduler + gtp-path + gtp-crypto
    ├─▶ gtp-io
    ├─▶ gtp-runtime-tokio
    └─▶ gtp-sim
           └─▶ gtp-cli
-gtp (SDK الموحّد) = يجمع كل ما سبق خلف واجهة واحدة
+gtp (the unified SDK) = gathers all of the above behind one interface
 ```
 
-**الأثر العملي على الخطة:** أي إصلاح في `gtp-types` أو `gtp-wire` يفرض إعادة اختبار كل ما فوقهما (11 كرايت). لذلك يجب إصلاح الطبقات السفلية **أولًا وبشكل معزول تمامًا**، مع تجميد واجهاتها العامة (public API) قبل الانتقال للطبقات الأعلى — هذا يمنع "موجات إعادة عمل" متكررة.
+**Practical impact on the plan:** any fix in `gtp-types` or `gtp-wire` forces retesting everything above them (11 crates). Therefore the lower layers must be fixed **first and in full isolation**, with their public APIs frozen before moving to the higher layers — this prevents repeated "rework waves".
 
 ---
 
-## المرحلة 0 — خط الأساس (Baseline) قبل أي تعديل
+## Phase 0 — the baseline before any change
 
-**الهدف:** امتلاك نقطة مرجعية موثوقة للمقارنة، حتى نستطيع إثبات أن الإصلاحات لم تُنقص الأداء أو الاستقرار.
+**Goal:** own a trustworthy reference point for comparison, so we can prove the fixes did not degrade performance or stability.
 
-| المهمة | التفاصيل | الكرايتات المتأثرة |
+| Task | Details | Affected crates |
 |---|---|---|
-| تثبيت toolchain محدد | إضافة `rust-toolchain.toml` بنسخة Rust ثابتة (نفس ما ورد في تقرير الامتثال: 1.98.0) | جذر الـ workspace |
-| إضافة CI أساسي | `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check` | جذر الـ workspace |
-| بنشماركات مرجعية | إضافة `criterion` كـ dev-dependency في `gtp-cc`, `gtp-wire`, `gtp-crypto`، وتسجيل الأرقام الحالية (throughput الترميز/فك الترميز، زمن seal/open، تقارب CUBIC) | gtp-cc, gtp-wire, gtp-crypto |
-| توثيق سلوك الأخطاء الحالي | جرد كامل لكل `unwrap`/`expect`/`panic!` مع تصنيفها: (أ) داخل `#[cfg(test)]` — لا تُغيَّر، (ب) في مسار يعالج مدخلات شبكية غير موثوقة — أولوية قصوى، (ج) في مسار داخلي بمدخلات مضمونة الصحة من النوع (type-guaranteed) — أولوية منخفضة | gtp-wire, gtp-core, gtp-recovery, gtp-scheduler |
+| Pin the toolchain | Add `rust-toolchain.toml` with a fixed Rust version (the same as the compliance report: 1.98.0) | workspace root |
+| Add basic CI | `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check` | workspace root |
+| Reference benchmarks | Add `criterion` as a dev-dependency in `gtp-cc`, `gtp-wire`, `gtp-crypto`, recording current numbers (encode/decode throughput, seal/open time, CUBIC convergence) | gtp-cc, gtp-wire, gtp-crypto |
+| Document current error behavior | A full inventory of every `unwrap`/`expect`/`panic!` classified: (a) inside `#[cfg(test)]` — do not touch, (b) on a path handling untrusted network input — highest priority, (c) on an internal path with type-guaranteed valid inputs — low priority | gtp-wire, gtp-core, gtp-recovery, gtp-scheduler |
 
-**معيار القبول:** CI أخضر على الكود الحالي كما هو (بدون أي إصلاح بعد)، وأرقام benchmark مسجّلة كمرجع. **لا تبدأ المرحلة 1 قبل اكتمال هذه المرحلة.**
+**Acceptance criteria:** green CI on the current code as-is (before any fix), with benchmark numbers recorded as the reference. **Do not start Phase 1 before this phase completes.**
 
 ---
 
-## المرحلة 1 — إصلاح طبقة التشفير (حرجة أمنيًا، معزولة معماريًا)
+## Phase 1 — fixing the cryptography layer (security-critical, architecturally isolated)
 
-### 1.1 اشتقاق المفاتيح (Key Derivation) — يُنفَّذ أولًا لأنه الأساس الذي يعتمد عليه AEAD
+### 1.1 Key derivation — done first because it is the foundation AEAD relies on
 
-**المشكلة المكتشفة:** مفتاح ثابت `[0x3C; 32]` وIV ثابت `[0x7E; 12]` مكتوبان مباشرة في `ConnectionHot::new`، مشتركان بين كل الاتصالات.
+**The discovered problem:** a fixed key `[0x3C; 32]` and a fixed IV `[0x7E; 12]` are written directly in `ConnectionHot::new`, shared across all connections.
 
-**الحل المعماري:**
-- إضافة نوع `HandshakeSecret` جديد في `gtp-crypto` (وحدة جديدة `gtp-crypto/src/kdf.rs`)، يستخدم HKDF (عبر crate `hkdf` + `sha2`، وكلاهما pure-Rust، متوافقان مع `no_std` عند الحاجة).
-- كل اتصال يشتق مفتاح `[u8; 32]` وIV `[u8; 12]` منفصلين من سر مشترك (shared secret) ناتج عن تبادل مفاتيح (يفضَّل X25519 عبر crate `x25519-dalek`) + `ConnectionId` كـ "info" في HKDF لضمان عدم تكرار المفتاح بين الاتصالات.
-- **التوقيت:** هذا الاشتقاق يحدث **مرة واحدة فقط عند إنشاء الاتصال** (handshake)، وليس لكل حزمة — **صفر أثر على كمون اللعب الفعلي**.
+**The architectural solution:**
+- Add a new `HandshakeSecret` type in `gtp-crypto` (a new module `gtp-crypto/src/kdf.rs`) using HKDF (via the `hkdf` + `sha2` crates, both pure-Rust and `no_std`-compatible when needed).
+- Every connection derives a separate `[u8; 32]` key and `[u8; 12]` IV from a shared secret produced by a key exchange (X25519 via the `x25519-dalek` crate is preferred) + the `ConnectionId` as the HKDF "info" to guarantee no key repetition between connections.
+- **Timing:** this derivation happens **once at connection creation** (the handshake), not per packet — **zero impact on actual gameplay latency**.
 
-**التوافق المعماري:** لا يغيّر توقيع `PacketProtector` trait إطلاقًا. `ConnectionHot::new` يتغيّر فقط في كيفية إنشاء `GtpAeadProtector` (يستقبل الآن مفتاحًا مُشتقًا بدل الثابت المكتوب).
+**Architectural compatibility:** it does not change the `PacketProtector` trait signature at all. `ConnectionHot::new` changes only in how the `GtpAeadProtector` is constructed (it now receives a derived key instead of the hardcoded constant).
 
-### 1.2 استبدال خوارزمية AEAD
+### 1.2 Replacing the AEAD algorithm
 
-**الاستبدال:** `GtpAeadProtector` (XOR + تجزئة شبيهة بـ FNV) → تنفيذ حقيقي عبر crate `chacha20poly1305` (pure Rust، لا يحتاج AES-NI، أداء متوقّع عبر كل أجهزة اللاعبين).
+**The replacement:** `GtpAeadProtector` (XOR + an FNV-like hash) → a real implementation via the `chacha20poly1305` crate (pure Rust, needs no AES-NI, predictable performance across all player hardware).
 
-**التوافق المعماري — نقطة حرجة:** كما ورد في التحليل السابق، `protector: Box<dyn PacketProtector>` هو الاستثناء الوحيد من static dispatch في المشروع. عند إعادة الكتابة، يُستبدَل بـ:
+**Architectural compatibility — a critical point:** as noted in the previous analysis, `protector: Box<dyn PacketProtector>` is the project's only exception to static dispatch. In the rewrite, it is replaced with:
 
 ```rust
 pub enum Protector {
@@ -77,143 +77,143 @@ impl PacketProtector for Protector {
             Protector::Plaintext(p) => p.seal(...),
         }
     }
-    // ... open, tag_len بنفس النمط
+    // ... open, tag_len in the same pattern
 }
 ```
-هذا يزيل التخصيص على الـ heap (`Box`) ويعيد المشروع لاتساقه الداخلي مع static dispatch، مع الحفاظ على نفس المرونة الوظيفية (تبديل التشفير/عدمه وقت التشغيل حسب `secure: bool`).
+This removes the heap allocation (`Box`) and returns the project to its internal consistency with static dispatch, while preserving the same functional flexibility (toggling encryption at runtime via `secure: bool`).
 
-**التغييرات المطلوبة بالتفصيل:**
+**The required changes in detail:**
 
-| الملف | التغيير |
+| File | The change |
 |---|---|
-| `gtp-crypto/Cargo.toml` | إضافة `chacha20poly1305`, `hkdf`, `sha2`, `x25519-dalek` |
-| `gtp-crypto/src/aead.rs` | إعادة كتابة `seal`/`open`/`compute_tag` بالكامل لاستدعاء `ChaCha20Poly1305::encrypt/decrypt` بدل الحلقات اليدوية |
-| `gtp-crypto/src/kdf.rs` (جديد) | منطق HKDF + تبادل X25519 |
-| `gtp-crypto/src/lib.rs` | إضافة `pub mod kdf;` وتصدير الأنواع الجديدة |
-| `gtp-core/src/state.rs` | استبدال `Box<dyn PacketProtector>` بـ `enum Protector`، وربط `ConnectionHot::new` بمسار الـ handshake الجديد بدل المفتاح الثابت |
+| `gtp-crypto/Cargo.toml` | Add `chacha20poly1305`, `hkdf`, `sha2`, `x25519-dalek` |
+| `gtp-crypto/src/aead.rs` | Fully rewrite `seal`/`open`/`compute_tag` to call `ChaCha20Poly1305::encrypt/decrypt` instead of the manual loops |
+| `gtp-crypto/src/kdf.rs` (new) | HKDF logic + the X25519 exchange |
+| `gtp-crypto/src/lib.rs` | Add `pub mod kdf;` and export the new types |
+| `gtp-core/src/state.rs` | Replace `Box<dyn PacketProtector>` with the `enum Protector`, and wire `ConnectionHot::new` to the new handshake path instead of the fixed key |
 
-**ما لا يتغيّر (لضمان الاستقرار):** توقيع `PacketProtector` trait، حجم `AEAD_TAG_LEN` (يبقى 16 بايت — متوافق مع تنسيق الحزمة الحالي)، وواجهة `seal`/`open` المستخدمة في بقية `gtp-core`.
+**What does not change (to guarantee stability):** the `PacketProtector` trait signature, the `AEAD_TAG_LEN` size (stays 16 bytes — compatible with the current packet format), and the `seal`/`open` interface used throughout the rest of `gtp-core`.
 
-### 1.3 اختبارات الانحدار (Regression) الإلزامية لهذه المرحلة
-- اختبار جولة كاملة (round-trip) seal/open بمفاتيح مُشتقة فعليًا (وليس ثوابت اختبار كما هو حاليًا).
-- اختبار أن مفتاحين لاتصالين مختلفين (نفس الطرفين، جلستين منفصلتين) **مختلفان فعليًا** — لضمان عدم تكرار nonce/key عبر الاتصالات.
-- اختبار كسر التلاعب (tamper) بالعلامة والـ AAD — موجود جزئيًا حاليًا، يُبقى ويُوسَّع.
-- بنشماركات مقارنة: زمن `seal`/`open` قبل/بعد — **معيار القبول: الفارق يجب أن يبقى ضمن هامش مقبول لحزم صغيرة (<200 بايت)، وهو متوقع أن يكون بضع مئات النانوثانية فقط**.
+### 1.3 The mandatory regression tests for this phase
+- A full seal/open round-trip test with actually derived keys (not test constants as currently).
+- A test that the keys of two different connections (the same two parties, two separate sessions) **actually differ** — guaranteeing no nonce/key repetition across connections.
+- A tag/AAD tamper-break test — partially present today; keep and extend.
+- Comparative benchmarks: `seal`/`open` time before/after — **acceptance criterion: the difference must stay within an acceptable margin for small packets (<200 bytes), expected to be only a few hundred nanoseconds**.
 
 ---
 
-## المرحلة 2 — تصليب مسار فك الترميز (Decode-Path Hardening)
+## Phase 2 — hardening the decode path
 
-**السبب:** `gtp-wire/src/frame.rs` يحتوي 39 استخدامًا لـ `unwrap()`/`expect()` على بايتات قادمة مباشرة من الشبكة (مصدر غير موثوق) — هذا مصدر خطر DoS حقيقي.
+**The reason:** `gtp-wire/src/frame.rs` contains 39 uses of `unwrap()`/`expect()` on bytes arriving directly from the network (an untrusted source) — a real DoS hazard.
 
-### 2.1 استراتيجية الإصلاح (بدون تغيير بنية الملفات)
-- إضافة نوع خطأ جديد أو توسيع `TransportError` الموجود في `gtp-types` بمتغيّر `TruncatedFrame { needed: usize, available: usize }`.
-- استبدال كل نمط:
+### 2.1 The fix strategy (without changing the file layout)
+- Add a new error type or extend the existing `TransportError` in `gtp-types` with a `TruncatedFrame { needed: usize, available: usize }` variant.
+- Replace every pattern:
   ```rust
   buf[offset..offset + N].try_into().unwrap()
   ```
-  بـ:
+  with:
   ```rust
   buf.get(offset..offset + N)
       .ok_or(TransportError::TruncatedFrame { needed: N, available: buf.len().saturating_sub(offset) })?
       .try_into()
-      .expect("slice length checked above") // هذا expect آمن الآن لأنه بعد تحقق الطول
+      .expect("slice length checked above") // this expect is now safe because the length was verified
   ```
-- تحويل توقيع دوال فك الترميز في `frame.rs` من `-> FrameType` إلى `-> Result<FrameType, TransportError>` (إن لم تكن كذلك أصلًا) وتمرير الخطأ عبر `?` حتى الطبقة المستدعية في `gtp-core`.
+- Change the decode function signatures in `frame.rs` from `-> FrameType` to `-> Result<FrameType, TransportError>` (if not already so) and propagate the error via `?` up to the consuming layer in `gtp-core`.
 
-### 2.2 معالجة الطبقة المستدعية (gtp-core)
-- في `connection.rs`، عند استقبال حزمة تُنتج `TransportError::TruncatedFrame` أو ما شابه: **إسقاط الحزمة بصمت (silent drop) وتسجيلها في المقاييس (metrics)**، وليس إنهاء الاتصال أو panic. هذا هو السلوك الصحيح لبروتوكول شبكي فوق UDP: حزمة تالفة واحدة لا يجب أن تُسقط الجلسة.
-- لا حاجة لتغيير أي منطق آخر في `gtp-core` — فقط نقطة استقبال الخطأ من `gtp-wire`.
+### 2.2 Handling the consuming layer (gtp-core)
+- In `connection.rs`, upon receiving a packet producing `TransportError::TruncatedFrame` or similar: **silently drop the packet and record it in the metrics**, not terminate the connection or panic. This is the correct behavior for a network protocol over UDP: one corrupt packet must not kill the session.
+- No other `gtp-core` logic needs changing — only the error-receiving point from `gtp-wire`.
 
-### 2.3 لماذا هذا لا يؤثر على الأداء
-- في المسار السليم (happy path — أكثر من 99.9% من الحزم في تشغيل طبيعي)، الفرق بين `unwrap()` و`ok_or(...)?` هو فحص طول إضافي (branch واحد يُتنبأ به بشكل صحيح تقريبًا دائمًا من المعالج) — تكلفته أقل من نانوثانية واحدة لكل حقل، وهو مهمَل مقارنة بزمن معالجة الحزمة الكامل (تشفير + جدولة + إرسال عبر socket).
-- **لا يُستخدم أي heap allocation إضافي**: `TransportError` يُصمَّم كـ enum بسيط بحقول `Copy`، فانتشاره عبر `Result` لا يكلّف شيئًا يُذكر.
+### 2.3 Why this does not affect performance
+- On the healthy path (more than 99.9% of packets in normal operation), the difference between `unwrap()` and `ok_or(...)?` is one additional length check (a single branch the CPU predicts correctly almost always) — a cost below one nanosecond per field, negligible against the full packet processing time (encryption + scheduling + socket send).
+- **No additional heap allocation is used**: `TransportError` is designed as a simple enum with `Copy` fields, so its propagation through `Result` costs essentially nothing.
 
-### 2.4 الكرايتات المتأثرة بهذه المرحلة (بالترتيب الإلزامي بسبب graph الاعتماد)
-1. `gtp-types` (توسيع `TransportError`) — يجب أن يُصرَّف وتمر اختباراته أولًا قبل أي شيء آخر.
-2. `gtp-wire` (frame.rs, header.rs, codec.rs, varint.rs) — أكبر حجم عمل في هذه المرحلة.
-3. `gtp-recovery`, `gtp-scheduler` — تحتوي أيضًا على unwrap (4 لكل منهما) لكنها أقل حرجية لأنها تعمل على بيانات مُتحقَّق منها مسبقًا من `gtp-wire`؛ تُعالَج بنفس النمط لكن بأولوية أقل.
-4. `gtp-core` — نقطة الاستهلاك النهائية لكل الأخطاء الجديدة.
+### 2.4 The crates affected by this phase (in the mandatory order imposed by the dependency graph)
+1. `gtp-types` (extending `TransportError`) — must compile and pass its tests first before anything else.
+2. `gtp-wire` (frame.rs, header.rs, codec.rs, varint.rs) — the largest workload of this phase.
+3. `gtp-recovery`, `gtp-scheduler` — also contain unwraps (4 each) but are less critical since they operate on data already validated by `gtp-wire`; handle them with the same pattern at a lower priority.
+4. `gtp-core` — the final consumption point of all the new errors.
 
-**معيار القبول:** تشغيل fuzzing (انظر المرحلة 3) لمدة لا تقل عن ساعة على `gtp-wire::frame::decode` بدون أي panic، فقط `Result::Err` منظّم.
+**Acceptance criteria:** run fuzzing (see Phase 3) for at least one hour on `gtp-wire::frame::decode` with zero panics — only structured `Result::Err`.
 
 ---
 
-## المرحلة 3 — بنية تحتية للاختبار والتحقق
+## Phase 3 — testing and verification infrastructure
 
-| المهمة | التفاصيل | لماذا لا تؤثر على الإنتاج |
+| Task | Details | Why it does not affect production |
 |---|---|---|
-| `cargo-fuzz` على `gtp-wire` | هدف fuzzing مخصص (`fuzz_targets/decode_frame.rs`) يغذّي بايتات عشوائية لدالة فك الترميز | كود fuzzing منفصل تمامًا في مجلد `fuzz/`، لا يُصرَّف ضمن `cargo build --release` العادي |
-| `cargo-fuzz` على `gtp-crypto` | التحقق من عدم وجود panic عند فتح (open) حمولات تالفة بعد التشفير الجديد | نفس العزل أعلاه |
-| اختبارات حالات الحافة الشبكية | حزم مقصوصة، packet number wraparound (RFC 1982)، إعادة ترتيب متطرفة، فقد متتالي طويل، تكرار عند حدود نافذة الـ replay بالضبط | تُضاف داخل `#[cfg(test)]` الموجود، صفر أثر على binary الإصدار |
-| اختبارات تكامل شاملة عبر `gtp-sim` | استخدام المحاكي الحتمي (deterministic) الموجود فعلًا في المشروع لمحاكاة اتصال كامل تحت ظروف شبكة واقعية (فقد 20%، jitter، bandwidth محدود) والتحقق من: عدم panic، تقارب CUBIC، عدم تجاوز anti-amplification | يستخدم بنية `gtp-sim` الموجودة مسبقًا — لا حاجة لإنشاء بنية جديدة |
-| `cargo audit` ضمن CI | فحص تلقائي لثغرات معروفة في التبعيات الجديدة (chacha20poly1305, hkdf, إلخ) عند كل push | build-time فقط |
+| `cargo-fuzz` on `gtp-wire` | A dedicated fuzz target (`fuzz_targets/decode_frame.rs`) feeding random bytes to the decode function | Fuzzing code lives entirely separately in `fuzz/`, never compiled into the normal `cargo build --release` |
+| `cargo-fuzz` on `gtp-crypto` | Verify no panics when opening corrupted payloads after the new encryption | The same isolation as above |
+| Network edge-case tests | Truncated packets, packet-number wraparound (RFC 1982), extreme reordering, long consecutive loss, duplication exactly at the replay-window boundary | Added inside the existing `#[cfg(test)]`, zero impact on the release binary |
+| Full integration tests via `gtp-sim` | Use the existing deterministic simulator for a full connection under realistic network conditions (20% loss, jitter, limited bandwidth), verifying: no panics, CUBIC convergence, no anti-amplification violations | Uses the pre-existing `gtp-sim` infrastructure — nothing new to build |
+| `cargo audit` in CI | Automatic checking of known vulnerabilities in the new dependencies (chacha20poly1305, hkdf, etc.) on every push | Build-time only |
 
-**ترتيب التنفيذ:** هذه المرحلة تعمل بالتوازي مع نهاية المرحلة 2 (fuzzing يحتاج الكود الجديد لمسار فك الترميز موجودًا أولًا حتى يكون مفيدًا).
+**Execution order:** this phase runs in parallel with the end of Phase 2 (fuzzing needs the new decode-path code to exist first to be useful).
 
 ---
 
-## المرحلة 4 — تحسينات أداء وممارسات Rust مثالية (اختيارية، بعد استقرار المراحل 1-3)
+## Phase 4 — performance enhancements and ideal Rust practices (optional, after Phases 1-3 stabilize)
 
-هذه المرحلة **لا تعالج عيوبًا حرجة**، بل ترفع المشروع من "يعمل بشكل صحيح" إلى "يستغل Rust بأقصى كفاءة".
+This phase **does not address critical defects**; it elevates the project from "works correctly" to "exploits Rust with maximum efficiency".
 
-### 4.1 ملف الإصدار (Release Profile)
-إضافة إلى جذر `Cargo.toml`:
+### 4.1 The release profile
+Add to the root `Cargo.toml`:
 ```toml
 [profile.release]
 lto = "fat"
 codegen-units = 1
 opt-level = 3
-panic = "abort"   # فقط بعد اكتمال المرحلة 2 بالكامل والتحقق عبر fuzzing
-strip = "symbols" # تقليل حجم الـ binary النهائي للتوزيع على عملاء الألعاب
+panic = "abort"   # only after Phase 2 fully completes and fuzzing verifies it
+strip = "symbols" # reduces the final binary size for distribution to game clients
 ```
-**شرط:** `panic = "abort"` مشروط بإتمام إزالة كل الـ unwrap في مسارات المدخلات غير الموثوقة أولًا (المرحلة 2)، وإلا فهو يزيد المخاطر بدل تقليلها.
+**Condition:** `panic = "abort"` is conditional on first removing every unwrap on untrusted-input paths (Phase 2); otherwise it increases risk instead of reducing it.
 
-### 4.2 استبدال Hasher في المسار الساخن
-في `gtp-core/src/state.rs`، استبدال `std::collections::HashMap` بـ `rustc-hash::FxHashMap` لحقلي `ordered_groups` و`next_order_seqs` — المفاتيح داخلية (`u16`) وليست مُدخلة مباشرة من الشبكة بصيغة خام، فلا خطر hash-flooding يبرر استخدام SipHash الأبطأ.
+### 4.2 Replacing the hasher on the hot path
+In `gtp-core/src/state.rs`, replace `std::collections::HashMap` with `rustc-hash::FxHashMap` for the `ordered_groups` and `next_order_seqs` fields — the keys are internal (`u16`) and not fed raw from the network, so no hash-flooding risk justifies the slower SipHash.
 
-### 4.3 إثراء خوارزمية CUBIC (اختياري)
-- إضافة "TCP-friendly region" و"fast convergence" (RFC 8312) في `gtp-cc/src/cubic.rs` كفرع منطقي إضافي داخل `update_w_cubic` — لا يغيّر البنية الخارجية للدالة أو الـ trait.
-- تحسين حساب `pacing_rate` ليعتمد على تباين RTT (`RTTVAR`) بدل المعامل الثابت 1.2×.
+### 4.3 Enriching the CUBIC algorithm (optional)
+- Add the "TCP-friendly region" and "fast convergence" (RFC 8312) in `gtp-cc/src/cubic.rs` as an extra logical branch inside `update_w_cubic` — it does not change the function's external structure or the trait.
+- Improve the `pacing_rate` computation to depend on RTT variance (`RTTVAR`) instead of the fixed 1.2× factor.
 
-### 4.4 بنشماركات دائمة (Criterion) كجزء من CI (اختياري لكن موصى به)
-تشغيل دوري (مثلًا أسبوعي أو عند كل PR يمس `gtp-cc`/`gtp-wire`/`gtp-crypto`) مع حفظ النتائج لرصد أي تراجع أداء (performance regression) مستقبلي تلقائيًا.
+### 4.4 Permanent Criterion benchmarks as part of CI (optional but recommended)
+Periodic runs (e.g., weekly, or on any PR touching `gtp-cc`/`gtp-wire`/`gtp-crypto`) with results archived to automatically detect any future performance regression.
 
 ---
 
-## المرحلة 5 — نضج المشروع وقابلية التطوير طويلة المدى
+## Phase 5 — project maturity and long-term scalability
 
-هذه المرحلة تخدم "قابلية الصيانة والتوسع" التي طلبتها تحديدًا، ولا تمس الكود التشغيلي إطلاقًا:
+This phase serves the "maintainability and scalability" you specifically requested and touches no operational code at all:
 
-| المهمة | الهدف |
+| Task | The goal |
 |---|---|
-| `CHANGELOG.md` بصيغة Keep a Changelog | تتبّع كل تغيير سلوكي منذ الإصدار 0.1.0 |
-| اعتماد Semantic Versioning فعليًا | ترقية الإصدار إلى 0.2.0 بعد المرحلة 1 (تغيير غير متوافق للخلف في تنسيق التشفير)، مع توثيق "breaking change" |
-| توسيع `PacketProtector` مستقبلًا | تصميم الـ enum في 1.2 بحيث يسهل إضافة متغيّر ثالث (مثلًا AES-128-GCM للسيرفرات المزوّدة بـ AES-NI) دون كسر الواجهة العامة — نفس نمط enum قابل للتوسع مستقبلًا بإضافة variant جديد فقط |
-| توثيق قرارات معمارية (ADR) لكل تغيير كبير | تحديث `GTP_Architecture_Decision_Paper` بقرارات المرحلة 1 (لماذا ChaCha20-Poly1305 لا AES-GCM كافتراضي، لماذا enum لا dyn) |
-| إعادة كتابة تقرير الامتثال الذاتي | تصحيح البنود التي كانت "100% Pass" بشكل غير دقيق (تحديدًا بند التشفير) بعد اكتمال الإصلاح الفعلي، وربطها بنتائج fuzzing/benchmark حقيقية بدل تقييم ذاتي |
+| A `CHANGELOG.md` in Keep a Changelog format | Track every behavioral change since 0.1.0 |
+| Actual Semantic Versioning adoption | Bump to 0.2.0 after Phase 1 (a backward-incompatible change in the encryption format), documenting the "breaking change" |
+| Future `PacketProtector` extension | Design the enum in 1.2 so a third variant (e.g., AES-128-GCM for AES-NI-equipped servers) is easy to add without breaking the public interface — the same extensible-enum pattern: add a variant only |
+| Architecture Decision Records (ADR) for every major change | Update `GTP_Architecture_Decision_Paper` with Phase 1 decisions (why ChaCha20-Poly1305 rather than AES-GCM by default, why enum rather than dyn) |
+| Rewrite the self-compliance report | Correct the items that were inaccurately "100% Pass" (specifically the cryptography item) after the actual fix completes, tying them to real fuzzing/benchmark results instead of self-assessment |
 
 ---
 
-## جدول ملخّص: الأولوية × الأثر × المخاطر
+## Summary table: priority × impact × risk
 
-| المرحلة | الأولوية | أثر على الأداء | أثر على الاستقرار | مخاطر التنفيذ | يعتمد على |
+| Phase | Priority | Performance impact | Stability impact | Implementation risk | Depends on |
 |---|---|---|---|---|---|
-| 0. خط الأساس | إلزامية أولًا | صفر | يحمي من الانحدار لاحقًا | منخفضة | لا شيء |
-| 1. التشفير + اشتقاق المفاتيح | **حرجة** | صفر تقريبًا (handshake مرة واحدة) | يزيل ثغرة أمنية خطيرة | متوسطة (تغيير غير متوافق للخلف) | المرحلة 0 |
-| 2. تصليب فك الترميز | **حرجة** | صفر تقريبًا | يمنع DoS عبر panic | منخفضة-متوسطة (39 موقع تعديل) | المرحلة 0، مستقلة عن 1 (يمكن التوازي) |
-| 3. Fuzzing/اختبارات | عالية | صفر (build-time) | يكشف عيوبًا خفية | منخفضة | تكتمل فائدتها بعد 1+2 |
-| 4. تحسينات أداء | متوسطة (اختيارية) | تحسين ملموس (LTO خاصة) | محايد إلى إيجابي | منخفضة | بعد 1، 2، 3 |
-| 5. نضج ووثائق | منخفضة (لا تُعجّل) | صفر | يحسّن الصيانة طويلة المدى | صفر | مستمرة بالتوازي |
+| 0. Baseline | Mandatory first | Zero | Protects against later regression | Low | Nothing |
+| 1. Crypto + key derivation | **Critical** | Near zero (a one-time handshake) | Removes a serious security hole | Medium (a backward-incompatible change) | Phase 0 |
+| 2. Decode hardening | **Critical** | Near zero | Prevents DoS via panic | Low-medium (39 edit sites) | Phase 0, independent of 1 (can parallelize) |
+| 3. Fuzzing/tests | High | Zero (build-time) | Exposes hidden defects | Low | Full value after 1+2 |
+| 4. Performance enhancements | Medium (optional) | Tangible improvement (LTO especially) | Neutral to positive | Low | After 1, 2, 3 |
+| 5. Maturity and docs | Low (no rush) | Zero | Improves long-term maintenance | Zero | Continuous, in parallel |
 
 ---
 
-## مبدأ التكامل بين المراحل (لضمان الانسجام المعماري)
+## The integration principle between phases (to guarantee architectural coherence)
 
-1. **المراحل 1 و2 مستقلتان تقنيًا** (تمسّان كرايتات مختلفة: `gtp-crypto` مقابل `gtp-wire`) ويمكن تنفيذهما بالتوازي من قِبل مطوّرَين مختلفين دون تعارض، لأن `gtp-core` هو نقطة الدمج الوحيدة المشتركة، وتغييراته في كل مرحلة معزولة (استبدال نوع `protector` مقابل معالجة أخطاء `decode`).
-2. **لا تُدمَج أي مرحلة في الفرع الرئيسي قبل اجتياز CI الكامل** (المرحلة 0) — هذا يضمن أن كل مرحلة تالية تُبنى على أساس مُختبر فعليًا.
-3. **الحفاظ على توقيعات الـ traits العامة** (`PacketProtector`, `CongestionController`) طوال كل المراحل يعني أن أي كود مستهلك خارجي (عبر كرايت `gtp` الموحّد) لن يحتاج تعديلًا إلا في نقطة إنشاء الاتصال (بسبب الـ handshake الجديد في المرحلة 1) — وهذا التغيير الوحيد المتوقَّع أن يكسر التوافق مع الإصدار الحالي، ويُوثَّق بوضوح في `CHANGELOG` كـ breaking change لإصدار 0.2.0.
-4. **ترتيب التنفيذ الفعلي الموصى به:**
-   المرحلة 0 → (المرحلة 1 والمرحلة 2 بالتوازي) → المرحلة 3 (تُبنى على نتائج 1+2) → المرحلة 4 → المرحلة 5 (مستمرة طوال الوقت).
+1. **Phases 1 and 2 are technically independent** (they touch different crates: `gtp-crypto` versus `gtp-wire`) and can be executed in parallel by two different developers without conflict, since `gtp-core` is the only shared merge point and its changes in each phase are isolated (replacing the `protector` type versus handling decode errors).
+2. **No phase merges into the main branch before passing the full CI** (Phase 0) — this guarantees each subsequent phase builds on an actually tested foundation.
+3. **Preserving the public trait signatures** (`PacketProtector`, `CongestionController`) throughout all phases means no externally consuming code (via the unified `gtp` crate) needs changes except at the connection-creation point (due to the new handshake in Phase 1) — the only change expected to break compatibility with the current version, clearly documented in the `CHANGELOG` as a breaking change for the 0.2.0 release.
+4. **The recommended actual execution order:**
+   Phase 0 → (Phase 1 and Phase 2 in parallel) → Phase 3 (built on 1+2) → Phase 4 → Phase 5 (continuous throughout).
 
-هذا الترتيب يضمن أن أخطر فجوتين (التشفير المزيّف والـ panic القابل للاستغلال) تُعالَجان أولًا وبأسرع مسار ممكن، مع الحفاظ الكامل على بنية الاعتماد بين الكرايتات، وبدون أي إعادة هيكلة غير ضرورية للأجزاء التي أثبتت الفحوصات أنها مصممة بشكل صحيح أصلًا (CUBIC، replay window، تصميم traits العام).
+This order guarantees that the two most dangerous gaps (the fake encryption and the exploitable panic) are addressed first via the fastest possible path, while fully preserving the inter-crate dependency structure, and without any unnecessary refactoring of the parts the inspections already proved are correctly designed (CUBIC, the replay window, the general trait design).

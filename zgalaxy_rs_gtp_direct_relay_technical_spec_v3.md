@@ -1,18 +1,18 @@
-# ورقة تقنية شاملة
-## إضافة GTP-rs إلى zgalaxy-rs مع Direct-First وRelay Fallback
+# Comprehensive Technical Paper
+## Adding GTP-rs to zgalaxy-rs with Direct-First and Relay Fallback
 
-**الإصدار:** 3.0  
-**التاريخ:** 2026-08-28  
-**النطاق:** `dreamzone-cc/zgalaxy-rs` + `dreamzone-cc/GTP-rs` + التحقق من دور `dreamzone-cc/ZGALAXY`  
-**الهدف:** إضافة GTP كـ Mesh Transport إضافي، مع إبقاء QUIC، واعتماد الاتصال المباشر أولاً ثم Relay عند تعذر المسار المباشر.
+**Version:** 3.0
+**Date:** 2026-08-28
+**Scope:** `dreamzone-cc/zgalaxy-rs` + `dreamzone-cc/GTP-rs` + verifying the role of `dreamzone-cc/ZGALAXY`
+**Goal:** add GTP as an additional mesh transport, keep QUIC, and adopt a direct-connection-first strategy with relay fallback when the direct path is unavailable.
 
 ---
 
-# 1. الملخص التنفيذي
+# 1. Executive summary
 
-الهدف ليس استبدال QUIC، وليس تحويل `ZGALAXY` الخارجي إلى Relay، وليس وضع Relay داخل GTP.
+The goal is not to replace QUIC, not to turn the external `ZGALAXY` into a relay, and not to put a relay inside GTP.
 
-الهدف الصحيح هو بناء طبقة **Path/Connection Management** مستقلة داخل `zgalaxy-rs` تجعل قرار المسار منفصلاً عن البروتوكول:
+The correct goal is to build an independent **Path/Connection Management** layer inside `zgalaxy-rs` that makes the path decision separate from the protocol:
 
 ```text
                          zgalaxy-rs
@@ -34,60 +34,60 @@
                     └────────────────────────────────
 ```
 
-القاعدة:
+The rule:
 
 ```text
-1. اكتشف Peer
-2. حاول Direct Mesh
-3. استخدم QUIC أو GTP وفق policy/capability
-4. إذا فشل Direct → Relay
-5. استمر في اختبار Direct
-6. عند نجاح Direct مرة أخرى → migrate back
+1. Discover a peer
+2. Try the Direct mesh
+3. Use QUIC or GTP per policy/capability
+4. If Direct fails → Relay
+5. Keep probing Direct
+6. When Direct succeeds again → migrate back
 ```
 
-هذا يجعل:
+This makes:
 
 ```text
 Path selection
 ```
 
-مستقلاً عن:
+independent of:
 
 ```text
 Transport selection
 ```
 
-وهذه هي النقطة المعمارية الأساسية في الإصدار الجديد.
+— and that is the core architectural point of the new version.
 
 ---
 
-# 2. تصحيح المصطلحات
+# 2. Terminology corrections
 
-يجب عدم الخلط بين:
+The following must not be conflated:
 
 ## 2.1 `ZGALAXY`
 
-المستودع:
+The repository:
 
 ```text
 dreamzone-cc/ZGALAXY
 ```
 
-مشروع مستقل.
+An independent project.
 
-لا ينبغي افتراض أنه هو نفسه الـ Controller الموجود داخل `zgalaxy-rs`.
+It must not be assumed to be the same as the Controller inside `zgalaxy-rs`.
 
 ---
 
 ## 2.2 `zgalaxy-rs`
 
-المستودع:
+The repository:
 
 ```text
 dreamzone-cc/zgalaxy-rs
 ```
 
-وهو الـ Client/Agent، ويحتوي داخله على:
+It is the client/agent, containing:
 
 ```text
 Client
@@ -98,21 +98,21 @@ TUN
 Mesh/QUIC transport
 ```
 
-إضافة GTP المطلوبة هي إلى هذا المشروع.
+The requested GTP addition belongs to this project.
 
 ---
 
 ## 2.3 EmbeddedController
 
-داخل:
+Lives in:
 
 ```text
 zgalaxy-rs/src/controller.rs
 ```
 
-وهو Controller اختياري داخل نفس الـ binary.
+An optional controller inside the same binary.
 
-وظائفه تشمل:
+Its responsibilities include:
 
 ```text
 network configuration
@@ -123,41 +123,41 @@ member records
 join handling
 ```
 
-ولا ينبغي أن نعتبره Relay Data Plane تلقائياً.
+It must not automatically be treated as the relay data plane.
 
 ---
 
 ## 2.4 Relay
 
-Relay هو مسار بيانات احتياطي:
+A relay is a fallback data path:
 
 ```text
 Peer A → Relay → Peer B
 ```
 
-ويجب تصميمه كـ component مستقل.
+and must be designed as an independent component.
 
 ---
 
-# 3. الاستنتاج المعماري الرئيسي
+# 3. The main architectural conclusion
 
-نحتاج إلى فصل قرارين:
+We need to separate two decisions:
 
 ```text
 Question 1:
-كيف أصل إلى Peer؟
+How do I reach a peer?
 
 Answer:
-Direct أو Relay
+Direct or Relay
 
 Question 2:
-ما transport المستخدم داخل المسار؟
+Which transport is used inside the path?
 
 Answer:
-QUIC أو GTP
+QUIC or GTP
 ```
 
-لذلك:
+Therefore:
 
 ```rust
 enum PathMode {
@@ -171,7 +171,7 @@ enum TransportKind {
 }
 ```
 
-والتركيبات الممكنة:
+And the possible combinations:
 
 ```text
 Direct + QUIC
@@ -181,7 +181,7 @@ Relay + QUIC
 Relay + GTP
 ```
 
-لكن الـ policy الافتراضية:
+But the default policy:
 
 ```text
 Direct first
@@ -190,7 +190,7 @@ Relay fallback
 
 ---
 
-# 4. الشكل النهائي المستهدف
+# 4. The target end-state shape
 
 ```text
                          ┌─────────────────────┐
@@ -232,29 +232,29 @@ Relay fallback
 
 ---
 
-# 5. ما الذي يثبت من الكود الحالي؟
+# 5. What does the current code prove?
 
-المراجعة السابقة للملفات الأساسية تشير إلى أن:
+The previous review of the core files indicates that:
 
-- `src/quic.rs` يحتوي transport وevents وcontrol semantics.
-- `src/main.rs` يتعامل مع أحداث QUIC وControl messages.
-- `src/controller.rs` يحتوي EmbeddedController.
-- `src/nat.rs` يحتوي coupling مع transport/QUIC.
-- `src/peer.rs` يدير peer/path state.
-- `src/transport.rs` يمثل UDP wire transport مختلفاً عن QUIC.
-- `GTP-rs` يوفر transport capabilities مثل reliability modes، loss recovery، congestion control، AEAD، path validation/migration وTokio integration.
+- `src/quic.rs` contains the transport, events, and control semantics.
+- `src/main.rs` handles QUIC events and control messages.
+- `src/controller.rs` contains the EmbeddedController.
+- `src/nat.rs` contains coupling with the transport/QUIC.
+- `src/peer.rs` manages peer/path state.
+- `src/transport.rs` is a distinct UDP wire transport, separate from QUIC.
+- `GTP-rs` provides transport capabilities such as reliability modes, loss recovery, congestion control, AEAD, path validation/migration, and Tokio integration.
 
-المراجع المباشرة مدرجة في القسم الأخير.
+Direct references are listed in the final section.
 
 ---
 
-# 6. مشكلة architecture الحالية
+# 6. The problem with the current architecture
 
-المشكلة ليست أن QUIC سيئ.
+The problem is not that QUIC is bad.
 
-المشكلة أن بعض ZGalaxy semantics مرتبطة مباشرة بـ QUIC.
+The problem is that some ZGalaxy semantics are directly coupled to QUIC.
 
-الشكل الحالي المفاهيمي:
+The current conceptual shape:
 
 ```text
 QuicEvent
@@ -270,9 +270,9 @@ main.rs
    └── data
 ```
 
-هذا يجعل إضافة GTP صعبة.
+This makes adding GTP difficult.
 
-الشكل المطلوب:
+The required shape:
 
 ```text
 QuicEvent ──┐
@@ -295,29 +295,29 @@ GtpEvent ───┤
 
 ---
 
-# 7. فصل Control Plane عن Transport
+# 7. Separating the control plane from the transport
 
-يجب نقل:
+We must move:
 
 ```text
 ControlMessage
 ```
 
-من:
+from:
 
 ```text
 src/quic.rs
 ```
 
-إلى شيء مثل:
+to something like:
 
 ```text
 src/control.rs
 ```
 
-لأن الرسائل ليست QUIC-specific.
+because the messages are not QUIC-specific.
 
-مثل:
+For example:
 
 ```text
 NodeAnnounce
@@ -330,15 +330,15 @@ Ping
 Pong
 ```
 
-هذه ZGalaxy semantics.
+These are ZGalaxy semantics.
 
 ---
 
 # 8. MeshTransport
 
-يجب تعريف abstraction مبنية على احتياجات `zgalaxy-rs` وليس على شكل QUIC.
+An abstraction must be defined based on the needs of `zgalaxy-rs`, not on the shape of QUIC.
 
-مثال:
+Example:
 
 ```rust
 #[async_trait::async_trait]
@@ -370,13 +370,13 @@ pub trait MeshTransport: Send + Sync {
 }
 ```
 
-لكن يجب تثبيت API النهائي بعد مراجعة GTP-rs الحالي أثناء التنفيذ.
+But the final API must be pinned down after reviewing the current GTP-rs during implementation.
 
 ---
 
 # 9. TransportEvent
 
-المقترح:
+The proposal:
 
 ```rust
 pub enum TransportEvent {
@@ -405,22 +405,22 @@ pub enum TransportEvent {
 }
 ```
 
-وبذلك:
+With that:
 
 ```text
 QUIC → TransportEvent
 GTP  → TransportEvent
 ```
 
-ولا يحتاج core إلى معرفة المصدر.
+and the core does not need to know the source.
 
 ---
 
 # 10. PathManager
 
-هذه الطبقة هي أهم إضافة مع GTP/Relay.
+This layer is the most important addition together with GTP/Relay.
 
-المقترح:
+The proposal:
 
 ```rust
 pub struct PathManager {
@@ -430,7 +430,7 @@ pub struct PathManager {
 }
 ```
 
-مسؤولياتها:
+Its responsibilities:
 
 ```text
 peer discovery
@@ -447,9 +447,9 @@ migration
 
 ---
 
-# 11. State machine
+# 11. The state machine
 
-يجب ألا تكون عملية fallback عبارة عن:
+The fallback process must not be:
 
 ```rust
 if !connected {
@@ -457,7 +457,7 @@ if !connected {
 }
 ```
 
-بل state machine واضحة:
+but a clear state machine:
 
 ```text
              ┌──────────────┐
@@ -489,9 +489,9 @@ if !connected {
 
 ---
 
-# 12. Direct-first policy
+# 12. The direct-first policy
 
-الـ default:
+The default:
 
 ```rust
 PathPolicy {
@@ -501,19 +501,19 @@ PathPolicy {
 }
 ```
 
-ولا يجب تشغيل Relay قبل إعطاء direct فرصة مناسبة.
+Relay must not be engaged before direct has been given a fair chance.
 
 ---
 
-# 13. كيف نحدد فشل Direct؟
+# 13. How do we determine direct failure?
 
-لا يكفي:
+It is not enough that:
 
 ```text
-TCP-like connection failed
+a TCP-like connection failed
 ```
 
-نحتاج:
+We need:
 
 ```text
 candidate timeout
@@ -524,7 +524,7 @@ repeated loss
 NAT mapping failure
 ```
 
-ويجب تحديد:
+And the following must be defined, configurably:
 
 ```text
 initial timeout
@@ -533,38 +533,36 @@ backoff
 relay threshold
 ```
 
-بشكل configurable.
-
 ---
 
-# 14. Relay لا يلغي Direct
+# 14. Relay does not cancel Direct
 
-عند الانتقال إلى Relay:
+When switching to relay:
 
 ```text
 Direct = failed/currently unavailable
 Relay = active
 ```
 
-لكن يبقى:
+but the following remains on:
 
 ```text
 Direct probing = enabled
 ```
 
-مثلاً:
+For example:
 
 ```text
-كل 10-30 ثانية
+every 10-30 seconds
 ```
 
-أو adaptive probing.
+or adaptive probing.
 
 ---
 
-# 15. العودة إلى Direct
+# 15. Returning to Direct
 
-عندما يصبح direct متاحاً:
+When direct becomes available:
 
 ```text
 Relay
@@ -583,15 +581,15 @@ Drain relay
 Close relay
 ```
 
-ويجب تجنب packet loss قدر الإمكان.
+Packet loss must be avoided as much as possible.
 
 ---
 
 # 16. Relay architecture
 
-Relay يجب أن يكون server-side component.
+The relay must be a server-side component.
 
-الشكل:
+The shape:
 
 ```text
 Peer A
@@ -611,25 +609,25 @@ Peer A
       Peer B
 ```
 
-Relay لا يفك تشفير ZGalaxy payload.
+The relay does not decrypt the ZGalaxy payload.
 
 ---
 
 # 17. Relay routing
 
-يجب أن يكون لدى Relay:
+The relay must have:
 
 ```text
 PeerID → Session
 ```
 
-مثلاً:
+For example:
 
 ```rust
 HashMap<PeerId, RelaySession>
 ```
 
-وكل session تعرف:
+And each session knows:
 
 ```text
 peer identity
@@ -644,13 +642,13 @@ bytes
 
 # 18. Relay authentication
 
-لا يجب أن يكون Relay مفتوحاً:
+The relay must not be open:
 
 ```text
 UDP packet → forward
 ```
 
-بل:
+but:
 
 ```text
 connect
@@ -664,13 +662,13 @@ bind PeerID
 allow relay
 ```
 
-ويجب أن تكون authorization مرتبطة بـ Controller/network membership.
+And authorization must be tied to the Controller/network membership.
 
 ---
 
-# 19. العلاقة بين EmbeddedController وRelay
+# 19. The relationship between the EmbeddedController and the relay
 
-الأفضل:
+The best shape:
 
 ```text
 EmbeddedController
@@ -685,7 +683,7 @@ EmbeddedController
                     └── forwards traffic
 ```
 
-لكن لا يجب أن يصبح:
+But it must not become:
 
 ```text
 EmbeddedController
@@ -693,19 +691,19 @@ EmbeddedController
 Relay
 ```
 
-لأن lifecycle والـ responsibilities مختلفة.
+because the lifecycle and responsibilities differ.
 
 ---
 
-# 20. إذا كان Relay داخل نفس zgalaxy-rs binary
+# 20. If the relay lives inside the same zgalaxy-rs binary
 
-يمكن دعم:
+One can support:
 
 ```text
 zgalaxy-rs --controller
 ```
 
-ليحتوي:
+containing:
 
 ```text
 EmbeddedController
@@ -713,7 +711,7 @@ RelayService
 Controller API
 ```
 
-لكنها تبقى modules منفصلة:
+but they remain separate modules:
 
 ```text
 controller.rs
@@ -724,9 +722,9 @@ relay.rs
 
 # 21. External ZGALAXY
 
-يجب عدم تعديل `ZGALAXY` فقط لأننا أضفنا GTP.
+`ZGALAXY` must not be modified just because we added GTP.
 
-لكن إذا كان المطلوب أن يكون **Relay service مملوكاً ومُداراً بواسطة منظومة ZGALAXY الخارجية**، فهناك حاجة لفحص واجهاتها الحالية بدقة:
+However, if the requirement is for the **relay service to be owned and operated by the external ZGALAXY system**, its current interfaces must be examined precisely:
 
 ```text
 controller API
@@ -736,13 +734,13 @@ network membership
 relay discovery
 ```
 
-والمرحلة الأولى يجب أن تعتبر Relay endpoint خدمة مستقلة، إلى أن يتم إثبات وجود Relay protocol في `ZGALAXY`.
+And the first phase must treat the relay endpoint as an independent service, until the existence of a relay protocol in `ZGALAXY` is proven.
 
 ---
 
 # 22. GTP integration
 
-GTP يجب أن يكون transport backend:
+GTP must be a transport backend:
 
 ```text
 MeshTransport
@@ -751,7 +749,7 @@ MeshTransport
      └── GtpTransport
 ```
 
-ولا يجب أن يكون:
+And it must not be:
 
 ```text
 GTP
@@ -762,9 +760,9 @@ GTP
 
 ---
 
-# 23. GTP Data Plane
+# 23. The GTP data plane
 
-التوصية:
+The recommendation:
 
 ```text
 ZGalaxy frame
@@ -774,15 +772,15 @@ GTP Unreliable
 Peer
 ```
 
-لأن data plane الحالي المبني على QUIC يستخدم datagram semantics.
+because the current QUIC-based data plane uses datagram semantics.
 
-لا نريد تحويل كل L2/L3 traffic إلى reliable ordered traffic.
+We do not want to turn all L2/L3 traffic into reliable ordered traffic.
 
 ---
 
-# 24. GTP Control Plane
+# 24. The GTP control plane
 
-التوصية:
+The recommendation:
 
 ```text
 ControlMessage
@@ -790,7 +788,7 @@ ControlMessage
 GTP ReliableOrdered
 ```
 
-لـ:
+for:
 
 ```text
 NodeAnnounce
@@ -800,13 +798,13 @@ NetworkConfigRequest
 NetworkConfigResponse
 ```
 
-أما Ping/Pong فيمكن أن تكون control messages ذات priority مرتفعة.
+Ping/Pong can be high-priority control messages.
 
 ---
 
-# 25. GTP Relay
+# 25. GTP relay
 
-عند Direct:
+When direct:
 
 ```text
 Peer A
@@ -816,7 +814,7 @@ Peer A
 Peer B
 ```
 
-عند Relay:
+When relaying:
 
 ```text
 Peer A
@@ -830,13 +828,13 @@ Relay
 Peer B
 ```
 
-Relay لا يحتاج إلى تغيير GTP semantics.
+The relay does not need to change GTP semantics.
 
 ---
 
-# 26. خيار مهم: Relay عبر GTP
+# 26. An important option: relay over GTP
 
-يفضل أن يكون Relay مجرد forwarding endpoint:
+The relay should preferably be a plain forwarding endpoint:
 
 ```text
 GTP connection A
@@ -848,11 +846,11 @@ Relay routing
 GTP connection B
 ```
 
-ويظل end-to-end encryption بين peers.
+End-to-end encryption between the peers is preserved.
 
 ---
 
-# 27. لا نستخدم GTP لتشفير Peer Identity بدلاً من ZGalaxy identity
+# 27. We do not use GTP encryption for peer identity in place of ZGalaxy identity
 
 GTP security:
 
@@ -869,13 +867,13 @@ NodeChallenge
 AnnounceProof
 ```
 
-تبقى منفصلة.
+They remain separate.
 
 ---
 
-# 28. Identity handshake فوق Direct وRelay
+# 28. The identity handshake over Direct and Relay
 
-نفس protocol:
+The same protocol:
 
 ```text
 Direct:
@@ -885,15 +883,15 @@ Relay:
 GTP → Relay → NodeAnnounce → Challenge → Proof
 ```
 
-أي أن Relay لا يغير identity semantics.
+I.e., the relay does not change identity semantics.
 
 ---
 
-# 29. Controller mode فوق Relay
+# 29. Controller mode over the relay
 
-هذا يجب اختباره.
+This must be tested.
 
-مثال:
+Example:
 
 ```text
 Controller Node
@@ -904,7 +902,7 @@ controller_enabled=true
 Client
 ```
 
-يجب أن يعمل:
+The following must work:
 
 ```text
 NodeAnnounce
@@ -914,13 +912,13 @@ NetworkConfigRequest
 NetworkConfigResponse
 ```
 
-بنفس الطريقة التي يعمل بها direct.
+in the same way as direct.
 
 ---
 
 # 30. NAT architecture
 
-NAT layer يجب أن يكون:
+The NAT layer must be:
 
 ```text
 NAT
@@ -930,7 +928,7 @@ NAT
  └── path status
 ```
 
-وليس:
+and not:
 
 ```text
 NAT → QUIC only
@@ -940,7 +938,7 @@ NAT → QUIC only
 
 # 31. GTP path capabilities
 
-يجب الاستفادة من قدرات GTP-rs المتعلقة بـ:
+The GTP-rs capabilities related to:
 
 ```text
 path validation
@@ -952,15 +950,15 @@ congestion control
 RTT
 ```
 
-بدلاً من إعادة تنفيذها في zgalaxy-rs.
+must be leveraged instead of reimplemented in zgalaxy-rs.
 
-لكن يجب فصل:
+But the following must be kept separate:
 
 ```text
 GTP path state
 ```
 
-عن:
+from:
 
 ```text
 ZGalaxy Peer path state
@@ -970,7 +968,7 @@ ZGalaxy Peer path state
 
 # 32. PeerManager
 
-`PeerManager` يجب أن يحتفظ بمفهوم:
+`PeerManager` must retain the concepts of:
 
 ```text
 peer
@@ -980,7 +978,7 @@ endpoint
 status
 ```
 
-ولا يجب أن يصبح مسؤولاً عن:
+and must not become responsible for:
 
 ```text
 GTP implementation
@@ -988,13 +986,13 @@ QUIC implementation
 Relay implementation
 ```
 
-هذه مسؤولية PathManager.
+That is the PathManager's responsibility.
 
 ---
 
-# 33. Path object
+# 33. The Path object
 
-المقترح:
+The proposal:
 
 ```rust
 pub struct PathInfo {
@@ -1008,7 +1006,7 @@ pub struct PathInfo {
 }
 ```
 
-وهذا يسمح بتمثيل:
+This allows representing:
 
 ```text
 Peer A
@@ -1021,7 +1019,7 @@ Peer A
 
 # 34. Transport capabilities
 
-كل transport يجب أن يقدم:
+Each transport must offer:
 
 ```rust
 pub struct TransportCapabilities {
@@ -1032,36 +1030,36 @@ pub struct TransportCapabilities {
 }
 ```
 
-GTP وQUIC يمكن أن يختلفا.
+GTP and QUIC can differ.
 
 ---
 
 # 35. MTU
 
-لا تستخدم قيمة QUIC الحالية كـ global constant.
+Do not use the current QUIC value as a global constant.
 
-بدلاً من:
+Instead of:
 
 ```text
 if quic:
     1186
 ```
 
-يجب أن يصبح:
+it must become:
 
 ```text
 TransportCapabilities.max_payload
 ```
 
-لأن GTP لديه overhead مختلف وPMTU مختلف.
+because GTP has a different overhead and a different PMTU.
 
 ---
 
 # 36. Relay MTU
 
-Relay يضيف overhead إضافياً.
+The relay adds extra overhead.
 
-لذلك:
+Therefore:
 
 ```text
 Peer MTU
@@ -1073,13 +1071,13 @@ Relay overhead
 Maximum payload
 ```
 
-ويجب أن تكون fragmentation/segmentation semantics واضحة.
+And the fragmentation/segmentation semantics must be clear.
 
 ---
 
 # 37. Reliability mapping
 
-المقترح:
+The proposal:
 
 | ZGalaxy traffic | Direct QUIC | Direct GTP | Relay QUIC | Relay GTP |
 |---|---|---|---|---|
@@ -1092,21 +1090,21 @@ Maximum payload
 
 # 38. Relay transport selection
 
-لا ينبغي أن يكون:
+It should not be:
 
 ```text
 if relay:
     use QUIC
 ```
 
-بل:
+but:
 
 ```text
 select path
 select transport
 ```
 
-مثلاً:
+For example:
 
 ```rust
 PathSelection {
@@ -1119,21 +1117,21 @@ PathSelection {
 
 # 39. Configuration
 
-المقترح:
+The proposal:
 
 ```toml
 [transport]
 mode = "quic"
 ```
 
-القيم:
+Values:
 
 ```text
 quic
 gtp
 ```
 
-ثم:
+Then:
 
 ```toml
 [path]
@@ -1142,7 +1140,7 @@ relay_enabled = true
 direct_retry = true
 ```
 
-ثم:
+Then:
 
 ```toml
 [relay]
@@ -1150,20 +1148,20 @@ enabled = true
 endpoint = "..."
 ```
 
-لا يجب تثبيت endpoint في code.
+The endpoint must not be hardcoded.
 
 ---
 
-# 40. Auto mode مستقبلاً
+# 40. An auto mode in the future
 
-بعد MVP:
+After the MVP:
 
 ```toml
 [transport]
 mode = "auto"
 ```
 
-ثم:
+then:
 
 ```text
 Peer capabilities
@@ -1175,13 +1173,13 @@ GTP preferred
 QUIC fallback
 ```
 
-لكن هذا لا يجب أن يسبق نجاح GTP/QUIC basic operation.
+But this must not precede the success of basic GTP/QUIC operation.
 
 ---
 
-# 41. Per-peer transport مستقبلاً
+# 41. Per-peer transport in the future
 
-يمكن دعم:
+One can support:
 
 ```text
 Peer A → GTP
@@ -1189,7 +1187,7 @@ Peer B → QUIC
 Peer C → GTP
 ```
 
-ثم:
+and then:
 
 ```text
 Peer A → Direct GTP
@@ -1197,13 +1195,13 @@ Peer B → Relay QUIC
 Peer C → Direct QUIC
 ```
 
-وهذا سبب إضافي لفصل PathManager عن Transport.
+This is an additional reason to separate the PathManager from the transport.
 
 ---
 
 # 42. Path scoring
 
-يمكن بناء score:
+A score can be built:
 
 ```text
 direct + low latency = high score
@@ -1211,7 +1209,7 @@ direct + high loss = lower score
 relay + stable = fallback score
 ```
 
-مثلاً:
+For example:
 
 ```text
 Direct healthy
@@ -1224,13 +1222,13 @@ Relay
     score = 20
 ```
 
-ولا يستخدم Relay إلا إذا لم يكن direct صالحاً.
+And the relay is used only when direct is not viable.
 
 ---
 
 # 43. Hysteresis
 
-يجب منع:
+The following must be prevented:
 
 ```text
 Direct
@@ -1240,9 +1238,9 @@ Relay
 ...
 ```
 
-بسبب jitter.
+due to jitter.
 
-استخدم:
+Use:
 
 ```text
 failure threshold
@@ -1250,7 +1248,7 @@ success threshold
 cooldown
 ```
 
-مثلاً:
+For example:
 
 ```text
 3 consecutive direct failures
@@ -1260,11 +1258,11 @@ cooldown
 → direct
 ```
 
-الأرقام النهائية تحتاج benchmark.
+The final numbers need benchmarking.
 
 ---
 
-# 44. Relay session lifecycle
+# 44. The relay session lifecycle
 
 ```text
 Create
@@ -1292,9 +1290,9 @@ Close
 
 # 45. Relay discovery
 
-هناك عدة خيارات:
+There are several options:
 
-### A. Controller يعطي relay endpoint
+### A. The controller provides the relay endpoint
 
 ```text
 NetworkConfigResponse
@@ -1302,29 +1300,29 @@ NetworkConfigResponse
 RelayEndpoint
 ```
 
-### B. Client لديه relay endpoint ثابت
+### B. The client has a fixed relay endpoint
 
 ```text
 relay.endpoint
 ```
 
-### C. External ZGALAXY يوفر relay discovery API
+### C. The external ZGALAXY offers a relay discovery API
 
-وهذا يحتاج فحصاً وتنفيذاً منفصلاً.
+This needs a separate examination and implementation.
 
-الأنسب للـ MVP:
+The most suitable for the MVP:
 
 ```text
 configured relay endpoint
 ```
 
-ثم لاحقاً Controller-managed relay discovery.
+then, later, controller-managed relay discovery.
 
 ---
 
 # 46. Relay authorization
 
-يجب أن يستطيع Relay معرفة:
+The relay must be able to know:
 
 ```text
 PeerID
@@ -1333,13 +1331,13 @@ membership
 token/credential
 ```
 
-لكن لا يحتاج إلى قراءة data payload.
+but it does not need to read the data payload.
 
 ---
 
 # 47. E2E security
 
-الهدف:
+The goal:
 
 ```text
 Peer A
@@ -1353,7 +1351,7 @@ Relay
 Peer B
 ```
 
-Relay يرى فقط metadata الضرورية:
+The relay sees only the necessary metadata:
 
 ```text
 source session
@@ -1362,13 +1360,13 @@ packet size
 timing
 ```
 
-وليس payload plaintext.
+and not the plaintext payload.
 
 ---
 
 # 48. DoS protection
 
-Relay يجب أن يفرض:
+The relay must enforce:
 
 ```text
 max connections
@@ -1379,7 +1377,7 @@ packet rate limit
 max payload
 ```
 
-ولا يسمح:
+and must not allow:
 
 ```text
 unauthenticated arbitrary forwarding
@@ -1389,7 +1387,7 @@ unauthenticated arbitrary forwarding
 
 # 49. Relay observability
 
-يجب تسجيل:
+The following must be recorded:
 
 ```text
 relay sessions
@@ -1401,13 +1399,13 @@ reason for fallback
 direct recovery
 ```
 
-لكن لا تسجل plaintext packets.
+but plaintext packets must not be logged.
 
 ---
 
-# 50. أهم metrics في Client
+# 50. The most important client-side metrics
 
-يجب إضافة:
+The following must be added:
 
 ```text
 direct_attempts
@@ -1422,15 +1420,15 @@ transport_failures
 
 ---
 
-# 51. API/debug endpoint
+# 51. The API/debug endpoint
 
-يفضل إضافة حالة:
+It is preferable to add a state for:
 
 ```text
 /peer
 ```
 
-أو endpoint داخلي يعرض:
+or an internal endpoint showing:
 
 ```json
 {
@@ -1442,7 +1440,7 @@ transport_failures
 }
 ```
 
-وعند Relay:
+And under relay:
 
 ```json
 {
@@ -1453,13 +1451,13 @@ transport_failures
 }
 ```
 
-مع الحفاظ على backward compatibility للـ API الحالي.
+while preserving backward compatibility with the current API.
 
 ---
 
-# 52. Main.rs refactoring
+# 52. The main.rs refactoring
 
-الهدف النهائي:
+The end goal:
 
 ```rust
 let transport = build_transport(config).await?;
@@ -1467,7 +1465,7 @@ let path_manager = PathManager::new(...);
 let control_engine = ControlEngine::new(...);
 ```
 
-ثم event loop عام:
+then a generic event loop:
 
 ```rust
 while let Some(event) = transport.next_event().await {
@@ -1475,11 +1473,11 @@ while let Some(event) = transport.next_event().await {
 }
 ```
 
-ولا يحتوي `main.rs` على QUIC-specific controller handling.
+And `main.rs` contains no QUIC-specific controller handling.
 
 ---
 
-# 53. الملفات المقترحة
+# 53. The proposed files
 
 ```text
 src/
@@ -1517,33 +1515,33 @@ src/
 
 ---
 
-# 54. لا تحذف `src/transport.rs`
+# 54. Do not delete `src/transport.rs`
 
-يجب التمييز بين:
+A distinction must be made between:
 
 ```text
 src/transport.rs
 ```
 
-و:
+and:
 
 ```text
 src/transport/gtp.rs
 ```
 
-الأول legacy/native UDP wire transport.
+The former is the legacy/native UDP wire transport.
 
-الثاني GTP Mesh Transport.
+The latter is the GTP mesh transport.
 
-يمكن لاحقاً إعادة تسمية الملفات لتقليل الالتباس، لكن لا ينبغي تنفيذ rename كبير بالتزامن مع GTP.
+The files can later be renamed to reduce confusion, but a large rename should not be performed simultaneously with the GTP work.
 
 ---
 
-# 55. مراحل التنفيذ
+# 55. Implementation phases
 
 ## Phase 0 — Repository audit
 
-افحص:
+Examine:
 
 ```text
 ZGALAXY
@@ -1551,7 +1549,7 @@ zgalaxy-rs
 GTP-rs
 ```
 
-مع توثيق:
+documenting:
 
 ```text
 control
@@ -1567,19 +1565,19 @@ API
 
 ## Phase 1 — Control extraction
 
-انقل:
+Move:
 
 ```text
 ControlMessage
 ```
 
-إلى module مستقل.
+into an independent module.
 
 ---
 
 ## Phase 2 — Transport abstraction
 
-أنشئ:
+Create:
 
 ```text
 MeshTransport
@@ -1589,17 +1587,17 @@ TransportCapabilities
 
 ---
 
-## Phase 3 — QUIC adapter
+## Phase 3 — The QUIC adapter
 
-اجعل QUIC يعمل عبر abstraction بدون تغيير behavior.
+Make QUIC work through the abstraction without a behavior change.
 
-هذه مرحلة إلزامية قبل GTP.
+This is a mandatory phase before GTP.
 
 ---
 
 ## Phase 4 — ControlEngine
 
-انقل:
+Move:
 
 ```text
 NodeAnnounce
@@ -1610,13 +1608,13 @@ NetworkConfigResponse
 Ping/Pong
 ```
 
-خارج `main.rs`.
+out of `main.rs`.
 
 ---
 
 ## Phase 5 — PathManager
 
-أضف:
+Add:
 
 ```text
 DirectPath
@@ -1625,25 +1623,25 @@ PathState
 PathPolicy
 ```
 
-لكن يمكن في البداية تنفيذ Relay mock/in-process للاختبار.
+Initially a mock/in-process relay can be used for testing.
 
 ---
 
 ## Phase 6 — NAT decoupling
 
-اجعل NAT يتعامل مع:
+Make NAT deal with:
 
 ```text
 PathManager
 ```
 
-وليس QUIC مباشرة.
+rather than QUIC directly.
 
 ---
 
 ## Phase 7 — GTP-rs
 
-أضف dependency واختبر:
+Add the dependency and test:
 
 ```text
 runtime
@@ -1654,21 +1652,21 @@ reliable
 path APIs
 ```
 
-لا تعتمد على API مفترض.
+Do not rely on an assumed API.
 
 ---
 
 ## Phase 8 — Direct GTP
 
-نفذ:
+Implement:
 
 ```text
 Peer A → GTP → Peer B
 ```
 
-بدون Relay أولاً.
+without a relay first.
 
-يجب إثبات:
+The following must be proven:
 
 ```text
 identity
@@ -1680,9 +1678,9 @@ NAT
 
 ---
 
-## Phase 9 — GTP Controller mode
+## Phase 9 — GTP controller mode
 
-اختبر:
+Test:
 
 ```text
 GTP Client
@@ -1692,7 +1690,7 @@ GTP
 zgalaxy-rs EmbeddedController
 ```
 
-مع:
+with:
 
 ```text
 NetworkConfigRequest
@@ -1700,21 +1698,21 @@ NetworkConfigRequest
 
 ---
 
-## Phase 10 — Relay server
+## Phase 10 — The relay server
 
-أضف:
+Add:
 
 ```text
 RelayService
 ```
 
-إما داخل `zgalaxy-rs` controller mode أو binary مستقل، حسب deployment requirements.
+either inside `zgalaxy-rs` controller mode or as a standalone binary, per deployment requirements.
 
 ---
 
 ## Phase 11 — Relay over QUIC
 
-أثبت:
+Prove:
 
 ```text
 Peer A → QUIC Relay → Peer B
@@ -1724,7 +1722,7 @@ Peer A → QUIC Relay → Peer B
 
 ## Phase 12 — Relay over GTP
 
-ثم:
+Then:
 
 ```text
 Peer A → GTP Relay → Peer B
@@ -1734,7 +1732,7 @@ Peer A → GTP Relay → Peer B
 
 ## Phase 13 — Automatic fallback
 
-نفذ:
+Implement:
 
 ```text
 Direct first
@@ -1746,7 +1744,7 @@ Direct first
 
 ## Phase 14 — Recovery
 
-نفذ:
+Implement:
 
 ```text
 Relay
@@ -1758,7 +1756,7 @@ Relay
 
 ---
 
-# 56. الاختبارات الأساسية
+# 56. The core tests
 
 ## Test 1 — Direct QUIC
 
@@ -1836,7 +1834,7 @@ Client → Relay → EmbeddedController
 
 # 57. Network fault injection
 
-اختبر:
+Test:
 
 ```text
 packet loss:
@@ -1860,7 +1858,7 @@ temporary firewall block
 
 # 58. GTP benchmarks
 
-قارن:
+Compare:
 
 ```text
 QUIC Direct
@@ -1889,7 +1887,7 @@ recovery time
 
 # 59. Security tests
 
-اختبر:
+Test:
 
 ```text
 invalid NodeAnnounce
@@ -1905,7 +1903,7 @@ GTP replay
 connection flood
 ```
 
-النتيجة:
+The expected result:
 
 ```text
 reject
@@ -1916,11 +1914,11 @@ no authorization bypass
 
 ---
 
-# 60. Migration strategy
+# 60. The migration strategy
 
-لا تجمع كل التغييرات في commit واحد.
+Do not bundle every change into one commit.
 
-المقترح:
+The proposal:
 
 ```text
 1. ControlMessage extraction
@@ -1943,9 +1941,9 @@ no authorization bypass
 
 ---
 
-# 61. قرار مهم: Relay ليس Transport ثالثاً
+# 61. A key decision: the relay is not a third transport
 
-لا نريد:
+We do not want:
 
 ```text
 QUIC
@@ -1953,9 +1951,9 @@ GTP
 Relay
 ```
 
-كأنها ثلاثة transports متساوية.
+as three equal transports.
 
-التصميم الصحيح:
+The correct design:
 
 ```text
 Path
@@ -1970,13 +1968,13 @@ Path
         └── GTP
 ```
 
-هذا يزيل الالتباس بالكامل.
+This removes the confusion entirely.
 
 ---
 
-# 62. قرار مهم: Controller ليس Relay
+# 62. A key decision: the controller is not the relay
 
-التصميم:
+The design:
 
 ```text
 EmbeddedController
@@ -1988,13 +1986,13 @@ RelayService
 data forwarding
 ```
 
-يمكن تشغيلهما في نفس process، لكنهما modules منفصلة.
+They can run in the same process, but they are separate modules.
 
 ---
 
-# 63. قرار مهم: GTP ليس مسؤولاً عن fallback
+# 63. A key decision: GTP is not responsible for fallback
 
-لا:
+Not:
 
 ```text
 GtpTransport
@@ -2004,7 +2002,7 @@ if failed
 Relay
 ```
 
-بل:
+but:
 
 ```text
 PathManager
@@ -2016,7 +2014,7 @@ choose Relay
 Relay GTP
 ```
 
-وبالمثل:
+and likewise:
 
 ```text
 Direct QUIC failed
@@ -2026,21 +2024,21 @@ Relay QUIC
 
 ---
 
-# 64. قرار مهم: Direct هو الحالة الطبيعية
+# 64. A key decision: Direct is the normal state
 
-الـ relay يجب أن يكون:
+The relay must be:
 
 ```text
 fallback
 ```
 
-وليس:
+and not:
 
 ```text
 default topology
 ```
 
-لأسباب:
+for the reasons:
 
 ```text
 latency
@@ -2052,9 +2050,9 @@ privacy
 
 ---
 
-# 65. قرار مهم: Relay لا يفك التشفير
+# 65. A key decision: the relay does not decrypt
 
-الهدف:
+The goal:
 
 ```text
 E2E:
@@ -2065,13 +2063,13 @@ Peer A ===================== Peer B
              opaque
 ```
 
-وهذا يقلل trust requirements على Relay.
+This reduces the trust requirements on the relay.
 
 ---
 
-# 66. GTP وRelay: أفضل صيغة
+# 66. GTP and the relay: the best shape
 
-الهدف النهائي:
+The end goal:
 
 ```text
                     PathManager
@@ -2090,7 +2088,7 @@ Peer A ===================== Peer B
           Peer B                    Relay
 ```
 
-وبذلك يمكن مستقبلاً إضافة:
+With this, one can later add:
 
 ```text
 WebSocket relay
@@ -2098,15 +2096,15 @@ TCP relay
 another transport
 ```
 
-من دون إعادة تصميم الـ Client.
+without redesigning the client.
 
 ---
 
-# 67. هل نحتاج تعديل ZGALAXY؟
+# 67. Do we need to modify ZGALAXY?
 
-ليس كشرط لإضافة GTP إلى `zgalaxy-rs`.
+Not as a condition for adding GTP to `zgalaxy-rs`.
 
-لكن إذا كان المطلوب:
+But if the requirement is:
 
 ```text
 ZGALAXY external service
@@ -2116,9 +2114,9 @@ Relay discovery
 Relay allocation
 ```
 
-فهذا مشروع integration منفصل.
+then that is a separate integration project.
 
-يجب أولاً فحص API والبنية الفعلية لـ `ZGALAXY` وإثبات وجود/غياب:
+The actual ZGALAXY API and structure must first be examined, proving the presence or absence of:
 
 ```text
 relay allocation
@@ -2127,13 +2125,13 @@ peer rendezvous
 relay authentication
 ```
 
-ولا ينبغي افتراض وجودها من مجرد اسم المشروع.
+Their existence must not be assumed from the project name alone.
 
 ---
 
-# 68. القرار المعماري النهائي
+# 68. The final architectural decision
 
-التصميم الذي ينبغي اعتماده:
+The design to adopt:
 
 ```text
                           ┌──────────────────┐
@@ -2179,28 +2177,28 @@ relay authentication
 
 ---
 
-# 69. الخلاصة التنفيذية
+# 69. The executive conclusion
 
-المشروع المطلوب ليس:
-
-```text
-"إضافة GTP إلى QUIC"
-```
-
-ولا:
+The required project is not:
 
 ```text
-"استبدال QUIC بـ GTP"
+"adding GTP to QUIC"
 ```
 
-بل:
+nor:
 
 ```text
-إعادة فصل architecture الخاصة بـ zgalaxy-rs
-بحيث يصبح transport/path مستقلاً عن ZGalaxy semantics.
+"replacing QUIC with GTP"
 ```
 
-ثم:
+but:
+
+```text
+Re-separating the zgalaxy-rs architecture
+so that transport/path becomes independent of ZGalaxy semantics.
+```
+
+Then:
 
 ```text
 QUIC ─────────┐
@@ -2216,9 +2214,9 @@ GTP ──────────┘
        (first)             (fallback)
 ```
 
-وبالتالي يصبح السيناريو النهائي:
+Thus the final scenarios become:
 
-### الحالة الطبيعية
+### The normal state
 
 ```text
 Peer A
@@ -2228,7 +2226,7 @@ Peer A
 Peer B
 ```
 
-### إذا فشل GTP direct
+### If direct GTP fails
 
 ```text
 Peer A
@@ -2242,7 +2240,7 @@ Relay
 Peer B
 ```
 
-### إذا كان GTP غير متاح لكن QUIC متاح
+### If GTP is unavailable but QUIC is available
 
 ```text
 Peer A
@@ -2252,7 +2250,7 @@ Peer A
 Peer B
 ```
 
-### إذا فشل Direct بالكامل
+### If Direct fails entirely
 
 ```text
 Peer A
@@ -2266,7 +2264,7 @@ Relay
 Peer B
 ```
 
-### وإذا عاد Direct
+### And if Direct returns
 
 ```text
 Relay
@@ -2281,67 +2279,67 @@ Traffic migrates to Direct
 Relay session closes
 ```
 
-**هذه هي البنية التي أوصي باعتمادها كهدف معماري رسمي للمشروع.**
+**This is the structure I recommend adopting as the official architectural goal of the project.**
 
 ---
 
-# 70. المصادر
+# 70. Sources
 
 ## `zgalaxy-rs`
 
-- Repository:  
+- Repository:
   https://github.com/dreamzone-cc/zgalaxy-rs
 
-- Architecture:  
+- Architecture:
   https://raw.githubusercontent.com/dreamzone-cc/zgalaxy-rs/main/ARCHITECTURE.md
 
-- Embedded Controller:  
+- Embedded Controller:
   https://raw.githubusercontent.com/dreamzone-cc/zgalaxy-rs/main/src/controller.rs
 
-- Main daemon/event loop:  
+- Main daemon/event loop:
   https://raw.githubusercontent.com/dreamzone-cc/zgalaxy-rs/main/src/main.rs
 
-- QUIC implementation:  
+- QUIC implementation:
   https://raw.githubusercontent.com/dreamzone-cc/zgalaxy-rs/main/src/quic.rs
 
-- NAT:  
+- NAT:
   https://raw.githubusercontent.com/dreamzone-cc/zgalaxy-rs/main/src/nat.rs
 
-- Peer Manager:  
+- Peer Manager:
   https://raw.githubusercontent.com/dreamzone-cc/zgalaxy-rs/main/src/peer.rs
 
-- Legacy UDP transport:  
+- Legacy UDP transport:
   https://raw.githubusercontent.com/dreamzone-cc/zgalaxy-rs/main/src/transport.rs
 
 ---
 
 ## `GTP-rs`
 
-- Repository:  
+- Repository:
   https://github.com/dreamzone-cc/GTP-rs
 
-- README:  
+- README:
   https://raw.githubusercontent.com/dreamzone-cc/GTP-rs/main/README.md
 
-المراجع المستخدمة لفهم delivery modes، loss recovery، congestion control، priority scheduling، AEAD، path validation، NAT rebinding/path migration وTokio integration.
+References used to understand delivery modes, loss recovery, congestion control, priority scheduling, AEAD, path validation, NAT rebinding/path migration, and Tokio integration.
 
 ---
 
 ## `ZGALAXY`
 
-- Repository:  
+- Repository:
   https://github.com/dreamzone-cc/ZGALAXY
 
-هذا المستودع منفصل عن `zgalaxy-rs`. يجب عدم افتراض أن وجود `ZGALAXY` يعني وجود Relay Data Plane فيه إلا بعد إثبات ذلك من الكود/API الفعلي.
+This repository is separate from `zgalaxy-rs`. The existence of `ZGALAXY` must not be taken to mean it contains a relay data plane until that is proven from the actual code/API.
 
 ---
 
-## مراجع تصميمية إضافية
+## Additional design references
 
-استخدمت أيضاً نماذج Relay/P2P الحديثة للتحقق من مبدأ:
+Modern relay/P2P models were also used to validate the principle:
 
 ```text
 Direct preferred → Relay fallback
 ```
 
-ومنها NetBird الذي يعرّف Relay client لإدارة connections إلى peers عبر relay، ومشاريع P2P التي تستخدم direct-first ثم relay fallback. هذه المراجع **ليست مصدراً لخصائص ZGALAXY نفسها**، وإنما مرجع لتصميم نمط الـ fallback. 
+including NetBird, which defines a relay client managing connections to peers via a relay, and P2P projects that use direct-first then relay fallback. These references are **not a source for the characteristics of ZGALAXY itself**, but a reference for designing the fallback pattern.
