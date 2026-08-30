@@ -180,7 +180,17 @@ impl AckTracker {
         false
     }
 
-    pub fn generate_ack_frame(&mut self, now: MonotonicTime) -> Option<Frame<'static>> {
+    /// Builds the ACK frame **without** touching tracker state.
+    ///
+    /// R-3: `generate_ack_frame` used to clear `unacked_packet_count`/`has_gap` and
+    /// advance `last_ack_sent_time` before the caller knew whether the frame actually
+    /// made it into a datagram that was successfully sealed and sent. Any later
+    /// early-return (encode failure, anti-amplification rejection, seal error) then
+    /// destroyed acknowledgements the peer never received, forcing spurious
+    /// retransmissions. Callers must now `peek_ack_frame` and only `commit_ack_sent`
+    /// once the datagram is on its way — the same check/commit split already used by
+    /// `ReplayWindow`.
+    pub fn peek_ack_frame(&self, now: MonotonicTime) -> Option<Frame<'static>> {
         let largest = self.largest_received?;
         let ack_delay_us = now.duration_since(self.largest_received_time).as_micros() as u32;
 
@@ -188,7 +198,6 @@ impl AckTracker {
         let mut range_count = 0;
 
         if !self.intervals.is_empty() {
-            // First range: Largest Acked down to first interval start
             let first = self.intervals[0];
             let first_len = (first.end - first.start) as u32;
             ranges[0] = AckRange {
@@ -207,10 +216,6 @@ impl AckTracker {
             }
         }
 
-        self.unacked_packet_count = 0;
-        self.has_gap = false;
-        self.last_ack_sent_time = Some(now);
-
         Some(Frame::Ack {
             largest_acked: largest,
             ack_delay_us,
@@ -220,6 +225,24 @@ impl AckTracker {
             ect1_count: self.ect1_count,
             ce_count: self.ce_count,
         })
+    }
+
+    /// Records that an ACK frame produced by [`Self::peek_ack_frame`] was actually
+    /// transmitted. Only then is the pending-acknowledgement state cleared.
+    pub fn commit_ack_sent(&mut self, now: MonotonicTime) {
+        self.unacked_packet_count = 0;
+        self.has_gap = false;
+        self.last_ack_sent_time = Some(now);
+    }
+
+    /// Convenience wrapper: peek + immediate commit.
+    ///
+    /// Only safe when the caller is certain the frame will be transmitted. The
+    /// connection engine uses the explicit peek/commit pair instead.
+    pub fn generate_ack_frame(&mut self, now: MonotonicTime) -> Option<Frame<'static>> {
+        let frame = self.peek_ack_frame(now)?;
+        self.commit_ack_sent(now);
+        Some(frame)
     }
 }
 
@@ -333,5 +356,31 @@ mod tests {
         patient.set_policy(1, Duration::from_millis(25));
         patient.on_packet_received(PacketNumber(2), true, 0, t0);
         assert!(patient.should_send_ack(t0));
+    }
+
+    #[test]
+    fn peek_does_not_consume_pending_ack_state() {
+        // R-3: building the frame must be free of side effects, so a datagram that
+        // is never transmitted cannot destroy acknowledgements the peer needs.
+        let mut tracker = AckTracker::new();
+        let now = MonotonicTime::from_micros(1_000_000);
+
+        tracker.on_packet_received(PacketNumber(1), true, 0, now);
+        tracker.on_packet_received(PacketNumber(2), true, 0, now);
+        assert!(tracker.should_send_ack(now));
+
+        // Peeking twice yields the same frame and leaves the ACK still pending.
+        let first = tracker.peek_ack_frame(now);
+        let second = tracker.peek_ack_frame(now);
+        assert!(first.is_some());
+        assert_eq!(first, second);
+        assert!(
+            tracker.should_send_ack(now),
+            "peek must not clear the pending acknowledgement"
+        );
+
+        // Only an explicit commit clears it.
+        tracker.commit_ack_sent(now);
+        assert!(!tracker.should_send_ack(now));
     }
 }

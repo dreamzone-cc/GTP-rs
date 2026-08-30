@@ -297,11 +297,21 @@ impl LossDetector {
     /// retransmittable records — at most `MAX_PTO_RETRANSMIT_BURST` of them — and
     /// **remove** them from the outstanding set so each PTO fires a bounded burst
     /// instead of re-enqueueing the entire window every period.
+    ///
+    /// R-1: the drained records leave `sent_packets`, so they can never later be
+    /// acknowledged (`bytes_acked`) nor declared lost (`bytes_lost`). Their bytes
+    /// are therefore reported here as `bytes_lost` so the congestion controller can
+    /// settle the in-flight debt. `lost_packets` stays empty on purpose: a PTO is a
+    /// probe, not a loss declaration, and every controller gates
+    /// `on_congestion_event` on `!lost_packets.is_empty()`. Without this the
+    /// controller's `inflight` ratchets up permanently and `cwnd - inflight`
+    /// collapses to zero for the rest of the connection.
     pub fn on_timeout(&mut self, _now: MonotonicTime) -> LossEvent {
         self.pto_count = self.pto_count.saturating_add(1);
 
         let mut retransmittable = Vec::new();
         let mut drained: Vec<u64> = Vec::new();
+        let mut bytes_drained: usize = 0;
 
         for (&pn, record) in &self.sent_packets {
             if drained.len() >= MAX_PTO_RETRANSMIT_BURST {
@@ -313,6 +323,7 @@ impl LossDetector {
             for frame in &record.retransmittable_frames {
                 retransmittable.push(frame.clone());
             }
+            bytes_drained = bytes_drained.saturating_add(record.bytes);
             drained.push(pn);
         }
 
@@ -322,7 +333,7 @@ impl LossDetector {
 
         LossEvent {
             lost_packets: Vec::new(),
-            bytes_lost: 0,
+            bytes_lost: bytes_drained,
             retransmittable,
         }
     }
@@ -603,5 +614,38 @@ mod tests {
         assert!(detector.pto_count >= MAX_PTO_BACKOFF_EXPONENT);
         let capped = detector.pto_duration_with_backoff(Duration::from_millis(500));
         assert_eq!(capped, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn pto_drain_reports_bytes_for_congestion_settlement() {
+        // R-1: `on_timeout` removes the drained records from `sent_packets`, so no
+        // later ACK or loss sweep can ever repay their in-flight debt. The event must
+        // therefore carry those bytes, while leaving `lost_packets` empty so no extra
+        // congestion event fires on top of the timeout.
+        let mut detector = LossDetector::new();
+        let now = MonotonicTime::from_micros(1_000_000);
+
+        for pn in 1..=2u64 {
+            detector.on_packet_sent(SentPacketRecord {
+                packet_number: PacketNumber(pn),
+                send_time: now,
+                bytes: 100,
+                ack_eliciting: true,
+                in_flight: true,
+                retransmittable_frames: Vec::new(),
+            });
+        }
+        assert_eq!(detector.inflight_bytes(), 200);
+
+        let ev = detector.on_timeout(now);
+        assert_eq!(
+            ev.bytes_lost, 200,
+            "drained bytes must be reported to the controller"
+        );
+        assert!(
+            ev.lost_packets.is_empty(),
+            "a PTO is a probe, not a loss declaration"
+        );
+        assert_eq!(detector.inflight_bytes(), 0);
     }
 }

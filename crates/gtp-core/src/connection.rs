@@ -4,7 +4,7 @@ use crate::state::{ConnectionCold, ConnectionHot, OutgoingControlFrame};
 use gtp_cc::{calculate_backpressure, BackpressureLevel, CongestionController};
 use gtp_crypto::DirectionalKeys;
 use gtp_recovery::{RetransmissionRecord, SentPacketRecord};
-use gtp_scheduler::{OrderedGroupReceiver, SchedulableItem};
+use gtp_scheduler::{GameScheduler, OrderedGroupReceiver, SchedulableItem};
 use gtp_types::{
     ConnectionId, FragmentId, GenerationId, MessageClass, MessageId, MonotonicTime, OrderedGroupId,
     PriorityTier, Result, StateKey, StateSequence, TransmissionId, TransportError,
@@ -269,14 +269,39 @@ impl GtpConnection {
         let (aad_slice, encrypted_payload) = datagram.split_at_mut(header_consumed);
         let ciphertext_len = encrypted_payload.len();
 
-        let mut open_result = self.hot.rx_protector.open(
-            header.packet_number,
-            header.connection_id,
-            aad_slice,
-            encrypted_payload,
-            ciphertext_len,
-        );
+        // R-8: pick the key from the wire KEY_PHASE bit instead of trying both
+        // blindly. Blind double-trying doubled the AEAD cost of every junk packet
+        // (a cheap DoS amplifier) and silently depended on the AEAD verifying the
+        // Poly1305 tag *before* applying the keystream. The single fallback attempt
+        // below still tolerates a peer that has not rotated yet and reordering
+        // across the rotation boundary; it is safe for the same documented reason,
+        // which `failed_open_leaves_buffer_intact` now pins down as a test.
+        let prefer_prev = header.flags.key_phase() != self.hot.key_phase;
+        let mut open_result: Result<usize> = Err(TransportError::CryptoFailure);
+
+        if prefer_prev {
+            if let Some(prev) = self.hot.rx_protector_prev.as_ref() {
+                open_result = prev.open(
+                    header.packet_number,
+                    header.connection_id,
+                    aad_slice,
+                    encrypted_payload,
+                    ciphertext_len,
+                );
+            }
+        }
+
         if open_result.is_err() {
+            open_result = self.hot.rx_protector.open(
+                header.packet_number,
+                header.connection_id,
+                aad_slice,
+                encrypted_payload,
+                ciphertext_len,
+            );
+        }
+
+        if open_result.is_err() && !prefer_prev {
             if let Some(prev) = self.hot.rx_protector_prev.as_ref() {
                 open_result = prev.open(
                     header.packet_number,
@@ -294,6 +319,8 @@ impl GtpConnection {
                 self.hot.replay_window.commit(header.packet_number);
                 // A legitimate authenticated packet proves peer reachability.
                 self.hot.anti_amplification.mark_validated();
+                // R-6: age the post-ratchet grace window on the receive path too.
+                self.hot.tick_rx_key_grace();
                 len
             }
             Err(e) => {
@@ -579,6 +606,25 @@ impl GtpConnection {
     // TX Pipeline
     // ==========================================
 
+    /// Returns items that were popped for a datagram which was never transmitted.
+    ///
+    /// R-4/R-5: every early return after `pop_next` funnels through here, and the
+    /// scheduler's `requeue` path bypasses the supersession gate so a re-admitted
+    /// sequenced item is not silently dropped. Reversed iteration restores the
+    /// original head-of-queue order.
+    fn requeue_popped(
+        scheduler: &mut GameScheduler,
+        popped: Vec<SchedulableItem>,
+        now: MonotonicTime,
+        cold: &mut ConnectionCold,
+    ) {
+        for item in popped.into_iter().rev() {
+            if scheduler.requeue(item, now).is_err() {
+                cold.total_dropped_frames += 1;
+            }
+        }
+    }
+
     pub fn produce_outgoing_datagram(
         &mut self,
         now: MonotonicTime,
@@ -616,6 +662,11 @@ impl GtpConnection {
             if now.duration_since(self.hot.loss_detector.time_of_last_ack_eliciting_packet) >= pto {
                 let loss_ev = self.hot.loss_detector.on_timeout(now);
                 self.hot.cc.on_timeout(now);
+                // R-1: settle the in-flight debt for records the PTO sweep drained.
+                // They are gone from `sent_packets`, so no future ACK or loss sweep
+                // can ever repay them. `lost_packets` is empty, so this does NOT
+                // trigger an extra congestion event on top of `on_timeout`.
+                self.hot.cc.on_loss(&loss_ev, now);
 
                 self.event_queue.push(ControlEvent::PtoTriggered {
                     pto_count: self.hot.loss_detector.pto_count,
@@ -678,10 +729,27 @@ impl GtpConnection {
         // PATH-5: a control frame directed at a specific address sends alone.
         let mut override_dest: Option<SocketAddr> = None;
 
-        // 3. Attach ACK Frame if needed
-        if should_ack {
-            if let Some(ack_frame) = self.hot.ack_tracker.generate_ack_frame(now) {
-                let _ = builder.append_frame(&ack_frame);
+        // R-7: a control frame aimed at an address other than the active path takes
+        // the whole datagram and is sent there. An ACK must never ride along: the
+        // real peer would never receive it, and our packet-number state would leak
+        // to an address that has not completed path validation.
+        let directed_ahead = matches!(
+            self.hot.control_queue.front(),
+            Some(
+                OutgoingControlFrame::PathResponse { dest, .. }
+                    | OutgoingControlFrame::PathChallenge { dest, .. },
+            ) if *dest != self.hot.active_path
+        );
+
+        // 3. Attach ACK Frame if needed.
+        // R-3: peek only — the tracker is committed in step 8, after the datagram
+        // has actually been sealed and accepted for transmission.
+        let mut ack_appended = false;
+        if should_ack && !directed_ahead {
+            if let Some(ack_frame) = self.hot.ack_tracker.peek_ack_frame(now) {
+                if builder.append_frame(&ack_frame).is_ok() {
+                    ack_appended = true;
+                }
             }
         }
 
@@ -728,7 +796,11 @@ impl GtpConnection {
                         if encoded.is_err() {
                             // D-2: never silently drop a frame that was popped —
                             // requeue it for the next datagram and stop filling.
-                            let _ = self.hot.scheduler.enqueue(item, now);
+                            // R-5: `requeue` (not `enqueue`) so the supersession gate
+                            // cannot discard the item we are trying to preserve.
+                            if self.hot.scheduler.requeue(item, now).is_err() {
+                                self.cold.total_dropped_frames += 1;
+                            }
                             break;
                         }
                         ack_eliciting = true;
@@ -739,16 +811,26 @@ impl GtpConnection {
             }
         }
 
-        // 5. Finalize unencrypted header & calculate final payload length including tag
-        let unencrypted_len = builder.finish()?;
+        // 5. Finalize unencrypted header & calculate final payload length including tag.
+        // R-4: every failure path from here on must return the popped items to the
+        // scheduler — a bare `?` would drop reliable messages that were already
+        // removed from their queue but never transmitted.
+        // Bind the result first: a borrow of `self` living inside a `match` scrutinee
+        // would collide with the `&mut self` needed by the requeue path.
+        let finish_result = builder.finish();
+        let unencrypted_len = match finish_result {
+            Ok(len) => len,
+            Err(e) => {
+                Self::requeue_popped(&mut self.hot.scheduler, popped, now, &mut self.cold);
+                return Err(e);
+            }
+        };
         let header_len = MIN_COMMON_HEADER_LEN;
         let unsealed_payload_len = unencrypted_len - header_len;
         let final_payload_len = unsealed_payload_len + self.hot.tx_protector.tag_len();
         if final_payload_len > u16::MAX as usize {
             // WIR-3: reject instead of truncating the declared length.
-            for item in popped.into_iter().rev() {
-                let _ = self.hot.scheduler.enqueue(item, now);
-            }
+            Self::requeue_popped(&mut self.hot.scheduler, popped, now, &mut self.cold);
             return Err(TransportError::BufferOverflow);
         }
 
@@ -758,22 +840,28 @@ impl GtpConnection {
 
         // 6. Seal Payload with AEAD (TX direction protector — SEC-1)
         let (aad_slice, payload_slice) = out_buf.split_at_mut(header_len);
-        let sealed_payload_len = self.hot.tx_protector.seal(
+        let seal_result = self.hot.tx_protector.seal(
             pn,
             self.hot.connection_id,
             &aad_slice[..header_len],
             payload_slice,
             unsealed_payload_len,
-        )?;
+        );
+        let sealed_payload_len = match seal_result {
+            Ok(len) => len,
+            Err(e) => {
+                // R-4: a seal failure must not swallow the popped items either.
+                Self::requeue_popped(&mut self.hot.scheduler, popped, now, &mut self.cold);
+                return Err(e);
+            }
+        };
 
         let total_datagram_len = header_len + sealed_payload_len;
 
         // Check Anti-Amplification Limiter — on rejection, every popped item is
         // re-queued; nothing reliable is lost to the gate.
         if !self.hot.anti_amplification.can_send(total_datagram_len) {
-            for item in popped.into_iter().rev() {
-                let _ = self.hot.scheduler.enqueue(item, now);
-            }
+            Self::requeue_popped(&mut self.hot.scheduler, popped, now, &mut self.cold);
             return Ok(None);
         }
         self.hot
@@ -802,13 +890,26 @@ impl GtpConnection {
         self.cold.total_tx_packets += 1;
         self.cold.total_tx_bytes += total_datagram_len as u64;
 
+        // 8. R-3: the datagram is on its way — only now is the acknowledgement
+        // state considered delivered to the peer.
+        if ack_appended {
+            self.hot.ack_tracker.commit_ack_sent(now);
+        }
+
+        // R-6: retire the pre-ratchet RX key once the grace window has elapsed so a
+        // compromised old key cannot be used to inject packets for the rest of the
+        // session, and so the retired material is dropped (and zeroized) promptly.
+        self.hot.tick_rx_key_grace();
+
         let dest = override_dest.unwrap_or(self.hot.active_path);
         Ok(Some((dest, total_datagram_len)))
     }
     fn build_control_frame(ctrl: &OutgoingControlFrame) -> Frame<'_> {
         match ctrl {
             OutgoingControlFrame::Ping { nonce } => Frame::Ping { nonce: *nonce },
-            OutgoingControlFrame::PathChallenge { data, .. } => Frame::PathChallenge { data: *data },
+            OutgoingControlFrame::PathChallenge { data, .. } => {
+                Frame::PathChallenge { data: *data }
+            }
             OutgoingControlFrame::PathResponse { data, .. } => Frame::PathResponse { data: *data },
             OutgoingControlFrame::MtuProbe {
                 probe_id,
@@ -1127,7 +1228,11 @@ mod tests {
         let total = 24 + sealed_len;
 
         let d = server
-            .handle_incoming_datagram("127.0.0.1:5000".parse().unwrap(), &mut late_buf[..total], now)
+            .handle_incoming_datagram(
+                "127.0.0.1:5000".parse().unwrap(),
+                &mut late_buf[..total],
+                now,
+            )
             .unwrap();
         assert!(
             d.is_empty(),
@@ -1229,7 +1334,9 @@ mod tests {
             .unwrap();
 
         // KEY_PHASE advertised on the sealed header
-        let header = gtp_wire::PacketHeader::decode(&post_buf[..post_len]).unwrap().0;
+        let header = gtp_wire::PacketHeader::decode(&post_buf[..post_len])
+            .unwrap()
+            .0;
         assert!(header.flags.key_phase());
 
         let delivered = server
@@ -1276,7 +1383,10 @@ mod tests {
             .produce_outgoing_datagram(now, &mut out)
             .unwrap()
             .unwrap();
-        assert_eq!(dest, new_server_addr, "challenge must target the new address");
+        assert_eq!(
+            dest, new_server_addr,
+            "challenge must target the new address"
+        );
 
         let client_active_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
@@ -1403,5 +1513,270 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    // ==========================================
+    // R-6 / R-7 regression helpers
+    // ==========================================
+
+    /// The sealing material a test wants to forge a datagram with — captured before
+    /// a ratchet so it can be replayed after the key was supposed to be retired.
+    struct CraftedSeal {
+        cid: ConnectionId,
+        key: [u8; 32],
+        iv: [u8; 12],
+        key_phase: bool,
+    }
+
+    /// Seals a plain-unreliable datagram with an EXPLICIT key/IV/key-phase, exactly
+    /// as a peer's TX path would. Lets a test replay traffic under a key the
+    /// connection is supposed to have retired.
+    fn craft_datagram(
+        seal: &CraftedSeal,
+        pn: gtp_types::PacketNumber,
+        payload: &[u8],
+        now: MonotonicTime,
+        buf: &mut [u8],
+    ) -> usize {
+        let CraftedSeal {
+            cid,
+            key,
+            iv,
+            key_phase,
+        } = *seal;
+        let frame = Frame::Data {
+            message_id: MessageId(9_000),
+            state_key: StateKey::default(),
+            sequence: StateSequence::default(),
+            generation: GenerationId::default(),
+            deadline_ms: 0,
+            payload,
+        };
+        let mut header = PacketHeader::new_short(cid, pn, now.as_micros() as u32, 0);
+        header.flags.set_key_phase(key_phase);
+        let mut builder = PacketBuilder::new(buf, header).unwrap();
+        builder.append_frame(&frame).unwrap();
+        let unsealed = builder.finish().unwrap();
+
+        let hdr = MIN_COMMON_HEADER_LEN;
+        let declared = (unsealed - hdr + gtp_crypto::AEAD_TAG_LEN) as u16;
+        buf[hdr - 2..hdr].copy_from_slice(&declared.to_be_bytes());
+
+        let aad = buf[..hdr].to_vec();
+        let protector = gtp_crypto::GtpAeadProtector::new(key, iv);
+        let sealed = gtp_crypto::PacketProtector::seal(
+            &protector,
+            pn,
+            cid,
+            &aad,
+            &mut buf[hdr..],
+            unsealed - hdr,
+        )
+        .unwrap();
+        hdr + sealed
+    }
+
+    /// Opens a datagram produced by `conn` and lists the frame kinds it carries.
+    fn opened_frame_kinds(datagram: &mut [u8], key: [u8; 32], iv: [u8; 12]) -> Vec<&'static str> {
+        let (header, consumed) = PacketHeader::decode(datagram).unwrap();
+        let (aad, payload) = datagram.split_at_mut(consumed);
+        let ciphertext_len = payload.len();
+        let protector = gtp_crypto::GtpAeadProtector::new(key, iv);
+        let plain_len = gtp_crypto::PacketProtector::open(
+            &protector,
+            header.packet_number,
+            header.connection_id,
+            aad,
+            payload,
+            ciphertext_len,
+        )
+        .expect("test must be able to open the datagram it just produced");
+
+        FrameIterator::new(&payload[..plain_len])
+            .filter_map(|f| f.ok())
+            .map(|f| match f {
+                Frame::Ack { .. } => "Ack",
+                Frame::Data { .. } => "Data",
+                Frame::PathChallenge { .. } => "PathChallenge",
+                Frame::PathResponse { .. } => "PathResponse",
+                _ => "Other",
+            })
+            .collect()
+    }
+
+    /// R-6: the pre-ratchet RX key must be accepted only for a bounded grace window.
+    ///
+    /// Before the fix `rx_protector_prev` was set at the ratchet and never cleared,
+    /// so a leaked old key stayed valid for injection for the rest of the session and
+    /// the ratchet delivered no forward secrecy at all.
+    #[test]
+    fn previous_rx_key_is_retired_after_grace_window() {
+        use crate::state::RX_PREV_KEY_GRACE_PACKETS;
+
+        let cid = ConnectionId(0x8AC6_0000_0000_0009);
+        let (mut client, mut server) = loopback_pair(cid);
+        let mut now = MonotonicTime::from_micros(9_000_000);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Keys in force BEFORE the rotation — the material an attacker would leak.
+        let leaked = CraftedSeal {
+            cid,
+            key: client.hot.tx_key,
+            iv: client.hot.tx_iv,
+            key_phase: client.hot.key_phase,
+        };
+
+        client.control().ratchet_key();
+        server.control().ratchet_key();
+        assert!(server.hot.rx_protector_prev.is_some());
+        assert_eq!(server.hot.rx_prev_grace_packets, RX_PREV_KEY_GRACE_PACKETS);
+
+        // 1. Inside the window the retired key is still honoured (in-flight packets
+        //    sealed just before the rotation must not be dropped).
+        let mut old_buf = [0u8; 1500];
+        let pn = client.hot.next_packet_number;
+        let old_len = craft_datagram(&leaked, pn, b"in_flight_at_rotation", now, &mut old_buf);
+        // The crafted datagram consumed the client's packet number.
+        client.hot.next_packet_number = gtp_types::PacketNumber(pn.as_u64() + 1);
+
+        let delivered = server
+            .handle_incoming_datagram(client_addr, &mut old_buf[..old_len], now)
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].payload, b"in_flight_at_rotation");
+        assert_eq!(
+            server.hot.rx_prev_grace_packets,
+            RX_PREV_KEY_GRACE_PACKETS - 1,
+            "every processed datagram must age the grace window"
+        );
+
+        // 2. Drive the window down to exactly one remaining datagram with ordinary
+        //    post-ratchet traffic — this is what proves the tick is WIRED into the
+        //    receive path, not merely present as a method.
+        let mut buf = [0u8; 1500];
+        for _ in 0..(RX_PREV_KEY_GRACE_PACKETS - 2) {
+            now += Duration::from_millis(5);
+            client
+                .send_unreliable(b"tick".to_vec(), PriorityTier::P1Input, None, now)
+                .unwrap();
+            let (_, len) = client
+                .produce_outgoing_datagram(now, &mut buf)
+                .unwrap()
+                .expect("client must keep producing datagrams");
+            server
+                .handle_incoming_datagram(client_addr, &mut buf[..len], now)
+                .unwrap();
+        }
+        assert_eq!(server.hot.rx_prev_grace_packets, 1);
+        assert!(server.hot.rx_protector_prev.is_some());
+
+        // 3. One more datagram exhausts the window: the old protector is dropped
+        //    (which zeroizes its key material).
+        now += Duration::from_millis(5);
+        client
+            .send_unreliable(b"last".to_vec(), PriorityTier::P1Input, None, now)
+            .unwrap();
+        let (_, len) = client
+            .produce_outgoing_datagram(now, &mut buf)
+            .unwrap()
+            .unwrap();
+        server
+            .handle_incoming_datagram(client_addr, &mut buf[..len], now)
+            .unwrap();
+        assert!(
+            server.hot.rx_protector_prev.is_none(),
+            "the pre-ratchet RX key must be retired once the grace window elapses"
+        );
+
+        // 4. A packet sealed with the leaked old key is now rejected outright.
+        let mut replay_buf = [0u8; 1500];
+        let replay_pn = client.hot.next_packet_number;
+        let replay_len = craft_datagram(
+            &leaked,
+            replay_pn,
+            b"injected_with_leaked_key",
+            now,
+            &mut replay_buf,
+        );
+        let res = server.handle_incoming_datagram(client_addr, &mut replay_buf[..replay_len], now);
+        assert!(
+            matches!(res, Err(TransportError::CryptoFailure)),
+            "a retired key must no longer authenticate injected packets, got {res:?}"
+        );
+    }
+
+    /// R-7: a datagram directed at an address other than the active path must not
+    /// carry an ACK, and the pending ACK state must survive for the real peer.
+    ///
+    /// Before the fix the ACK was appended in step 3 and its tracker state consumed
+    /// there too, so the acknowledgement was shipped to the challenged address —
+    /// leaking our packet-number state to an unvalidated peer — and the genuine peer
+    /// never received it, nor could it be regenerated.
+    #[test]
+    fn directed_control_frame_carries_no_ack() {
+        let cid = ConnectionId(0xD16E_0000_0000_000A);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(10_000_000);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let probe_addr: SocketAddr = "127.0.0.1:5100".parse().unwrap();
+
+        // 1. Traffic from the client leaves the server owing an ACK.
+        client
+            .send_unreliable(b"input".to_vec(), PriorityTier::P1Input, None, now)
+            .unwrap();
+        let mut buf = [0u8; 1500];
+        let (_, len) = client
+            .produce_outgoing_datagram(now, &mut buf)
+            .unwrap()
+            .unwrap();
+        server
+            .handle_incoming_datagram(client_addr, &mut buf[..len], now)
+            .unwrap();
+        assert!(server.hot.ack_tracker.should_send_ack(now));
+
+        // 2. The server probes a DIFFERENT address; that datagram is directed.
+        server
+            .control()
+            .trigger_path_challenge(probe_addr, [0x5A; 8], now)
+            .unwrap();
+        let mut out = [0u8; 1500];
+        let (dest, out_len) = server
+            .produce_outgoing_datagram(now, &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            dest, probe_addr,
+            "the challenge must target the probed address"
+        );
+
+        let kinds = opened_frame_kinds(&mut out[..out_len], server.hot.tx_key, server.hot.tx_iv);
+        assert!(
+            kinds.contains(&"PathChallenge"),
+            "the directed datagram must carry the challenge, got {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"Ack"),
+            "an ACK must never ride on a datagram sent off the active path, got {kinds:?}"
+        );
+
+        // 3. The ACK state is intact, so the next datagram to the real peer carries it.
+        assert!(
+            server.hot.ack_tracker.should_send_ack(now),
+            "the pending ACK must survive a datagram that never carried it"
+        );
+        let (dest2, len2) = server
+            .produce_outgoing_datagram(now, &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(dest2, client_addr);
+        let kinds2 = opened_frame_kinds(&mut out[..len2], server.hot.tx_key, server.hot.tx_iv);
+        assert!(
+            kinds2.contains(&"Ack"),
+            "the deferred ACK must reach the genuine peer, got {kinds2:?}"
+        );
+        assert!(
+            !server.hot.ack_tracker.should_send_ack(now),
+            "the ACK is only committed once it is actually on the wire"
+        );
     }
 }

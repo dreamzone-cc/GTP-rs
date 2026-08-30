@@ -358,4 +358,28 @@ mod tests {
         assert_eq!(cubic.cwnd(), 50_000);
         assert_eq!(cubic.min_cwnd_bytes, 10_000);
     }
+
+    #[test]
+    fn pto_drained_bytes_leave_the_inflight_counter() {
+        // R-1: without settling the drained bytes, `inflight` ratchets up for the
+        // rest of the connection and `cwnd - inflight` collapses to zero, stalling
+        // the sender permanently even after the path recovers.
+        let mut cubic = CubicCongestionController::new(1200);
+        let now = MonotonicTime::from_micros(1_000_000);
+
+        cubic.on_packet_sent(PacketNumber(1), 1200, now);
+        cubic.on_packet_sent(PacketNumber(2), 1200, now);
+        assert_eq!(cubic.inflight(), 2400);
+
+        cubic.on_timeout(now);
+        let drained = LossEvent {
+            lost_packets: Vec::new(),
+            bytes_lost: 2400,
+            retransmittable: Vec::new(),
+        };
+        cubic.on_loss(&drained, now);
+
+        assert_eq!(cubic.inflight(), 0);
+        assert!(cubic.cwnd() > 0);
+    }
 }

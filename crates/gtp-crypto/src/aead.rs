@@ -3,6 +3,7 @@ use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use core::fmt;
 use gtp_types::{ConnectionId, PacketNumber, Result, TransportError};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const AEAD_TAG_LEN: usize = 16;
 
@@ -12,7 +13,9 @@ pub const AEAD_TAG_LEN: usize = 16;
 /// mixed into nonce bytes 4..12, so packet numbers 1 and 2^32+1 can never collide.
 /// The key itself is already CID-scoped via HKDF info, and direction-scoped by the
 /// handshake key schedule (see `derive_directional_handshake_session_keys`).
-#[derive(Clone)]
+/// R-6: the key material is wiped when the protector is dropped, so a retired
+/// pre-ratchet key does not linger in freed memory and undercut forward secrecy.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct GtpAeadProtector {
     key: [u8; 32],
     iv: [u8; 12],
@@ -208,6 +211,46 @@ mod tests {
             usize::MAX,
         );
         assert!(res.is_err());
+    }
+
+    /// R-8: the key-phase fallback in the receive path tries a second protector on
+    /// the SAME buffer after the first attempt failed. That is only sound because a
+    /// failed `open` verifies the Poly1305 tag before touching the ciphertext and
+    /// therefore leaves the buffer byte-identical. This test pins that dependency on
+    /// `chacha20poly1305` down so a crate upgrade that changed it would fail here
+    /// instead of silently corrupting every packet that takes the fallback path.
+    #[test]
+    fn failed_open_leaves_buffer_intact() {
+        let protector_a = GtpAeadProtector::new([0x11u8; 32], [0x22u8; 12]);
+        let protector_b = GtpAeadProtector::new([0x33u8; 32], [0x22u8; 12]);
+
+        let cid = ConnectionId(0x0BAD_0BAD_0BAD_0BAD);
+        let pn = PacketNumber(7);
+        let aad = b"short_header_aad";
+        let plaintext = b"state_update_seq=91_hp=68";
+
+        let mut buffer = [0u8; 128];
+        buffer[..plaintext.len()].copy_from_slice(plaintext);
+        let sealed_len = protector_a
+            .seal(pn, cid, aad, &mut buffer, plaintext.len())
+            .unwrap();
+
+        let sealed_snapshot = buffer;
+
+        // Wrong key: must fail WITHOUT mutating a single byte of the buffer.
+        assert!(protector_b
+            .open(pn, cid, aad, &mut buffer, sealed_len)
+            .is_err());
+        assert_eq!(
+            buffer, sealed_snapshot,
+            "a failed open must not apply the keystream to the buffer"
+        );
+
+        // Same buffer, correct key: the fallback attempt still recovers the plaintext.
+        let opened_len = protector_a
+            .open(pn, cid, aad, &mut buffer, sealed_len)
+            .unwrap();
+        assert_eq!(&buffer[..opened_len], plaintext);
     }
 
     /// SEC-14: Debug formatting must not leak key material.

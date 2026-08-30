@@ -79,6 +79,32 @@ impl GameScheduler {
         Ok(())
     }
 
+    /// Re-admits an item that was already popped for transmission but could not be sent.
+    ///
+    /// R-5: `enqueue` re-runs the supersession gate, and a requeued
+    /// `UnreliableSequenced` item carries the exact `(state_key, generation,
+    /// sequence)` already recorded in the state table. `should_admit` uses strict
+    /// "strictly newer" semantics, so the item would be silently discarded by the
+    /// very path meant to preserve it. Requeue skips that gate — the table already
+    /// reflects this message — and restores the item at the head of its tier so the
+    /// original transmission order is preserved.
+    pub fn requeue(&mut self, item: SchedulableItem, now: MonotonicTime) -> Result<()> {
+        if item.is_expired(now) {
+            return Err(TransportError::MessageExpired);
+        }
+
+        let tier_idx = item.priority as usize;
+        let current_tier_bytes: usize = self.queues[tier_idx].iter().map(|i| i.size_bytes()).sum();
+        if current_tier_bytes + item.size_bytes() > self.max_queue_bytes_per_tier {
+            return Err(TransportError::ResourceLimitExceeded(
+                "Scheduler queue tier capacity reached",
+            ));
+        }
+
+        self.queues[tier_idx].push_front(item);
+        Ok(())
+    }
+
     pub fn pop_next(&mut self, send_budget: usize, now: MonotonicTime) -> Option<SchedulableItem> {
         if send_budget == 0 {
             return None;

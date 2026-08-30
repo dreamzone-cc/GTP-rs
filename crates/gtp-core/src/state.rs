@@ -80,6 +80,12 @@ impl DeliveredIndex {
     }
 }
 
+/// Number of datagrams for which the pre-ratchet RX key stays acceptable (R-6).
+///
+/// Wide enough to absorb reordering and in-flight packets around a key rotation,
+/// short enough that a leaked old key stops being useful almost immediately.
+pub const RX_PREV_KEY_GRACE_PACKETS: u32 = 256;
+
 /// Hot connection state: protocol engine fields for the inner send/receive loops.
 pub struct ConnectionHot {
     pub connection_id: ConnectionId,
@@ -104,6 +110,13 @@ pub struct ConnectionHot {
     pub rx_protector: Protector,
     /// Previous RX key retained for a grace window across a key ratchet (P2-5).
     pub rx_protector_prev: Option<Protector>,
+    /// Remaining datagrams for which `rx_protector_prev` stays acceptable.
+    ///
+    /// R-6: the retained key used to live for the rest of the connection, which
+    /// meant a compromised pre-ratchet key could inject packets forever and the
+    /// ratchet delivered no forward secrecy at all. The grace window is now finite;
+    /// when it expires the protector is dropped (and its key zeroized).
+    pub rx_prev_grace_packets: u32,
     pub tx_key: [u8; 32],
     pub rx_key: [u8; 32],
     pub tx_iv: [u8; 12],
@@ -179,7 +192,9 @@ impl ConnectionHot {
             )
         };
 
-        Self::build(cid, peer_addr, tx, rx, None, tx_key, rx_key, tx_iv, rx_iv, false, true)
+        Self::build(
+            cid, peer_addr, tx, rx, None, tx_key, rx_key, tx_iv, rx_iv, false, true,
+        )
     }
 
     /// Builds a connection from directional handshake keys (SEC-1): `as_client`
@@ -297,6 +312,7 @@ impl ConnectionHot {
             tx_protector,
             rx_protector,
             rx_protector_prev,
+            rx_prev_grace_packets: 0,
             tx_key,
             rx_key,
             tx_iv,
@@ -329,6 +345,7 @@ impl ConnectionHot {
             Protector::Aead(GtpAeadProtector::new(new_rx_key, new_rx_iv)),
         );
         self.rx_protector_prev = Some(old_rx);
+        self.rx_prev_grace_packets = RX_PREV_KEY_GRACE_PACKETS;
         self.tx_protector = Protector::Aead(GtpAeadProtector::new(new_tx_key, new_tx_iv));
         self.tx_key = new_tx_key;
         self.rx_key = new_rx_key;
@@ -336,6 +353,20 @@ impl ConnectionHot {
         self.rx_iv = new_rx_iv;
         self.key_phase = !self.key_phase;
         self.packets_since_ratchet = 0;
+    }
+
+    /// Consumes one unit of the post-ratchet grace window and retires the previous
+    /// RX key when it runs out (R-6). Called once per processed datagram in each
+    /// direction so the window covers reordering across roughly one RTT of traffic.
+    pub fn tick_rx_key_grace(&mut self) {
+        if self.rx_protector_prev.is_none() {
+            return;
+        }
+        self.rx_prev_grace_packets = self.rx_prev_grace_packets.saturating_sub(1);
+        if self.rx_prev_grace_packets == 0 {
+            // Dropping the protector zeroizes the retired key material.
+            self.rx_protector_prev = None;
+        }
     }
 }
 

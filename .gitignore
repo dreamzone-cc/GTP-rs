@@ -16,3 +16,7 @@
 Thumbs.db
 # Machine-local Arabic documentation originals (kept out of the repository per docs policy)
 arabic-local/
+
+# Machine-local remediation review artifacts (same docs policy as arabic-local/)
+fixes/
+files.zip

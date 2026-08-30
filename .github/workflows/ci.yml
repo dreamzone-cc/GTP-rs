@@ -60,3 +60,29 @@ jobs:
 
       - name: Run Deterministic Simulation Benchmark
         run: cargo run -p gtp-cli -- sim-benchmark --ticks 500
+
+  fuzz_smoke:
+    name: Fuzz smoke (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # WIR-12: the `fuzz` package is deliberately kept OUT of the workspace
+      # members (libfuzzer-sys needs nightly and would break the stable jobs),
+      # which meant the fuzz targets were never built and could rot unnoticed.
+      # This job builds and briefly runs them on every push instead.
+      - name: Set up nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+
+      - name: Run decode_frame
+        run: cargo +nightly fuzz run decode_frame -- -max_total_time=120
+
+      - name: Run handshake_frames
+        run: cargo +nightly fuzz run handshake_frames -- -max_total_time=120
