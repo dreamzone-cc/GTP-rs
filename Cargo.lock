@@ -289,6 +289,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -432,6 +433,8 @@ version = "0.2.0"
 dependencies = [
  "gtp-types",
  "gtp-wire",
+ "hmac",
+ "sha2",
  "subtle",
 ]
 
@@ -1061,6 +1064,7 @@ checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
 dependencies = [
  "curve25519-dalek",
  "rand_core",
+ "zeroize",
 ]
 
 [[package]]

@@ -30,6 +30,7 @@ impl ConnectionState {
         match (*self, next) {
             (Self::Initial, Self::Handshaking)
             | (Self::Initial, Self::Validated)
+            | (Self::Initial, Self::Closed) // PATH-1: a failed handshake must be closable
             | (Self::Handshaking, Self::Validated)
             | (Self::Validated, Self::Established)
             | (Self::Established, Self::Draining)

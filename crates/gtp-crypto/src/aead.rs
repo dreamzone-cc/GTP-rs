@@ -1,12 +1,18 @@
 use crate::protector::PacketProtector;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
+use core::fmt;
 use gtp_types::{ConnectionId, PacketNumber, Result, TransportError};
 
 pub const AEAD_TAG_LEN: usize = 16;
 
 /// Production ChaCha20-Poly1305 AEAD packet protector with deterministic 96-bit Nonce derivation.
-#[derive(Clone, Debug)]
+///
+/// The nonce is `IV ⊕ (CID_be[0..4] ‖ PN_be[0..8])`: the full 64-bit packet number is
+/// mixed into nonce bytes 4..12, so packet numbers 1 and 2^32+1 can never collide.
+/// The key itself is already CID-scoped via HKDF info, and direction-scoped by the
+/// handshake key schedule (see `derive_directional_handshake_session_keys`).
+#[derive(Clone)]
 pub struct GtpAeadProtector {
     key: [u8; 32],
     iv: [u8; 12],
@@ -17,19 +23,29 @@ impl GtpAeadProtector {
         Self { key, iv }
     }
 
-    /// Derives 96-bit unique nonce from base IV XOR (ConnectionID || PacketNumber).
+    /// Derives 96-bit unique nonce from base IV XOR (CID ‖ full 64-bit PacketNumber).
     pub fn derive_nonce(&self, cid: ConnectionId, pn: PacketNumber) -> [u8; 12] {
         let mut nonce = self.iv;
         let cid_bytes = cid.to_be_bytes();
         let pn_bytes = pn.as_u64().to_be_bytes();
 
-        for i in 0..8 {
+        for i in 0..4 {
             nonce[i] ^= cid_bytes[i];
         }
-        for i in 0..4 {
-            nonce[8 + i] ^= pn_bytes[4 + i];
+        for i in 0..8 {
+            nonce[4 + i] ^= pn_bytes[i];
         }
         nonce
+    }
+}
+
+impl fmt::Debug for GtpAeadProtector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redacted: never expose live key material through Debug formatting.
+        f.debug_struct("GtpAeadProtector")
+            .field("key", &"[REDACTED; 32 bytes]")
+            .field("iv", &"[REDACTED; 12 bytes]")
+            .finish()
     }
 }
 
@@ -42,7 +58,10 @@ impl PacketProtector for GtpAeadProtector {
         payload: &mut [u8],
         payload_len: usize,
     ) -> Result<usize> {
-        if payload.len() < payload_len + AEAD_TAG_LEN {
+        let needed = payload_len
+            .checked_add(AEAD_TAG_LEN)
+            .ok_or(TransportError::BufferOverflow)?;
+        if payload.len() < needed {
             return Err(TransportError::BufferOverflow);
         }
 
@@ -157,5 +176,46 @@ mod tests {
         let tampered_aad = b"authenticated_header_tampered";
         let res_aad_tamper = protector.open(pn, cid, tampered_aad, &mut buffer, sealed_len);
         assert!(res_aad_tamper.is_err());
+    }
+
+    /// SEC-2: packet numbers 1 and 2^32+1 must produce distinct nonces.
+    #[test]
+    fn nonce_uses_full_packet_number() {
+        let protector = GtpAeadProtector::new([7u8; 32], [9u8; 12]);
+        let cid = ConnectionId(0xDEAD_BEEF_1234_5678);
+
+        let n1 = protector.derive_nonce(cid, PacketNumber(1));
+        let n_hi = protector.derive_nonce(cid, PacketNumber(1 + (1u64 << 32)));
+        assert_ne!(n1, n_hi);
+
+        // Injectivity across the full 64-bit space for a couple of wrap edges
+        assert_ne!(
+            protector.derive_nonce(cid, PacketNumber(0)),
+            protector.derive_nonce(cid, PacketNumber(u64::MAX))
+        );
+    }
+
+    /// SEC-10: oversized payload_len must return an error, never panic.
+    #[test]
+    fn seal_rejects_overflowing_payload_len() {
+        let protector = GtpAeadProtector::new([1u8; 32], [2u8; 12]);
+        let mut buf = [0u8; 64];
+        let res = protector.seal(
+            PacketNumber(1),
+            ConnectionId(1),
+            b"aad",
+            &mut buf,
+            usize::MAX,
+        );
+        assert!(res.is_err());
+    }
+
+    /// SEC-14: Debug formatting must not leak key material.
+    #[test]
+    fn debug_does_not_leak_keys() {
+        let protector = GtpAeadProtector::new([0xABu8; 32], [0xCDu8; 12]);
+        let rendered = format!("{:?}", protector);
+        assert!(!rendered.contains("171")); // 0xAB decimal
+        assert!(rendered.contains("REDACTED"));
     }
 }

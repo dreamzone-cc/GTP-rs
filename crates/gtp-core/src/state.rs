@@ -1,15 +1,86 @@
-use gtp_cc::{CubicCongestionController, PacingEngine};
+use gtp_cc::{CubicConfig, CubicCongestionController, PacingEngine, PacingEngineConfig};
 use gtp_crypto::{
-    derive_session_keys, GtpAeadProtector, PlaintextProtector, Protector, ReplayWindow,
+    derive_directional_session_keys, ratchet_key, DirectionalKeys, GtpAeadProtector,
+    PlaintextProtector, Protector, ReplayWindow,
 };
 use gtp_path::{AntiAmplificationLimiter, ConnectionState, PathValidator};
 use gtp_recovery::{AckTracker, LossDetector};
-use gtp_scheduler::{GameScheduler, OrderedGroupReceiver};
+use gtp_scheduler::{GameScheduler, OrderedGroupReceiver, StateTable};
 use gtp_types::{ConnectionId, MonotonicTime, PacketNumber};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 
-/// Hot connection state: cache-line optimized for inner send/receive loops.
+/// A protocol control frame queued for transmission as a real frame — never wrapped
+/// inside `Frame::Data` (Core-C1 fix). `dest` overrides the active path when the
+/// frame must answer a specific source address (e.g. PathResponse to a challenger).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutgoingControlFrame {
+    Ping {
+        nonce: u64,
+    },
+    PathChallenge {
+        data: [u8; 8],
+        /// Routing target: a challenge probes the NEW address, so it must be sent
+        /// there rather than along the current active path.
+        dest: SocketAddr,
+    },
+    PathResponse {
+        data: [u8; 8],
+        dest: SocketAddr,
+    },
+    MtuProbe {
+        probe_id: u32,
+        padding_len: usize,
+    },
+    AckFrequency {
+        ack_frequency_packets: u8,
+        max_ack_delay_ms: u16,
+        reorder_threshold: u8,
+    },
+    Close {
+        error_code: u16,
+        reason: String,
+    },
+}
+
+/// Bounded FIFO index of recently delivered reliable message ids (ORD-4): blocks
+/// duplicate delivery of `ReliableUnordered` payloads when loss detection or PTO
+/// re-enqueues the same message.
+#[derive(Debug, Default)]
+pub struct DeliveredIndex {
+    seen: FxHashSet<u64>,
+    order: VecDeque<u64>,
+    capacity: usize,
+}
+
+impl DeliveredIndex {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            seen: FxHashSet::default(),
+            order: VecDeque::with_capacity(capacity.min(1024)),
+            capacity: capacity.max(16),
+        }
+    }
+
+    /// Returns `true` when the key was NOT seen before and is now recorded;
+    /// `false` when it is a duplicate.
+    pub fn insert_if_new(&mut self, key: u64) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+        self.seen.insert(key);
+        self.order.push_back(key);
+        while self.order.len() > self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+}
+
+/// Hot connection state: protocol engine fields for the inner send/receive loops.
 pub struct ConnectionHot {
     pub connection_id: ConnectionId,
     pub next_packet_number: PacketNumber,
@@ -22,19 +93,36 @@ pub struct ConnectionHot {
     pub pacing: PacingEngine,
     pub scheduler: GameScheduler,
     pub ordered_groups: FxHashMap<u16, OrderedGroupReceiver>,
+    /// RX-side freshness table (SEM-2): drops late sequenced state at the receiver.
+    pub rx_state_table: StateTable,
+    /// ReliableUnordered duplicate-delivery guard (ORD-4).
+    pub delivered_index: DeliveredIndex,
     pub replay_window: ReplayWindow,
-    pub protector: Protector,
+    /// Seals outgoing packets (this endpoint's TX direction only).
+    pub tx_protector: Protector,
+    /// Opens incoming packets (the peer's TX direction).
+    pub rx_protector: Protector,
+    /// Previous RX key retained for a grace window across a key ratchet (P2-5).
+    pub rx_protector_prev: Option<Protector>,
+    pub tx_key: [u8; 32],
+    pub rx_key: [u8; 32],
+    pub tx_iv: [u8; 12],
+    pub rx_iv: [u8; 12],
+    pub key_phase: bool,
+    /// Protocol control frames awaiting transmission (Core-C1 fix).
+    pub control_queue: VecDeque<OutgoingControlFrame>,
+    /// Set once the CLOSE frame has been encoded into an outgoing datagram.
+    pub close_frame_sent: bool,
     pub anti_amplification: AntiAmplificationLimiter,
     pub path_validator: PathValidator,
     pub next_message_id: u64,
     pub next_order_seqs: FxHashMap<u16, u32>,
-    pub current_session_key: [u8; 32],
     pub packets_since_ratchet: u64,
 }
 
 impl ConnectionHot {
     #[deprecated(
-        note = "Uses a hardcoded shared secret; use the handshake-driven GtpEndpoint::connect which derives real per-session keys via X25519. Only safe for offline gtp-sim testing with secure=false."
+        note = "Uses a hardcoded shared secret; use the handshake-driven GtpEndpoint::connect which derives real per-session keys via X25519. Only safe for offline gtp-sim testing."
     )]
     pub fn new(cid: ConnectionId, peer_addr: SocketAddr, secure: bool) -> Self {
         #[allow(deprecated)]
@@ -43,17 +131,129 @@ impl ConnectionHot {
             peer_addr,
             secure,
             b"gtp_default_session_master_secret_2026",
+            true,
         )
     }
 
-    pub fn new_with_session_keys(
+    #[deprecated(
+        note = "Uses a hardcoded shared secret; use the handshake-driven GtpEndpoint::connect which derives real per-session keys via X25519. Only safe for offline gtp-sim testing."
+    )]
+    pub fn new_with_master_secret(
         cid: ConnectionId,
         peer_addr: SocketAddr,
-        key: [u8; 32],
-        iv: [u8; 12],
+        secure: bool,
+        master_secret: &[u8],
+        as_client: bool,
+    ) -> Self {
+        let (tx, rx, tx_key, rx_key, tx_iv, rx_iv) = if secure {
+            // SEC-1: even the legacy path derives per-direction keys so packet
+            // number N never collides on the same (key, nonce) in both directions.
+            let dirs = derive_directional_session_keys(master_secret, cid);
+            let (tx, rx) = if as_client {
+                (
+                    (dirs.client_tx_key, dirs.client_tx_iv),
+                    (dirs.server_tx_key, dirs.server_tx_iv),
+                )
+            } else {
+                (
+                    (dirs.server_tx_key, dirs.server_tx_iv),
+                    (dirs.client_tx_key, dirs.client_tx_iv),
+                )
+            };
+            (
+                Protector::Aead(GtpAeadProtector::new(tx.0, tx.1)),
+                Protector::Aead(GtpAeadProtector::new(rx.0, rx.1)),
+                tx.0,
+                rx.0,
+                tx.1,
+                rx.1,
+            )
+        } else {
+            (
+                Protector::Plaintext(PlaintextProtector),
+                Protector::Plaintext(PlaintextProtector),
+                [0u8; 32],
+                [0u8; 32],
+                [0u8; 12],
+                [0u8; 12],
+            )
+        };
+
+        Self::build(cid, peer_addr, tx, rx, None, tx_key, rx_key, tx_iv, rx_iv, false, true)
+    }
+
+    /// Builds a connection from directional handshake keys (SEC-1): `as_client`
+    /// selects which direction this endpoint seals with.
+    pub fn new_with_directional_keys(
+        cid: ConnectionId,
+        peer_addr: SocketAddr,
+        keys: &DirectionalKeys,
+        as_client: bool,
         pre_validated: bool,
     ) -> Self {
-        let protector = Protector::Aead(GtpAeadProtector::new(key, iv));
+        let ((tx_key, tx_iv), (rx_key, rx_iv)) = keys.for_role(as_client);
+        Self::build(
+            cid,
+            peer_addr,
+            Protector::Aead(GtpAeadProtector::new(tx_key, tx_iv)),
+            Protector::Aead(GtpAeadProtector::new(rx_key, rx_iv)),
+            None,
+            tx_key,
+            rx_key,
+            tx_iv,
+            rx_iv,
+            false,
+            pre_validated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        cid: ConnectionId,
+        peer_addr: SocketAddr,
+        tx_protector: Protector,
+        rx_protector: Protector,
+        rx_protector_prev: Option<Protector>,
+        tx_key: [u8; 32],
+        rx_key: [u8; 32],
+        tx_iv: [u8; 12],
+        rx_iv: [u8; 12],
+        key_phase: bool,
+        pre_validated: bool,
+    ) -> Self {
+        let config = crate::control::config::GtpConfig::default();
+        Self::build_with_config(
+            cid,
+            peer_addr,
+            tx_protector,
+            rx_protector,
+            rx_protector_prev,
+            tx_key,
+            rx_key,
+            tx_iv,
+            rx_iv,
+            key_phase,
+            pre_validated,
+            &config,
+        )
+    }
+
+    /// Full constructor honoring `GtpConfig` (P1-2: the tuning surface is live).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_config(
+        cid: ConnectionId,
+        peer_addr: SocketAddr,
+        tx_protector: Protector,
+        rx_protector: Protector,
+        rx_protector_prev: Option<Protector>,
+        tx_key: [u8; 32],
+        rx_key: [u8; 32],
+        tx_iv: [u8; 12],
+        rx_iv: [u8; 12],
+        key_phase: bool,
+        pre_validated: bool,
+        config: &crate::control::config::GtpConfig,
+    ) -> Self {
         let mut anti_amp = AntiAmplificationLimiter::new();
         if pre_validated {
             anti_amp.mark_validated();
@@ -66,70 +266,76 @@ impl ConnectionHot {
             active_path: peer_addr,
             next_send_time: MonotonicTime::ZERO,
             loss_detector: LossDetector::new(),
-            ack_tracker: AckTracker::new(),
-            cc: CubicCongestionController::default(),
-            pacing: PacingEngine::default(),
-            scheduler: GameScheduler::default(),
+            ack_tracker: AckTracker::with_policy(
+                config.ack_frequency_packets,
+                config.max_ack_delay,
+            ),
+            cc: CubicCongestionController::with_config(CubicConfig {
+                smss: config.smss,
+                initial_cwnd_packets: config.initial_cwnd_packets,
+                min_cwnd_packets: config.min_cwnd_packets,
+                beta: config.cubic_beta,
+                c: config.cubic_c,
+                pacing_gain: config.pacing_gain,
+            }),
+            pacing: PacingEngine::with_config(PacingEngineConfig {
+                max_burst_bytes: config.max_pacing_burst_bytes,
+            }),
+            // Per-tier caps are enforced individually in a later phase; the scheduler
+            // currently takes one cap per tier array position via its constructor.
+            scheduler: GameScheduler::new(
+                *config
+                    .max_queue_bytes_per_tier
+                    .iter()
+                    .max()
+                    .unwrap_or(&(512 * 1024)),
+            ),
             ordered_groups: FxHashMap::default(),
+            rx_state_table: StateTable::new(),
+            delivered_index: DeliveredIndex::new(4096),
             replay_window: ReplayWindow::new(),
-            protector,
+            tx_protector,
+            rx_protector,
+            rx_protector_prev,
+            tx_key,
+            rx_key,
+            tx_iv,
+            rx_iv,
+            key_phase,
+            control_queue: VecDeque::new(),
+            close_frame_sent: false,
             anti_amplification: anti_amp,
             path_validator: PathValidator::new(peer_addr),
             next_message_id: 1,
             next_order_seqs: FxHashMap::default(),
-            current_session_key: key,
             packets_since_ratchet: 0,
         }
     }
 
-    /// Rotates the session AEAD encryption key for forward secrecy (Key Phase ratchet).
+    /// Rotates BOTH direction keys in lockstep (SEC-6 / P2-5) and retains the old RX
+    /// key for a grace window. Both peers must invoke this at the same logical point
+    /// (documented limitation until a wire-level key update frame exists).
     pub fn ratchet_session_key(&mut self) {
-        let next_key = gtp_crypto::ratchet_key(&self.current_session_key, self.connection_id);
-        let (_, iv) = derive_session_keys(&next_key, self.connection_id);
-        self.protector = Protector::Aead(GtpAeadProtector::new(next_key, iv));
-        self.current_session_key = next_key;
-        self.packets_since_ratchet = 0;
-    }
-
-    #[deprecated(
-        note = "Uses a hardcoded shared secret; use the handshake-driven GtpEndpoint::connect which derives real per-session keys via X25519. Only safe for offline gtp-sim testing with secure=false."
-    )]
-    pub fn new_with_master_secret(
-        cid: ConnectionId,
-        peer_addr: SocketAddr,
-        secure: bool,
-        master_secret: &[u8],
-    ) -> Self {
-        let (protector, key) = if secure {
-            let (key, iv) = derive_session_keys(master_secret, cid);
-            (Protector::Aead(GtpAeadProtector::new(key, iv)), key)
-        } else {
-            (Protector::Plaintext(PlaintextProtector), [0u8; 32])
-        };
-
-        let anti_amp = AntiAmplificationLimiter::new();
-
-        Self {
-            connection_id: cid,
-            next_packet_number: PacketNumber(1),
-            state: ConnectionState::Established,
-            active_path: peer_addr,
-            next_send_time: MonotonicTime::ZERO,
-            loss_detector: LossDetector::new(),
-            ack_tracker: AckTracker::new(),
-            cc: CubicCongestionController::default(),
-            pacing: PacingEngine::default(),
-            scheduler: GameScheduler::default(),
-            ordered_groups: FxHashMap::default(),
-            replay_window: ReplayWindow::new(),
-            protector,
-            anti_amplification: anti_amp,
-            path_validator: PathValidator::new(peer_addr),
-            next_message_id: 1,
-            next_order_seqs: FxHashMap::default(),
-            current_session_key: key,
-            packets_since_ratchet: 0,
+        if matches!(self.tx_protector, Protector::Plaintext(_)) {
+            return;
         }
+        let new_tx_key = ratchet_key(&self.tx_key, self.connection_id);
+        let new_rx_key = ratchet_key(&self.rx_key, self.connection_id);
+        let new_tx_iv = gtp_crypto::derive_session_keys(&new_tx_key, self.connection_id).1;
+        let new_rx_iv = gtp_crypto::derive_session_keys(&new_rx_key, self.connection_id).1;
+
+        let old_rx = std::mem::replace(
+            &mut self.rx_protector,
+            Protector::Aead(GtpAeadProtector::new(new_rx_key, new_rx_iv)),
+        );
+        self.rx_protector_prev = Some(old_rx);
+        self.tx_protector = Protector::Aead(GtpAeadProtector::new(new_tx_key, new_tx_iv));
+        self.tx_key = new_tx_key;
+        self.rx_key = new_rx_key;
+        self.tx_iv = new_tx_iv;
+        self.rx_iv = new_rx_iv;
+        self.key_phase = !self.key_phase;
+        self.packets_since_ratchet = 0;
     }
 }
 
@@ -144,4 +350,6 @@ pub struct ConnectionCold {
     pub total_retransmissions: u64,
     pub total_spurious_losses: u64,
     pub total_corrupted_packets: u64,
+    pub total_dropped_frames: u64,
+    pub total_duplicate_drops: u64,
 }

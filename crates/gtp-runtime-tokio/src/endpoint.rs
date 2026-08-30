@@ -1,6 +1,6 @@
 use crate::async_connection::AsyncGtpConnection;
 use gtp_core::{GtpConfig, GtpConnection, ReceivedMessage};
-use gtp_crypto::{derive_handshake_session_keys, EphemeralKeyPair};
+use gtp_crypto::{derive_directional_handshake_session_keys, EphemeralKeyPair};
 use gtp_path::StatelessTokenManager;
 use gtp_types::{ConnectionId, MonotonicTime, PacketNumber, Result, TransportError};
 use gtp_wire::frame::{
@@ -158,11 +158,15 @@ impl GtpEndpoint {
             }
         };
 
-        let shared = client_pair.compute_shared_secret(&server_pk);
-        let (key, iv) = derive_handshake_session_keys(&shared, &client_nonce, &server_nonce, cid);
+        let shared = client_pair
+            .compute_shared_secret(&server_pk)
+            .map_err(|_| TransportError::HandshakeFailed("non-contributory server key"))?;
+        let keys =
+            derive_directional_handshake_session_keys(&shared, &client_nonce, &server_nonce, cid);
 
         // 4. Send HandshakeFinish confirmation with Key Confirmation Proof
-        let client_proof = gtp_crypto::compute_client_proof(&key, &client_pk, &server_pk);
+        let client_proof =
+            gtp_crypto::compute_client_proof(&keys.client_tx_key, &client_pk, &server_pk);
         let mut fin_buf = [0u8; 128];
         let fin_hdr = PacketHeader::new_long(1, cid, PacketNumber(1), 0, 0);
         let fin_hdr_len = fin_hdr
@@ -180,11 +184,12 @@ impl GtpEndpoint {
             .send_to(&fin_buf[..fin_hdr_len + fin_frame_len], peer_addr)
             .await;
 
-        let conn = GtpConnection::new_with_session_keys(
+        // SEC-1: the client seals with the client->server direction.
+        let conn = GtpConnection::new_with_directional_keys(
             cid,
             peer_addr,
-            key,
-            iv,
+            &keys,
+            true,
             true,
             GtpConfig::competitive_fps(),
         );
@@ -192,19 +197,20 @@ impl GtpEndpoint {
         Ok(self.register_connection(cid, conn).await)
     }
 
-    pub async fn connect_with_session_keys(
+    /// Registers a connection built from externally supplied directional keys.
+    pub async fn connect_with_directional_keys(
         &self,
         cid: ConnectionId,
         peer_addr: SocketAddr,
-        key: [u8; 32],
-        iv: [u8; 12],
+        keys: &gtp_crypto::DirectionalKeys,
+        as_client: bool,
         pre_validated: bool,
     ) -> AsyncGtpConnection {
-        let conn = GtpConnection::new_with_session_keys(
+        let conn = GtpConnection::new_with_directional_keys(
             cid,
             peer_addr,
-            key,
-            iv,
+            keys,
+            as_client,
             pre_validated,
             GtpConfig::competitive_fps(),
         );
@@ -244,7 +250,24 @@ impl GtpEndpoint {
 
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
-            while let Ok((bytes, src)) = socket.recv_from(&mut buf).await {
+            // P2-1: the RX loop must survive transient socket errors. On UDP sockets,
+            // an ICMP port-unreachable surfaces as ConnectionReset/ConnectionRefused —
+            // a single datagram from a remote host must never kill the endpoint.
+            loop {
+                let recv = socket.recv_from(&mut buf).await;
+                let (bytes, src) = match recv {
+                    Ok(res) => res,
+                    Err(e) => match e.kind() {
+                        std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted => continue,
+                        _ => {
+                            eprintln!("gtp endpoint: RX socket error: {e}");
+                            continue;
+                        }
+                    },
+                };
                 let now = MonotonicTime::now();
                 let datagram = &buf[..bytes];
 
@@ -287,7 +310,7 @@ impl GtpEndpoint {
                                     entry.0 += 1;
                                 }
 
-                                if src.ip().is_loopback() || entry.0 <= 1000 {
+                                if src.ip().is_loopback() || entry.0 <= 20 {
                                     let (server_pk, server_nonce, cookie) = {
                                         let mut psh = pending_server_handshakes.write().await;
                                         // Prune expired handshakes older than 3 seconds
@@ -389,8 +412,12 @@ impl GtpEndpoint {
                                     {
                                         let server_nonce = server_pair.nonce;
                                         let server_pk = server_pair.public_key;
-                                        let shared = server_pair.compute_shared_secret(&client_pk);
-                                        let (key, iv) = derive_handshake_session_keys(
+                                        let Ok(shared) =
+                                            server_pair.compute_shared_secret(&client_pk)
+                                        else {
+                                            continue;
+                                        };
+                                        let keys = derive_directional_handshake_session_keys(
                                             &shared,
                                             &client_nonce,
                                             &server_nonce,
@@ -399,17 +426,18 @@ impl GtpEndpoint {
 
                                         // 2. Cryptographic Key Confirmation: Client & Server derived identical keys
                                         if gtp_crypto::verify_client_proof(
-                                            &key,
+                                            &keys.client_tx_key,
                                             &client_pk,
                                             &server_pk,
                                             &client_proof,
                                         ) {
-                                            // Instantiate verified connection (pre_validated: true)
-                                            let conn = GtpConnection::new_with_session_keys(
+                                            // Instantiate verified connection (pre_validated: true).
+                                            // SEC-1: the server seals with the server->client direction.
+                                            let conn = GtpConnection::new_with_directional_keys(
                                                 cid,
                                                 src,
-                                                key,
-                                                iv,
+                                                &keys,
+                                                false,
                                                 true,
                                                 GtpConfig::competitive_fps(),
                                             );
@@ -453,6 +481,13 @@ impl GtpEndpoint {
                             let _ = tx.send(msg).await;
                         }
                     }
+                    // CORE-4: evict closed connections so routing state does not leak
+                    if guard.hot.state.is_closed() {
+                        drop(guard);
+                        drop(conns);
+                        connections.write().await.remove(&cid);
+                        continue;
+                    }
                 }
             }
         });
@@ -468,7 +503,9 @@ impl GtpEndpoint {
                 let now = MonotonicTime::now();
                 let mut guard = conn_arc.lock().await;
 
-                if !guard.is_active() {
+                // Core-C1: only a fully Closed connection ends the TX loop. A Draining
+                // connection must keep transmitting so its CLOSE frame goes out.
+                if guard.hot.state.is_closed() {
                     break;
                 }
 

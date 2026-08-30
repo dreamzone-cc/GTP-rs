@@ -33,15 +33,26 @@ impl RttStats {
     }
 
     pub fn update(&mut self, send_to_ack_duration: Duration, ack_delay: Duration) {
-        let ack_delay_clamped = ack_delay.min(self.max_ack_delay);
-        let adjusted_rtt = if send_to_ack_duration >= ack_delay_clamped {
-            send_to_ack_duration - ack_delay_clamped
+        // RFC 9002 §5.2: min_rtt is tracked from the *unadjusted* latest sample so a
+        // peer over-reporting ack_delay cannot drag min_rtt (and every derived
+        // quantity) toward zero.
+        let raw_rtt = send_to_ack_duration;
+        self.min_rtt = self.min_rtt.min(raw_rtt);
+
+        // RFC 9002 §5.3: adjust for ack_delay only when the sample exceeds
+        // min_rtt + ack_delay, and never on the first sample (no min_rtt reference yet).
+        let adjusted_rtt = if self.first_sample {
+            raw_rtt
         } else {
-            send_to_ack_duration
+            let ack_delay_clamped = ack_delay.min(self.max_ack_delay);
+            if raw_rtt > self.min_rtt + ack_delay_clamped {
+                raw_rtt - ack_delay_clamped
+            } else {
+                raw_rtt
+            }
         };
 
         self.latest_rtt = adjusted_rtt;
-        self.min_rtt = self.min_rtt.min(adjusted_rtt);
 
         if self.first_sample {
             self.first_sample = false;
@@ -66,7 +77,11 @@ impl RttStats {
     }
 
     pub fn pto_duration(&self) -> Duration {
-        self.smoothed_rtt + Duration::from_micros(self.rttvar.as_micros() * 4) + self.max_ack_delay
+        let pto = self.smoothed_rtt
+            + Duration::from_micros(self.rttvar.as_micros() * 4)
+            + self.max_ack_delay;
+        // RFC 9002 §6.2.1: PTO must never be smaller than the timer granularity.
+        pto.max(Duration::from_millis(1))
     }
 }
 
@@ -79,17 +94,28 @@ mod tests {
         let mut stats = RttStats::new();
         assert!(stats.first_sample);
 
-        // First sample: 50ms with 5ms ack_delay -> adjusted = 45ms
+        // First sample: 50ms — RFC 9002: taken unadjusted (no min_rtt reference yet)
         stats.update(Duration::from_millis(50), Duration::from_millis(5));
-        assert_eq!(stats.latest_rtt, Duration::from_millis(45));
-        assert_eq!(stats.smoothed_rtt, Duration::from_millis(45));
-        assert_eq!(stats.min_rtt, Duration::from_millis(45));
-        assert_eq!(stats.rttvar, Duration::from_micros(22_500));
+        assert_eq!(stats.latest_rtt, Duration::from_millis(50));
+        assert_eq!(stats.smoothed_rtt, Duration::from_millis(50));
+        assert_eq!(stats.min_rtt, Duration::from_millis(50));
+        assert_eq!(stats.rttvar, Duration::from_micros(25_000));
 
-        // Second sample: 60ms with 5ms ack_delay -> adjusted = 55ms
+        // Second sample: 60ms raw with 5ms ack_delay: 60 > min_rtt(50) + 5 -> adjusted 55ms
         stats.update(Duration::from_millis(60), Duration::from_millis(5));
         assert_eq!(stats.latest_rtt, Duration::from_millis(55));
-        assert!(stats.smoothed_rtt > Duration::from_millis(45));
-        assert_eq!(stats.min_rtt, Duration::from_millis(45));
+        assert!(stats.smoothed_rtt > Duration::from_millis(50));
+        // min_rtt tracks the RAW sample, not the ack-delay-adjusted one
+        assert_eq!(stats.min_rtt, Duration::from_millis(50));
+
+        // Peer claiming an impossibly large ack_delay cannot drag values below min_rtt
+        stats.update(Duration::from_millis(52), Duration::from_millis(10_000));
+        assert_eq!(stats.latest_rtt, Duration::from_millis(52));
+        assert_eq!(stats.min_rtt, Duration::from_millis(50));
+
+        // PTO has a granularity floor even with a zero-ish RTT
+        let mut fast = RttStats::new();
+        fast.update(Duration::from_micros(1), Duration::ZERO);
+        assert!(fast.pto_duration() >= Duration::from_millis(1));
     }
 }

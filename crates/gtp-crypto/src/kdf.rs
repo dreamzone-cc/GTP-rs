@@ -6,14 +6,31 @@
 use gtp_types::ConnectionId;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroize;
 
 pub const KEY_LEN: usize = 32;
 pub const IV_LEN: usize = 12;
 
 /// Handshake master secret container.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is manually implemented and redacted so key material can never leak
+/// through formatting paths (logs, panic messages, error reports).
 pub struct HandshakeSecret {
     secret: Vec<u8>,
+}
+
+impl core::fmt::Debug for HandshakeSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HandshakeSecret")
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for HandshakeSecret {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
 }
 
 impl HandshakeSecret {
@@ -53,6 +70,50 @@ pub fn derive_session_keys(
         .expect("12 bytes is valid length for HKDF-SHA256");
 
     (key, iv)
+}
+
+/// Directional key material for a session (see `derive_directional_session_keys`).
+#[derive(Clone, Copy, Debug)]
+pub struct SessionDirectionalKeys {
+    pub client_tx_key: [u8; KEY_LEN],
+    pub client_tx_iv: [u8; IV_LEN],
+    pub server_tx_key: [u8; KEY_LEN],
+    pub server_tx_iv: [u8; IV_LEN],
+}
+
+/// Derives per-direction AEAD keys and IVs from a master secret and connection ID.
+///
+/// Even the legacy static-secret path must never share one key/IV across both
+/// directions (SEC-1): client packet N and server packet N would collide on the
+/// same (key, nonce) pair.
+pub fn derive_directional_session_keys(
+    master_secret: &[u8],
+    cid: ConnectionId,
+) -> SessionDirectionalKeys {
+    let hk = Hkdf::<Sha256>::new(None, master_secret);
+    let cid_bytes = cid.to_be_bytes();
+
+    // info = label(8) ‖ suffix(8) ‖ cid(8) — fixed 24-byte buffer
+    let expand = |label: &[u8; 8], suffix: &[u8; 8], out: &mut [u8]| {
+        let mut info = [0u8; 24];
+        info[..8].copy_from_slice(label);
+        info[8..16].copy_from_slice(suffix);
+        info[16..24].copy_from_slice(&cid_bytes);
+        hk.expand(&info, out)
+            .expect("fixed output lengths are valid for HKDF-SHA256");
+    };
+
+    let mut out = SessionDirectionalKeys {
+        client_tx_key: [0u8; KEY_LEN],
+        client_tx_iv: [0u8; IV_LEN],
+        server_tx_key: [0u8; KEY_LEN],
+        server_tx_iv: [0u8; IV_LEN],
+    };
+    expand(b"c2s key ", b"gtp/v1  ", &mut out.client_tx_key);
+    expand(b"c2s iv  ", b"gtp/v1  ", &mut out.client_tx_iv);
+    expand(b"s2c key ", b"gtp/v1  ", &mut out.server_tx_key);
+    expand(b"s2c iv  ", b"gtp/v1  ", &mut out.server_tx_iv);
+    out
 }
 
 #[cfg(test)]

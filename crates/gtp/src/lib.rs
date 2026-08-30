@@ -63,8 +63,8 @@ pub use gtp_runtime_tokio as runtime;
 pub use gtp_sim as sim;
 
 pub use gtp_crypto::{
-    compute_client_proof, derive_handshake_session_keys, ratchet_key, verify_client_proof,
-    EphemeralKeyPair, HandshakeSharedSecret,
+    compute_client_proof, derive_directional_handshake_session_keys, ratchet_key,
+    verify_client_proof, EphemeralKeyPair, HandshakeSharedSecret,
 };
 
 pub use gtp_core::{
@@ -91,8 +91,8 @@ pub mod prelude {
         GtpConnection, NetworkFeedback, ReceivedMessage,
     };
     pub use gtp_crypto::{
-        compute_client_proof, derive_handshake_session_keys, ratchet_key, verify_client_proof,
-        EphemeralKeyPair, HandshakeSharedSecret,
+        compute_client_proof, derive_directional_handshake_session_keys, ratchet_key,
+        verify_client_proof, EphemeralKeyPair, HandshakeSharedSecret,
     };
     pub use gtp_types::{
         ConnectionId, Duration, FragmentId, GenerationId, MessageClass, MessageId, MonotonicTime,

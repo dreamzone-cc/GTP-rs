@@ -7,16 +7,23 @@ fn test_gtp_library_end_to_end_integration() {
     let server_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
     let cid = ConnectionId(0x1234_5678_9ABC_DEF0);
 
-    // 1. Instantiate client and server using the unified `gtp` library
-    let mut client = GtpConnection::new_with_config(
+    // 1. Instantiate client and server using the unified `gtp` library.
+    // SEC-1: each side takes an explicit role so directions use distinct keys.
+    let mut client = GtpConnection::new_with_role(
         cid,
         server_addr,
         true, // AEAD encryption
+        true, // client role
         GtpConfig::competitive_fps(),
     );
 
-    let mut server =
-        GtpConnection::new_with_config(cid, client_addr, true, GtpConfig::competitive_fps());
+    let mut server = GtpConnection::new_with_role(
+        cid,
+        client_addr,
+        true,
+        false, // server role
+        GtpConfig::competitive_fps(),
+    );
 
     let now = MonotonicTime::from_micros(1_000_000);
 

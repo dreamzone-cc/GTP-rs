@@ -8,6 +8,11 @@ pub struct PacketInterval {
     pub end: u64,
 }
 
+/// Received intervals older than this many packets below `largest_received` are
+/// pruned: they are beyond any realistic re-ACK usefulness and would otherwise grow
+/// without bound (REC-5) and crowd the 32-range frame budget (REC-6).
+pub const ACK_RETENTION_WINDOW: u64 = 1024;
+
 /// Tracks received incoming packet numbers and formats ACK frames with range compression.
 #[derive(Clone, Debug)]
 pub struct AckTracker {
@@ -47,6 +52,26 @@ impl AckTracker {
         Self::default()
     }
 
+    /// Builds a tracker honoring the negotiated ACK policy (P1-2: GtpConfig wiring).
+    pub fn with_policy(ack_frequency: u8, max_ack_delay: Duration) -> Self {
+        Self {
+            ack_frequency: ack_frequency.max(1),
+            max_ack_delay,
+            ..Self::default()
+        }
+    }
+
+    /// Applies a new ACK policy at runtime (local control API or remote ACK_FREQUENCY).
+    pub fn set_policy(&mut self, ack_frequency: u8, max_ack_delay: Duration) {
+        self.ack_frequency = ack_frequency.max(1);
+        self.max_ack_delay = max_ack_delay;
+    }
+
+    /// Number of disjoint received intervals currently retained.
+    pub fn interval_count(&self) -> usize {
+        self.intervals.len()
+    }
+
     pub fn on_packet_received(
         &mut self,
         packet_number: PacketNumber,
@@ -79,10 +104,20 @@ impl AckTracker {
         }
 
         self.insert_packet(pn);
+        self.prune_old_intervals();
 
         if is_ack_eliciting {
             self.unacked_packet_count = self.unacked_packet_count.saturating_add(1);
         }
+    }
+
+    /// Drops intervals that fell out of the retention window below the newest packet.
+    fn prune_old_intervals(&mut self) {
+        let Some(largest) = self.largest_received else {
+            return;
+        };
+        let floor = largest.as_u64().saturating_sub(ACK_RETENTION_WINDOW);
+        self.intervals.retain(|iv| iv.end > floor);
     }
 
     fn insert_packet(&mut self, pn: u64) {
@@ -246,5 +281,57 @@ mod tests {
         } else {
             panic!("Expected ACK frame");
         }
+    }
+
+    /// REC-5: old intervals are pruned so memory cannot grow without bound.
+    #[test]
+    fn ack_intervals_pruned_and_coalesced() {
+        let mut tracker = AckTracker::new();
+        let t0 = MonotonicTime::from_micros(1_000_000);
+
+        // Create a sparse pattern far below the retention window, then advance far ahead
+        for pn in 1..=50u64 {
+            tracker.on_packet_received(PacketNumber(pn * 2), true, 0, t0); // 50 disjoint intervals
+        }
+        assert!(tracker.interval_count() > 10);
+
+        // Jump beyond the retention window: the old sparse intervals fall out
+        tracker.on_packet_received(PacketNumber(500_000), true, 0, t0);
+        assert!(
+            tracker.interval_count() <= 32,
+            "intervals must be pruned to stay within the frame budget"
+        );
+
+        // The frame still acknowledges the newest 32 intervals
+        let frame = tracker.generate_ack_frame(t0).unwrap();
+        if let Frame::Ack { largest_acked, .. } = frame {
+            assert_eq!(largest_acked, PacketNumber(500_000));
+        }
+    }
+
+    /// P1-2: the negotiated policy must actually drive ACK behavior.
+    #[test]
+    fn policy_config_drives_ack_behavior() {
+        let t0 = MonotonicTime::from_micros(1_000_000);
+
+        // High frequency threshold: 4 packets before an ACK
+        let mut tracker = AckTracker::with_policy(4, Duration::from_millis(25));
+        tracker.on_packet_received(PacketNumber(1), true, 0, t0);
+        tracker.on_packet_received(PacketNumber(2), true, 0, t0);
+        assert!(!tracker.should_send_ack(t0), "2 < 4 packets must not ack");
+        tracker.on_packet_received(PacketNumber(3), true, 0, t0);
+        tracker.on_packet_received(PacketNumber(4), true, 0, t0);
+        assert!(tracker.should_send_ack(t0));
+
+        // Immediate ACK despite low count when the max_ack_delay timer expires
+        let mut patient = AckTracker::with_policy(8, Duration::from_millis(10));
+        patient.on_packet_received(PacketNumber(1), true, 0, t0);
+        assert!(!patient.should_send_ack(t0 + Duration::from_millis(5)));
+        assert!(patient.should_send_ack(t0 + Duration::from_millis(11)));
+
+        // Runtime policy change takes effect
+        patient.set_policy(1, Duration::from_millis(25));
+        patient.on_packet_received(PacketNumber(2), true, 0, t0);
+        assert!(patient.should_send_ack(t0));
     }
 }

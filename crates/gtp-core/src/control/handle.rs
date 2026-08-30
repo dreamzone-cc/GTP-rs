@@ -1,12 +1,10 @@
 use crate::control::config::GtpConfig;
 use crate::control::events::ControlEvent;
 use crate::control::metrics::DetailedMetrics;
-use crate::state::{ConnectionCold, ConnectionHot};
+use crate::state::{ConnectionCold, ConnectionHot, OutgoingControlFrame};
 use gtp_cc::calculate_backpressure;
 use gtp_path::ConnectionState;
-use gtp_scheduler::SchedulableItem;
-use gtp_types::{MessageClass, MessageId, MonotonicTime, PriorityTier, Result};
-use gtp_wire::Frame;
+use gtp_types::{MonotonicTime, Result};
 use std::net::SocketAddr;
 
 /// Dedicated control handle providing full administrative and tuning access to an active GTP connection.
@@ -38,32 +36,25 @@ impl<'a> ConnectionControl<'a> {
         ack_frequency_packets: u8,
         max_ack_delay_ms: u16,
         reorder_threshold: u8,
-        now: MonotonicTime,
+        _now: MonotonicTime,
     ) -> Result<()> {
+        // REC-7: the negotiated policy takes effect locally as well as remotely.
         self.config.ack_frequency_packets = ack_frequency_packets;
         self.config.max_ack_delay = gtp_types::Duration::from_millis(max_ack_delay_ms as u64);
         self.config.ack_reorder_threshold = reorder_threshold;
-
-        let frame = Frame::AckFrequency {
+        self.hot.ack_tracker.set_policy(
             ack_frequency_packets,
-            max_ack_delay_ms,
-            reorder_threshold,
-        };
+            gtp_types::Duration::from_millis(max_ack_delay_ms as u64),
+        );
 
-        let mut buf = [0u8; 16];
-        let written = frame.encode(&mut buf)?;
-
-        let item = SchedulableItem {
-            message_id: MessageId(self.hot.next_message_id),
-            class: MessageClass::Unreliable,
-            priority: PriorityTier::P0Control,
-            created_at: now,
-            deadline: None,
-            supersedable: true,
-            payload: buf[..written].to_vec(),
-        };
-        self.hot.next_message_id += 1;
-        self.hot.scheduler.enqueue(item, now)
+        self.hot
+            .control_queue
+            .push_back(OutgoingControlFrame::AckFrequency {
+                ack_frequency_packets,
+                max_ack_delay_ms,
+                reorder_threshold,
+            });
+        Ok(())
     }
 
     /// Trigger path validation and migration to a new remote address.
@@ -77,21 +68,13 @@ impl<'a> ConnectionControl<'a> {
             .path_validator
             .start_challenge(new_addr, nonce, now);
 
-        let frame = Frame::PathChallenge { data: nonce };
-        let mut buf = [0u8; 16];
-        let written = frame.encode(&mut buf)?;
-
-        let item = SchedulableItem {
-            message_id: MessageId(self.hot.next_message_id),
-            class: MessageClass::Unreliable,
-            priority: PriorityTier::P0Control,
-            created_at: now,
-            deadline: None,
-            supersedable: true,
-            payload: buf[..written].to_vec(),
-        };
-        self.hot.next_message_id += 1;
-        self.hot.scheduler.enqueue(item, now)
+        self.hot
+            .control_queue
+            .push_back(OutgoingControlFrame::PathChallenge {
+                data: nonce,
+                dest: new_addr,
+            });
+        Ok(())
     }
 
     /// Enqueue an MTU probe frame to test Path MTU expansion.
@@ -99,76 +82,49 @@ impl<'a> ConnectionControl<'a> {
         &mut self,
         probe_id: u32,
         target_size: usize,
-        now: MonotonicTime,
+        _now: MonotonicTime,
     ) -> Result<()> {
-        let frame = Frame::MtuProbe {
-            probe_id,
-            padding_len: target_size.saturating_sub(32),
-        };
-        let mut buf = vec![0u8; target_size];
-        let written = frame.encode(&mut buf)?;
-
-        let item = SchedulableItem {
-            message_id: MessageId(self.hot.next_message_id),
-            class: MessageClass::Unreliable,
-            priority: PriorityTier::P0Control,
-            created_at: now,
-            deadline: None,
-            supersedable: true,
-            payload: buf[..written].to_vec(),
-        };
-        self.hot.next_message_id += 1;
-        self.hot.scheduler.enqueue(item, now)
+        self.hot
+            .control_queue
+            .push_back(OutgoingControlFrame::MtuProbe {
+                probe_id,
+                padding_len: target_size.saturating_sub(32),
+            });
+        Ok(())
     }
 
     /// Send a keepalive ping frame.
-    pub fn send_ping(&mut self, nonce: u64, now: MonotonicTime) -> Result<()> {
-        let frame = Frame::Ping { nonce };
-        let mut buf = [0u8; 16];
-        let written = frame.encode(&mut buf)?;
-
-        let item = SchedulableItem {
-            message_id: MessageId(self.hot.next_message_id),
-            class: MessageClass::Unreliable,
-            priority: PriorityTier::P0Control,
-            created_at: now,
-            deadline: None,
-            supersedable: true,
-            payload: buf[..written].to_vec(),
-        };
-        self.hot.next_message_id += 1;
-        self.hot.scheduler.enqueue(item, now)
+    pub fn send_ping(&mut self, nonce: u64, _now: MonotonicTime) -> Result<()> {
+        self.hot
+            .control_queue
+            .push_back(OutgoingControlFrame::Ping { nonce });
+        Ok(())
     }
 
     /// Initiate graceful session closing by emitting a CLOSE frame and transitioning to Draining.
+    ///
+    /// Core-C1: the CLOSE frame is queued BEFORE the state transition so the TX
+    /// pipeline can still produce a datagram carrying it.
     pub fn graceful_close(
         &mut self,
         error_code: u16,
         reason: &'static str,
-        now: MonotonicTime,
+        _now: MonotonicTime,
     ) -> Result<()> {
+        self.hot
+            .control_queue
+            .push_back(OutgoingControlFrame::Close {
+                error_code,
+                reason: reason.to_string(),
+            });
+
         let old_state = self.hot.state;
         self.hot.state.transition_to(ConnectionState::Draining)?;
         self.event_queue.push(ControlEvent::StateChanged {
             old_state,
             new_state: ConnectionState::Draining,
         });
-
-        let frame = Frame::Close { error_code, reason };
-        let mut buf = [0u8; 256];
-        let written = frame.encode(&mut buf)?;
-
-        let item = SchedulableItem {
-            message_id: MessageId(self.hot.next_message_id),
-            class: MessageClass::Unreliable,
-            priority: PriorityTier::P0Control,
-            created_at: now,
-            deadline: None,
-            supersedable: true,
-            payload: buf[..written].to_vec(),
-        };
-        self.hot.next_message_id += 1;
-        self.hot.scheduler.enqueue(item, now)
+        Ok(())
     }
 
     /// Forcefully terminate connection immediately without draining.
@@ -182,7 +138,7 @@ impl<'a> ConnectionControl<'a> {
         Ok(())
     }
 
-    /// Rotates the active session AEAD encryption key for forward secrecy (Key Ratchet).
+    /// Rotates the active session AEAD encryption keys in both directions (Key Ratchet).
     pub fn ratchet_key(&mut self) {
         self.hot.ratchet_session_key();
     }
@@ -208,7 +164,7 @@ impl<'a> ConnectionControl<'a> {
             cwnd_bytes: gtp_cc::CongestionController::cwnd(&self.hot.cc),
             inflight_bytes: gtp_cc::CongestionController::inflight(&self.hot.cc),
             pacing_rate_bps: gtp_cc::CongestionController::pacing_rate(&self.hot.cc),
-            pacing_tokens_remaining: 0,
+            pacing_tokens_remaining: self.hot.pacing.tokens_bytes(),
             backpressure,
 
             queue_bytes_per_tier: [0, 0, 0, 0, 0],

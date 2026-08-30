@@ -1,5 +1,5 @@
 use gtp_crypto::{
-    derive_handshake_session_keys, derive_session_keys, ratchet_key, EphemeralKeyPair,
+    derive_directional_handshake_session_keys, derive_session_keys, ratchet_key, EphemeralKeyPair,
     GtpAeadProtector, PacketProtector, PlaintextProtector, Protector,
 };
 use gtp_types::{ConnectionId, PacketNumber};
@@ -20,6 +20,21 @@ fn test_hkdf_multi_connection_entropy_isolation() {
         assert_eq!(iv.len(), 12);
         assert_eq!(key.len(), 32);
     }
+}
+
+/// SEC-1: directional derivation must be distinct across connections too.
+#[test]
+fn test_hkdf_directional_keys_isolation() {
+    let secret = b"directional_isolation_master_secret";
+    let cid_a = ConnectionId(0x1111);
+    let cid_b = ConnectionId(0x2222);
+
+    let a = gtp_crypto::derive_directional_session_keys(secret, cid_a);
+    let b = gtp_crypto::derive_directional_session_keys(secret, cid_b);
+
+    assert_ne!(a.client_tx_key, b.client_tx_key);
+    assert_ne!(a.client_tx_iv, b.client_tx_iv);
+    assert_ne!(a.server_tx_key, a.client_tx_key);
 }
 
 #[test]
@@ -74,27 +89,50 @@ fn test_x25519_passive_eavesdropper_cannot_decrypt() {
     // Passive eavesdropper creates their own keypair
     let attacker_ephemeral = EphemeralKeyPair::generate();
 
-    // Legitimate parties establish shared secret and session keys
-    let client_shared = client_ephemeral.compute_shared_secret(&server_pk);
-    let server_shared = server_ephemeral.compute_shared_secret(&client_pk);
+    // Legitimate parties establish shared secret and directional session keys
+    let client_shared = client_ephemeral
+        .compute_shared_secret(&server_pk)
+        .expect("contributory DH");
+    let server_shared = server_ephemeral
+        .compute_shared_secret(&client_pk)
+        .expect("contributory DH");
 
     let cid = ConnectionId(0x1234_5678_9ABC_DEF0);
-    let (c_key, c_iv) =
-        derive_handshake_session_keys(&client_shared, &client_nonce, &server_nonce, cid);
-    let (s_key, s_iv) =
-        derive_handshake_session_keys(&server_shared, &client_nonce, &server_nonce, cid);
+    let client_keys = derive_directional_handshake_session_keys(
+        &client_shared,
+        &client_nonce,
+        &server_nonce,
+        cid,
+    );
+    let server_keys = derive_directional_handshake_session_keys(
+        &server_shared,
+        &client_nonce,
+        &server_nonce,
+        cid,
+    );
 
-    assert_eq!(c_key, s_key);
-    assert_eq!(c_iv, s_iv);
+    // Both parties derive identical directional material, but the directions differ.
+    assert_eq!(client_keys.client_tx_key, server_keys.client_tx_key);
+    assert_ne!(client_keys.client_tx_key, client_keys.server_tx_key);
 
-    let client_protector = GtpAeadProtector::new(c_key, c_iv);
-    let server_protector = GtpAeadProtector::new(s_key, s_iv);
+    // Client seals with client_tx; the server opens with client_tx (its RX direction).
+    let client_protector =
+        GtpAeadProtector::new(client_keys.client_tx_key, client_keys.client_tx_iv);
+    let server_protector =
+        GtpAeadProtector::new(client_keys.client_tx_key, client_keys.client_tx_iv);
 
     // Attacker tries to compute shared secret with client public key
-    let attacker_shared = attacker_ephemeral.compute_shared_secret(&client_pk);
-    let (att_key, att_iv) =
-        derive_handshake_session_keys(&attacker_shared, &client_nonce, &server_nonce, cid);
-    let attacker_protector = GtpAeadProtector::new(att_key, att_iv);
+    let attacker_shared = attacker_ephemeral
+        .compute_shared_secret(&client_pk)
+        .expect("contributory DH");
+    let attacker_keys = derive_directional_handshake_session_keys(
+        &attacker_shared,
+        &client_nonce,
+        &server_nonce,
+        cid,
+    );
+    let attacker_protector =
+        GtpAeadProtector::new(attacker_keys.client_tx_key, attacker_keys.client_tx_iv);
 
     // Client seals gameplay packet
     let original_payload = b"super_secret_game_event_position_update";
@@ -171,21 +209,38 @@ fn test_active_mitm_key_tamper_rejected() {
     let cid = ConnectionId(0xAAAA_BBBB_CCCC_DDDD);
 
     // 1. Client computes shared secret with legitimate server PK
-    let client_shared = client_ephemeral.compute_shared_secret(&server_pk);
-    let (client_key, _) =
-        derive_handshake_session_keys(&client_shared, &client_nonce, &server_nonce, cid);
+    let client_shared = client_ephemeral
+        .compute_shared_secret(&server_pk)
+        .expect("contributory DH");
+    let client_keys = derive_directional_handshake_session_keys(
+        &client_shared,
+        &client_nonce,
+        &server_nonce,
+        cid,
+    );
 
     // 2. Attacker tampers with ClientHello on the wire, substituting client_pk with attacker_pk
     // Server computes shared secret with attacker_pk instead of client_pk
-    let server_shared = server_ephemeral.compute_shared_secret(&attacker_pk);
-    let (server_key, _) =
-        derive_handshake_session_keys(&server_shared, &client_nonce, &server_nonce, cid);
+    let server_shared = server_ephemeral
+        .compute_shared_secret(&attacker_pk)
+        .expect("contributory DH");
+    let server_keys = derive_directional_handshake_session_keys(
+        &server_shared,
+        &client_nonce,
+        &server_nonce,
+        cid,
+    );
 
-    // 3. Client generates HMAC Key Confirmation proof based on its key and PKs
-    let client_proof = compute_client_proof(&client_key, &client_pk, &server_pk);
+    // 3. Client generates HMAC Key Confirmation proof based on its confirmation key and PKs
+    let client_proof = compute_client_proof(&client_keys.client_tx_key, &client_pk, &server_pk);
 
     // 4. Server MUST REJECT the tampered handshake finish proof
-    let is_valid = verify_client_proof(&server_key, &attacker_pk, &server_pk, &client_proof);
+    let is_valid = verify_client_proof(
+        &server_keys.client_tx_key,
+        &attacker_pk,
+        &server_pk,
+        &client_proof,
+    );
     assert!(
         !is_valid,
         "Active MITM key substitution MUST fail cryptographic key confirmation!"

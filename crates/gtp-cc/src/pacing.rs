@@ -6,11 +6,26 @@ pub struct PacingEngine {
     tokens_bytes: u64,
     last_update_time: MonotonicTime,
     max_burst_bytes: u64,
+    fractional_remainder: f64,
 }
 
 impl Default for PacingEngine {
     fn default() -> Self {
         Self::new(12_000)
+    }
+}
+
+/// Tunable pacing parameters (P1-2: populated from `GtpConfig`).
+#[derive(Clone, Copy, Debug)]
+pub struct PacingEngineConfig {
+    pub max_burst_bytes: u64,
+}
+
+impl Default for PacingEngineConfig {
+    fn default() -> Self {
+        Self {
+            max_burst_bytes: 12_000,
+        }
     }
 }
 
@@ -20,7 +35,12 @@ impl PacingEngine {
             tokens_bytes: max_burst_bytes,
             last_update_time: MonotonicTime::ZERO,
             max_burst_bytes,
+            fractional_remainder: 0.0,
         }
+    }
+
+    pub fn with_config(config: PacingEngineConfig) -> Self {
+        Self::new(config.max_burst_bytes)
     }
 
     pub fn update_tokens(&mut self, pacing_rate_bps: u64, now: MonotonicTime) {
@@ -32,7 +52,11 @@ impl PacingEngine {
 
         let elapsed = now.duration_since(self.last_update_time);
         if elapsed > Duration::ZERO {
-            let added_tokens = (pacing_rate_bps as f64 * elapsed.as_secs_f64()) as u64;
+            // Carry the fractional remainder instead of truncating it away on every
+            // call (CC-9): at high poll rates the systematic under-credit accumulated.
+            let exact = pacing_rate_bps as f64 * elapsed.as_secs_f64() + self.fractional_remainder;
+            let added_tokens = exact.floor() as u64;
+            self.fractional_remainder = exact - exact.floor();
             self.tokens_bytes = (self.tokens_bytes + added_tokens).min(self.max_burst_bytes);
             self.last_update_time = now;
         }
@@ -52,6 +76,16 @@ impl PacingEngine {
         let cwnd_budget = cwnd.saturating_sub(inflight);
         let pacing_budget = self.tokens_bytes;
         cwnd_budget.min(pacing_budget) as usize
+    }
+
+    /// Current token balance — exported so `DetailedMetrics` reports the truth
+    /// instead of a hardcoded zero (CC-11).
+    pub fn tokens_bytes(&self) -> u64 {
+        self.tokens_bytes
+    }
+
+    pub fn max_burst_bytes(&self) -> u64 {
+        self.max_burst_bytes
     }
 }
 

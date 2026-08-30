@@ -7,11 +7,19 @@ use std::collections::BTreeMap;
 pub const PACKET_THRESHOLD: u64 = 3;
 pub const TIME_THRESHOLD_FACTOR_NUM: u64 = 9;
 pub const TIME_THRESHOLD_FACTOR_DEN: u64 = 8;
+/// Maximum total packets a single ACK frame may claim, defending the loss detector
+/// from attacker-controlled range expansion (REC-10) and optimistic-ACK window inflation.
+pub const MAX_ACKED_PER_FRAME: u64 = 16_384;
+/// Per-PTO retransmission burst cap (RFC 9002 §7.5: at most 2 probe datagrams).
+pub const MAX_PTO_RETRANSMIT_BURST: usize = 2;
+/// Exponential backoff ceiling exponent for PTO (2^8 = 256x).
+pub const MAX_PTO_BACKOFF_EXPONENT: u32 = 8;
 
 #[derive(Clone, Debug)]
 pub struct AckEvent {
     pub largest_acked: PacketNumber,
     pub acked_packets: Vec<SentPacketRecord>,
+    /// Bytes reclaimed from congestion-window accounting (in-flight packets only).
     pub bytes_acked: usize,
     pub rtt_sample: Option<Duration>,
 }
@@ -35,6 +43,7 @@ pub struct LossDetector {
     pub rtt_stats: RttStats,
     sent_packets: BTreeMap<u64, SentPacketRecord>,
     largest_acked_packet: Option<PacketNumber>,
+    largest_sent_packet: u64,
     pub time_of_last_ack_eliciting_packet: MonotonicTime,
     pub pto_count: u32,
     total_bytes_sent: u64,
@@ -49,6 +58,7 @@ impl Default for LossDetector {
             rtt_stats: RttStats::new(),
             sent_packets: BTreeMap::new(),
             largest_acked_packet: None,
+            largest_sent_packet: 0,
             time_of_last_ack_eliciting_packet: MonotonicTime::ZERO,
             pto_count: 0,
             total_bytes_sent: 0,
@@ -69,6 +79,7 @@ impl LossDetector {
             self.time_of_last_ack_eliciting_packet = record.send_time;
         }
         self.total_bytes_sent += record.bytes as u64;
+        self.largest_sent_packet = self.largest_sent_packet.max(record.packet_number.as_u64());
         self.sent_packets
             .insert(record.packet_number.as_u64(), record);
     }
@@ -79,6 +90,62 @@ impl LossDetector {
             .filter(|p| p.in_flight)
             .map(|p| p.bytes as u64)
             .sum()
+    }
+
+    /// PTO duration with RFC 9002 §6.2 exponential backoff, capped at `max_pto`.
+    pub fn pto_duration_with_backoff(&self, max_pto: Duration) -> Duration {
+        let factor = 1u64 << self.pto_count.min(MAX_PTO_BACKOFF_EXPONENT);
+        let expanded = Duration::from_micros(
+            self.rtt_stats
+                .pto_duration()
+                .as_micros()
+                .saturating_mul(factor),
+        );
+        expanded.min(max_pto)
+    }
+
+    /// Parses acknowledged packet numbers from ACK ranges.
+    ///
+    /// The wire semantics produced by `AckTracker::generate_ack_frame` are: range 0
+    /// covers `largest_acked` down to `largest_acked - length` (length = block size - 1);
+    /// every subsequent range first skips `gap` unacknowledged packets, then covers
+    /// `length + 1` packets. Malformed or overflowing ranges truncate the walk — they
+    /// can never inflate the acknowledged set (REC-10 / optimistic-ACK defense).
+    fn parse_ack_ranges(largest_pn: u64, ranges: &[AckRange], range_count: usize) -> Vec<u64> {
+        let mut acked = Vec::new();
+        let mut total: u64 = 0;
+        let mut block_high = largest_pn;
+        let mut prev_low = largest_pn;
+
+        for (i, range) in ranges.iter().take(range_count).enumerate() {
+            if i > 0 {
+                let gap = range.gap as u64;
+                // The gap sits between the previous block's low edge and this block's
+                // high edge; underflow means the frame is malformed — stop walking.
+                if gap + 1 > prev_low {
+                    break;
+                }
+                block_high = prev_low - gap - 1;
+            }
+
+            let length = range.length as u64;
+            if length > block_high {
+                break;
+            }
+            let block_low = block_high - length;
+
+            let count = length + 1;
+            if total + count > MAX_ACKED_PER_FRAME {
+                break;
+            }
+            for pn in (block_low..=block_high).rev() {
+                acked.push(pn);
+            }
+            total += count;
+            prev_low = block_low;
+        }
+
+        acked
     }
 
     pub fn on_ack_received(
@@ -92,30 +159,38 @@ impl LossDetector {
         let ack_delay = Duration::from_micros(ack_delay_us as u64);
         let largest_pn = largest_acked.as_u64();
 
+        // Optimistic-ACK defense (0.8): a peer cannot acknowledge packets we never sent.
+        if largest_pn > self.largest_sent_packet {
+            return (
+                AckEvent {
+                    largest_acked,
+                    acked_packets: Vec::new(),
+                    bytes_acked: 0,
+                    rtt_sample: None,
+                },
+                LossEvent {
+                    lost_packets: Vec::new(),
+                    bytes_lost: 0,
+                    retransmittable: Vec::new(),
+                },
+                None,
+            );
+        }
+
         let mut newly_acked = Vec::new();
-        let mut bytes_acked = 0;
+        let mut bytes_acked = 0usize;
         let mut rtt_sample = None;
 
-        // Parse acknowledged packet numbers from ACK ranges
-        let mut acked_numbers = Vec::new();
-        let mut current_pn = largest_pn;
-
-        for range in ranges.iter().take(range_count) {
-            let start = current_pn.saturating_sub(range.length as u64);
-            for pn in (start..=current_pn).rev() {
-                acked_numbers.push(pn);
-            }
-            if current_pn >= (range.length as u64 + range.gap as u64 + 1) {
-                current_pn = current_pn - (range.length as u64) - (range.gap as u64) - 1;
-            } else {
-                break;
-            }
-        }
+        let acked_numbers = Self::parse_ack_ranges(largest_pn, ranges, range_count);
 
         // Process newly acknowledged packets
         for &pn in &acked_numbers {
             if let Some(record) = self.sent_packets.remove(&pn) {
-                bytes_acked += record.bytes;
+                // P1-3: only in-flight bytes participate in congestion accounting —
+                // ACK-only packets would otherwise leak phantom congestion debt.
+                if record.in_flight {
+                    bytes_acked += record.bytes;
+                }
                 if pn == largest_pn {
                     let sample = now.duration_since(record.send_time);
                     self.rtt_stats.update(sample, ack_delay);
@@ -161,7 +236,9 @@ impl LossDetector {
             self.last_delivery_rate_bytes = self.total_bytes_acked;
         }
 
-        // Detect Lost Packets
+        // Detect Lost Packets — RFC 9002 §2: loss is declared for in-flight,
+        // ack-eliciting packets only. Never for ACK-only packets (the fix that
+        // eliminated the per-RTT phantom window reduction).
         let mut lost_packets = Vec::new();
         let mut bytes_lost = 0;
         let mut retransmittable = Vec::new();
@@ -178,7 +255,7 @@ impl LossDetector {
 
         let mut lost_pns = Vec::new();
         for (&pn, record) in &self.sent_packets {
-            if pn > largest_pn {
+            if pn > largest_pn || !record.in_flight {
                 continue;
             }
 
@@ -216,15 +293,33 @@ impl LossDetector {
         )
     }
 
+    /// PTO timeout sweep (RFC 9002 §7.5): retransmit the oldest in-flight
+    /// retransmittable records — at most `MAX_PTO_RETRANSMIT_BURST` of them — and
+    /// **remove** them from the outstanding set so each PTO fires a bounded burst
+    /// instead of re-enqueueing the entire window every period.
     pub fn on_timeout(&mut self, _now: MonotonicTime) -> LossEvent {
-        self.pto_count += 1;
-        // On PTO timeout, we return unacknowledged retransmissions
+        self.pto_count = self.pto_count.saturating_add(1);
+
         let mut retransmittable = Vec::new();
-        for record in self.sent_packets.values() {
+        let mut drained: Vec<u64> = Vec::new();
+
+        for (&pn, record) in &self.sent_packets {
+            if drained.len() >= MAX_PTO_RETRANSMIT_BURST {
+                break;
+            }
+            if !record.in_flight {
+                continue;
+            }
             for frame in &record.retransmittable_frames {
                 retransmittable.push(frame.clone());
             }
+            drained.push(pn);
         }
+
+        for pn in drained {
+            self.sent_packets.remove(&pn);
+        }
+
         LossEvent {
             lost_packets: Vec::new(),
             bytes_lost: 0,
@@ -238,6 +333,24 @@ mod tests {
     use super::*;
     use gtp_types::{FragmentId, MessageId, TransmissionId};
 
+    fn record(pn: u64) -> SentPacketRecord {
+        SentPacketRecord {
+            packet_number: PacketNumber(pn),
+            send_time: MonotonicTime::from_micros(1_000_000),
+            bytes: 100,
+            ack_eliciting: true,
+            in_flight: true,
+            retransmittable_frames: vec![RetransmissionRecord {
+                message_id: MessageId(pn),
+                fragment_id: FragmentId(0),
+                transmission_id: TransmissionId(1),
+                group_id: 0,
+                order_seq: 0,
+                payload: b"critical_game_event".to_vec(),
+            }],
+        }
+    }
+
     #[test]
     fn test_loss_detection_via_packet_threshold() {
         let mut detector = LossDetector::new();
@@ -245,23 +358,7 @@ mod tests {
 
         // Send packets 1, 2, 3, 4
         for pn in 1..=4 {
-            let retrans = vec![RetransmissionRecord {
-                message_id: MessageId(pn),
-                fragment_id: FragmentId(0),
-                transmission_id: TransmissionId(1),
-                group_id: 0,
-                order_seq: 0,
-                payload: b"critical_game_event".to_vec(),
-            }];
-
-            detector.on_packet_sent(SentPacketRecord {
-                packet_number: PacketNumber(pn),
-                send_time: now,
-                bytes: 100,
-                ack_eliciting: true,
-                in_flight: true,
-                retransmittable_frames: retrans,
-            });
+            detector.on_packet_sent(record(pn));
         }
 
         assert_eq!(detector.inflight_bytes(), 400);
@@ -283,5 +380,228 @@ mod tests {
         assert_eq!(loss_ev.lost_packets[0].packet_number, PacketNumber(1));
         assert_eq!(loss_ev.retransmittable.len(), 1);
         assert_eq!(loss_ev.retransmittable[0].message_id, MessageId(1));
+    }
+
+    /// P0-6 / reconciliation 0.7: with multiple gaps, the acknowledged set decoded by
+    /// the loss detector must EXACTLY equal the received set — the old decoder shifted
+    /// gap application by one block and phantom-acknowledged never-sent packets.
+    #[test]
+    fn ack_ranges_multi_gap_roundtrip_exact() {
+        let mut tracker_received: Vec<u64> = Vec::new();
+        // Received pattern with gaps: 1..=5, 8..=10, 20..=22 (from the reconciliation doc)
+        let mut tracker = crate::ack_tracker::AckTracker::new();
+        let t0 = MonotonicTime::from_micros(1_000_000);
+        for pn in [1u64, 2, 3, 4, 5, 8, 9, 10, 20, 21, 22] {
+            tracker.on_packet_received(PacketNumber(pn), true, 0, t0);
+            tracker_received.push(pn);
+        }
+
+        let frame = tracker.generate_ack_frame(t0).unwrap();
+        let (largest_acked, ranges, range_count) = match &frame {
+            gtp_wire::Frame::Ack {
+                largest_acked,
+                ranges,
+                range_count,
+                ..
+            } => (*largest_acked, *ranges, *range_count as usize),
+            _ => panic!("expected ACK frame"),
+        };
+
+        let mut detector = LossDetector::new();
+        for pn in 1..=22 {
+            detector.on_packet_sent(record(pn));
+        }
+
+        let (ack_ev, _, _) = detector.on_ack_received(largest_acked, 0, &ranges, range_count, t0);
+
+        let acked_set: std::collections::HashSet<u64> = ack_ev
+            .acked_packets
+            .iter()
+            .map(|r| r.packet_number.as_u64())
+            .collect();
+        let received_set: std::collections::HashSet<u64> = tracker_received.into_iter().collect();
+
+        assert_eq!(
+            acked_set, received_set,
+            "acked set must equal received set exactly"
+        );
+        // The never-sent / never-received packets must not be acknowledged
+        for phantom in [6u64, 7, 17, 18, 19] {
+            assert!(!acked_set.contains(&phantom), "phantom ack for {}", phantom);
+        }
+    }
+
+    /// Deterministic property sweep: random receive patterns (seeded LCG) must
+    /// round-trip through ACK encode → loss-detector decode losslessly whenever the
+    /// pattern fits within the 32-range frame budget, and must NEVER phantom-ack a
+    /// packet that was not received.
+    #[test]
+    fn ack_ranges_property_sweep_seeded() {
+        let mut lcg: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            lcg ^= lcg << 13;
+            lcg ^= lcg >> 7;
+            lcg ^= lcg << 17;
+            lcg
+        };
+
+        for _case in 0..64 {
+            let mut tracker = crate::ack_tracker::AckTracker::new();
+            let t0 = MonotonicTime::from_micros(1_000_000);
+            let mut detector = LossDetector::new();
+            let mut received = Vec::new();
+
+            let total: u64 = 30 + next() % 90;
+            for pn in 1..=total {
+                detector.on_packet_sent(record(pn));
+                let roll = next() % 100;
+                let delivered = roll < 82 || next() % 3 == 0;
+                if delivered {
+                    tracker.on_packet_received(PacketNumber(pn), true, 0, t0);
+                    received.push(pn);
+                }
+            }
+
+            if let Some(frame) = tracker.generate_ack_frame(t0) {
+                let (largest_acked, ranges, range_count) = match &frame {
+                    gtp_wire::Frame::Ack {
+                        largest_acked,
+                        ranges,
+                        range_count,
+                        ..
+                    } => (*largest_acked, *ranges, *range_count as usize),
+                    _ => unreachable!(),
+                };
+                let (ack_ev, _, _) =
+                    detector.on_ack_received(largest_acked, 0, &ranges, range_count, t0);
+                let acked: std::collections::HashSet<u64> = ack_ev
+                    .acked_packets
+                    .iter()
+                    .map(|r| r.packet_number.as_u64())
+                    .collect();
+                let expect: std::collections::HashSet<u64> = received.iter().copied().collect();
+
+                // Safety (the critical property): no phantom acknowledgements, ever.
+                assert!(
+                    acked.is_subset(&expect),
+                    "phantom ack detected in seeded ACK property case"
+                );
+
+                // Completeness: when the pattern fits the 32-range budget the frame
+                // must acknowledge every received packet exactly.
+                if tracker.interval_count() <= 32 {
+                    assert_eq!(
+                        acked, expect,
+                        "round-trip mismatch in seeded ACK property case"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 0.8: a peer acknowledging packets we never sent must be ignored entirely.
+    #[test]
+    fn optimistic_ack_rejected() {
+        let mut detector = LossDetector::new();
+        let now = MonotonicTime::from_micros(1_000_000);
+        detector.on_packet_sent(record(1));
+
+        let ranges = [AckRange {
+            gap: 0,
+            length: 1000,
+        }];
+        let (ack_ev, loss_ev, _) = detector.on_ack_received(PacketNumber(5000), 0, &ranges, 1, now);
+
+        assert!(ack_ev.acked_packets.is_empty());
+        assert!(loss_ev.lost_packets.is_empty());
+        assert_eq!(detector.inflight_bytes(), 100); // untouched
+    }
+
+    /// REC-10: a malicious ACK frame cannot drive unbounded allocation.
+    #[test]
+    fn oversized_ack_ranges_capped() {
+        let mut detector = LossDetector::new();
+        let now = MonotonicTime::from_micros(1_000_000);
+        detector.on_packet_sent(record(1));
+
+        let ranges = [AckRange {
+            gap: 0,
+            length: u32::MAX,
+        }];
+        let (ack_ev, _, _) = detector.on_ack_received(PacketNumber(1), 0, &ranges, 1, now);
+        // Everything beyond the sanity cap is refused; nothing panics or explodes.
+        assert!(ack_ev.acked_packets.len() as u64 <= MAX_ACKED_PER_FRAME);
+    }
+
+    /// P1-3: ACK-only packets are never declared lost and never charged to congestion.
+    #[test]
+    fn ack_only_packets_never_declared_lost() {
+        let mut detector = LossDetector::new();
+        let now = MonotonicTime::from_micros(1_000_000);
+
+        // ACK-only packet #1 (in_flight = false)
+        let mut ack_only = record(1);
+        ack_only.in_flight = false;
+        ack_only.ack_eliciting = false;
+        detector.on_packet_sent(ack_only);
+
+        // Data packets 2..=6, then ACK 6 → PN 1 is far past the packet threshold
+        for pn in 2..=6 {
+            detector.on_packet_sent(record(pn));
+        }
+
+        let ranges = [AckRange { gap: 0, length: 0 }];
+        let (ack_ev, loss_ev, _) = detector.on_ack_received(
+            PacketNumber(6),
+            0,
+            &ranges,
+            1,
+            now + Duration::from_millis(20),
+        );
+
+        // PN 1 (ACK-only) must not appear in either event
+        assert!(!loss_ev
+            .lost_packets
+            .iter()
+            .any(|r| r.packet_number == PacketNumber(1)));
+        assert!(!ack_ev
+            .acked_packets
+            .iter()
+            .any(|r| r.packet_number == PacketNumber(1)));
+        // Packet threshold (k=3): PN 2 and 3 are in-flight and >= 3 below largest(6)
+        assert_eq!(loss_ev.lost_packets.len(), 2);
+        // bytes_acked only counts the in-flight acked packet (not the ACK-only one)
+        assert_eq!(ack_ev.bytes_acked, 100);
+        assert_eq!(detector.inflight_bytes(), 200); // PNs 4,5 still in flight
+    }
+
+    /// P1-4: PTO drains only a bounded burst and removes the swept records.
+    #[test]
+    fn pto_burst_capped_and_drains_records() {
+        let mut detector = LossDetector::new();
+        let now = MonotonicTime::from_micros(1_000_000);
+        for pn in 1..=10 {
+            detector.on_packet_sent(record(pn));
+        }
+
+        let ev1 = detector.on_timeout(now);
+        assert_eq!(ev1.retransmittable.len(), 2); // burst cap
+        assert_eq!(detector.sent_packets.len(), 8); // records removed
+
+        let ev2 = detector.on_timeout(now);
+        assert_eq!(ev2.retransmittable.len(), 2);
+        assert_eq!(detector.sent_packets.len(), 6);
+
+        // Backoff grows then saturates and respects the cap
+        let base = detector.rtt_stats.pto_duration();
+        let max_pto = Duration::from_millis(10_000);
+        let b1 = detector.pto_duration_with_backoff(max_pto);
+        assert!(b1 > base);
+        for _ in 0..40 {
+            detector.on_timeout(now);
+        }
+        assert!(detector.pto_count >= MAX_PTO_BACKOFF_EXPONENT);
+        let capped = detector.pto_duration_with_backoff(Duration::from_millis(500));
+        assert_eq!(capped, Duration::from_millis(500));
     }
 }

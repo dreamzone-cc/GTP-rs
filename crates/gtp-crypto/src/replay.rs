@@ -15,15 +15,47 @@ impl ReplayWindow {
         Self::default()
     }
 
-    /// Checks if packet number is new and updates sliding window upon acceptance.
-    pub fn check_and_update(&mut self, packet_number: PacketNumber) -> Result<()> {
+    /// Checks whether the packet number is acceptable **without mutating** the window.
+    ///
+    /// SEC-3: callers must authenticate the packet (AEAD open) *before* calling
+    /// [`ReplayWindow::commit`]; a forged packet that fails authentication must never
+    /// advance or burn replay state.
+    pub fn check(&self, packet_number: PacketNumber) -> Result<()> {
+        let pn = packet_number.as_u64();
+
+        if !self.initialized {
+            return Ok(());
+        }
+
+        if pn > self.largest_seen {
+            return Ok(());
+        }
+
+        let diff = self.largest_seen - pn;
+        if diff >= REPLAY_WINDOW_SIZE {
+            // Packet too old, outside sliding window
+            return Err(TransportError::ReplayDetected);
+        }
+
+        if self.is_bit_set(diff as usize) {
+            // Duplicate packet number detected!
+            return Err(TransportError::ReplayDetected);
+        }
+
+        Ok(())
+    }
+
+    /// Commits a previously-accepted packet number into the sliding window.
+    ///
+    /// Must only be called after successful authentication of the packet.
+    pub fn commit(&mut self, packet_number: PacketNumber) {
         let pn = packet_number.as_u64();
 
         if !self.initialized {
             self.initialized = true;
             self.largest_seen = pn;
             self.bitmap[0] = 1;
-            return Ok(());
+            return;
         }
 
         if pn > self.largest_seen {
@@ -35,22 +67,20 @@ impl ReplayWindow {
             }
             self.largest_seen = pn;
             self.set_bit(0);
-            Ok(())
         } else {
             let diff = self.largest_seen - pn;
-            if diff >= REPLAY_WINDOW_SIZE {
-                // Packet too old, outside sliding window
-                return Err(TransportError::ReplayDetected);
+            if diff < REPLAY_WINDOW_SIZE {
+                self.set_bit(diff as usize);
             }
-
-            if self.is_bit_set(diff as usize) {
-                // Duplicate packet number detected!
-                return Err(TransportError::ReplayDetected);
-            }
-
-            self.set_bit(diff as usize);
-            Ok(())
         }
+    }
+
+    /// Convenience path: check and immediately commit (only for callers that do not
+    /// authenticate between check and commit).
+    pub fn check_and_update(&mut self, packet_number: PacketNumber) -> Result<()> {
+        self.check(packet_number)?;
+        self.commit(packet_number);
+        Ok(())
     }
 
     fn shift_bitmap(&mut self, shift: usize) {
@@ -110,5 +140,26 @@ mod tests {
 
         // 5. Very old packet (< 150 - 128) -> rejected
         assert!(window.check_and_update(PacketNumber(10)).is_err());
+    }
+
+    /// SEC-3: a failed authentication path must leave the window untouched, so the
+    /// legitimate packet with the same number is still accepted afterwards.
+    #[test]
+    fn failed_auth_simulation_does_not_burn_window() {
+        let mut window = ReplayWindow::new();
+
+        window.check_and_update(PacketNumber(100)).unwrap();
+
+        // "Forged" high packet number: check() accepts it...
+        assert!(window.check(PacketNumber(u64::MAX)).is_ok());
+        // ...but since authentication would fail, commit() is never called.
+        // The legitimate packet 101 must still be accepted and committable.
+        assert!(window.check(PacketNumber(101)).is_ok());
+        window.commit(PacketNumber(101));
+        assert!(window.check(PacketNumber(101)).is_err()); // now a duplicate
+
+        // The u64::MAX spoof was never committed, so 102 stays acceptable
+        assert!(window.check(PacketNumber(102)).is_ok());
+        window.commit(PacketNumber(102));
     }
 }

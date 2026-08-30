@@ -21,8 +21,12 @@ impl SimulationRunner {
         let server_addr: SocketAddr = "10.0.0.2:6000".parse().unwrap();
         let cid = ConnectionId(0x1020304050607080);
 
-        let client = GtpConnection::new(cid, server_addr, true);
-        let server = GtpConnection::new(cid, client_addr, true);
+        // SEC-1: the two peers must hold opposite directional roles — with the same
+        // role both would seal with the same key and every packet number would
+        // collide on one (key, nonce) pair across directions.
+        let client = GtpConnection::new_with_role(cid, server_addr, true, true, Default::default());
+        let server =
+            GtpConnection::new_with_role(cid, client_addr, true, false, Default::default());
 
         Self {
             client,

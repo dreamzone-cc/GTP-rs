@@ -47,7 +47,7 @@ hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
 rustc-hash = "2.1"
-x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets"] }
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }
 subtle = "2.6"
 criterion = { version = "0.5", default-features = false }
