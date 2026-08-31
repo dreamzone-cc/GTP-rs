@@ -320,7 +320,28 @@ impl GtpEndpoint {
                                         });
 
                                         let cookie = stateless_tokens.generate_cookie(src, now);
-                                        if let Some((existing_pair, _, _, _, _)) = psh.get(&cid) {
+                                        // Reuse the stored server ephemeral ONLY for a genuine
+                                        // ClientHello retransmit — one carrying the SAME client
+                                        // key material. A ClientHello for this CID that carries
+                                        // DIFFERENT client material is a new handshake (a fresh
+                                        // client that happens to reuse the connection id, or a
+                                        // stale entry left by an earlier attempt): it must
+                                        // supersede the stale entry, otherwise the ServerHello
+                                        // advertises an ephemeral derived against the OLD client
+                                        // key and the client_proof in the eventual
+                                        // HandshakeFinish can never match — the session then
+                                        // half-opens (server never accepts, client streams into a
+                                        // black hole). Keying the pending state on (CID + client
+                                        // ephemeral) instead of the CID alone closes that seam.
+                                        let is_retransmit = psh.get(&cid).is_some_and(
+                                            |(_, stored_pk, stored_nonce, _, _)| {
+                                                *stored_pk == client_public_key
+                                                    && *stored_nonce == client_nonce
+                                            },
+                                        );
+                                        if let Some((existing_pair, _, _, _, _)) =
+                                            psh.get(&cid).filter(|_| is_retransmit)
+                                        {
                                             (existing_pair.public_key, existing_pair.nonce, cookie)
                                         } else {
                                             let server_pair = EphemeralKeyPair::generate();

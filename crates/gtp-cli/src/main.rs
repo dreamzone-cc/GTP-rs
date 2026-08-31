@@ -313,7 +313,24 @@ async fn main() -> Result<()> {
             let local_addr = client_ep.local_addr()?;
             println!("Client local UDP socket bound to: {}\n", local_addr);
 
-            let cid = ConnectionId(0x1020_3040_5060_7080);
+            // Each client session MUST use a fresh Connection ID. The server keys all
+            // handshake and routing state on the client-chosen CID, so reusing one
+            // across sessions lets a prior session's server-side handshake state
+            // collide with a new handshake: the key-confirmation proof then mismatches
+            // and the server silently drops the session (observed as a ~20% half-open
+            // stall when this CID was hardcoded). Mixing the OS-assigned local UDP
+            // port, a high-resolution timestamp, and the PID yields a CID that is
+            // unique across both sequential and concurrent client processes without
+            // pulling in an RNG dependency.
+            let cid = {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64;
+                let port = local_addr.port() as u64;
+                let pid = std::process::id() as u64;
+                ConnectionId(nanos ^ (port << 48) ^ (pid << 32))
+            };
             let client_conn = client_ep.connect(cid, server_addr, true).await?;
 
             let start_time = Instant::now();
@@ -433,6 +450,9 @@ async fn main() -> Result<()> {
             );
             println!("Total TX Packets:       {}", metrics.total_tx_packets);
             println!("Total TX Bytes:         {} bytes", metrics.total_tx_bytes);
+            println!("Total RX Packets:       {}", metrics.total_rx_packets);
+            println!("Total RX Bytes:         {} bytes", metrics.total_rx_bytes);
+            println!("PTO Count:              {}", metrics.pto_count);
             println!("Total Retransmissions:  {}", metrics.total_retransmissions);
             println!(
                 "Corrupted Packets:      {}",
