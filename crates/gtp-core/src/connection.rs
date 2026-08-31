@@ -336,6 +336,12 @@ impl GtpConnection {
                         now,
                     );
 
+                    // FR-4: sync the controller's RTT from the single source of truth
+                    // (RttStats, just updated above) BEFORE it runs its window update and
+                    // once-per-RTT loss guard, so pacing/CC and PTO share one RTT.
+                    self.hot
+                        .cc
+                        .on_rtt(self.hot.loss_detector.rtt_stats.smoothed_rtt);
                     self.hot.cc.on_ack(&ack_ev, now);
                     self.hot.cc.on_loss(&loss_ev, now);
 
@@ -808,7 +814,9 @@ impl GtpConnection {
     fn build_control_frame(ctrl: &OutgoingControlFrame) -> Frame<'_> {
         match ctrl {
             OutgoingControlFrame::Ping { nonce } => Frame::Ping { nonce: *nonce },
-            OutgoingControlFrame::PathChallenge { data, .. } => Frame::PathChallenge { data: *data },
+            OutgoingControlFrame::PathChallenge { data, .. } => {
+                Frame::PathChallenge { data: *data }
+            }
             OutgoingControlFrame::PathResponse { data, .. } => Frame::PathResponse { data: *data },
             OutgoingControlFrame::MtuProbe {
                 probe_id,
@@ -955,6 +963,58 @@ mod tests {
         let server =
             GtpConnection::new_with_role(cid, client_addr, true, false, GtpConfig::default());
         (client, server)
+    }
+
+    /// FR-4 / TEST-4: after a real ACK round-trip the congestion controller's RTT is
+    /// identical to the loss detector's `RttStats::smoothed_rtt` — a single source of
+    /// truth feeds pacing, backpressure and PTO, rather than two independent estimates.
+    #[test]
+    fn controller_rtt_mirrors_the_single_rtt_source_after_ack() {
+        let cid = ConnectionId(0xF14_0000_0000_0004);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let (mut client, mut server) = loopback_pair(cid);
+        let t0 = MonotonicTime::from_micros(4_000_000);
+
+        // Client sends ack-eliciting data.
+        client
+            .send_reliable_unordered(
+                b"rtt_probe".to_vec(),
+                PriorityTier::P3ReliableGameplay,
+                None,
+                t0,
+            )
+            .unwrap();
+        let mut buf = [0u8; 1500];
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut buf)
+            .unwrap()
+            .unwrap();
+
+        // Server receives it (now owes an ACK) one RTT later.
+        let t1 = t0 + Duration::from_millis(80); // != cubic init (50ms) so the test distinguishes
+        server
+            .handle_incoming_datagram(client_addr, &mut buf[..len], t1)
+            .unwrap();
+        // Server emits the ACK.
+        let (_, ack_len) = server
+            .produce_outgoing_datagram(t1, &mut buf)
+            .unwrap()
+            .expect("server must produce an ACK datagram");
+        // Client processes the ACK -> RTT sample taken, controller RTT synced (FR-4).
+        server_ack_to_client(&mut client, &mut buf[..ack_len], t1);
+
+        let source_rtt = client.hot.loss_detector.rtt_stats.smoothed_rtt;
+        assert!(source_rtt > Duration::ZERO);
+        assert_eq!(
+            client.hot.cc.smoothed_rtt(),
+            source_rtt,
+            "controller RTT must mirror the single RTT source exactly"
+        );
+    }
+
+    fn server_ack_to_client(client: &mut GtpConnection, datagram: &mut [u8], now: MonotonicTime) {
+        let server_addr: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        let _ = client.handle_incoming_datagram(server_addr, datagram, now);
     }
 
     #[test]
@@ -1127,7 +1187,11 @@ mod tests {
         let total = 24 + sealed_len;
 
         let d = server
-            .handle_incoming_datagram("127.0.0.1:5000".parse().unwrap(), &mut late_buf[..total], now)
+            .handle_incoming_datagram(
+                "127.0.0.1:5000".parse().unwrap(),
+                &mut late_buf[..total],
+                now,
+            )
             .unwrap();
         assert!(
             d.is_empty(),
@@ -1229,7 +1293,9 @@ mod tests {
             .unwrap();
 
         // KEY_PHASE advertised on the sealed header
-        let header = gtp_wire::PacketHeader::decode(&post_buf[..post_len]).unwrap().0;
+        let header = gtp_wire::PacketHeader::decode(&post_buf[..post_len])
+            .unwrap()
+            .0;
         assert!(header.flags.key_phase());
 
         let delivered = server
@@ -1276,7 +1342,10 @@ mod tests {
             .produce_outgoing_datagram(now, &mut out)
             .unwrap()
             .unwrap();
-        assert_eq!(dest, new_server_addr, "challenge must target the new address");
+        assert_eq!(
+            dest, new_server_addr,
+            "challenge must target the new address"
+        );
 
         let client_active_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
