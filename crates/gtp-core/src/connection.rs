@@ -4,7 +4,7 @@ use crate::state::{ConnectionCold, ConnectionHot, OutgoingControlFrame};
 use gtp_cc::{calculate_backpressure, BackpressureLevel, CongestionController};
 use gtp_crypto::DirectionalKeys;
 use gtp_recovery::{RetransmissionRecord, SentPacketRecord};
-use gtp_scheduler::{GameScheduler, OrderedGroupReceiver, SchedulableItem};
+use gtp_scheduler::{GameScheduler, SchedulableItem};
 use gtp_types::{
     ConnectionId, FragmentId, GenerationId, MessageClass, MessageId, MonotonicTime, OrderedGroupId,
     PriorityTier, Result, StateKey, StateSequence, TransmissionId, TransportError,
@@ -491,12 +491,10 @@ impl GtpConnection {
                             payload: payload.to_vec(),
                         });
                     } else {
-                        // Ordered reliable delivery
-                        let group = self
-                            .hot
-                            .ordered_groups
-                            .entry(group_id.as_u16())
-                            .or_insert_with(|| OrderedGroupReceiver::new(group_id));
+                        // Ordered reliable delivery. FR-2: the bounded accessor caps
+                        // the number of live groups so a peer cannot exhaust memory by
+                        // choosing many distinct wire-supplied group_ids.
+                        let group = self.hot.ordered_group_mut(group_id);
 
                         // ORD-2: a full reorder buffer isolates THIS frame only —
                         // the datagram (and its ACK bookkeeping) survives.
@@ -1175,6 +1173,56 @@ mod tests {
         assert!(client
             .send_unreliable(vec![0u8; max], PriorityTier::P1Input, None, now)
             .is_ok());
+    }
+
+    /// FR-2 / TEST-2: the receive-side ordered-group map must stay bounded even when a
+    /// peer streams reliable-ordered traffic across far more distinct `group_id`s than
+    /// `MAX_ORDERED_GROUPS`. Before the bound this map grew once per wire-chosen group
+    /// id with nothing ever reclaiming it — a remote memory-exhaustion vector.
+    #[test]
+    fn ordered_group_map_stays_bounded_under_many_wire_group_ids() {
+        use crate::state::MAX_ORDERED_GROUPS;
+        let cid = ConnectionId(0xF12_0000_0000_0002);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(2_000_000);
+
+        // Drive many more distinct ordered groups than the cap, one in-order message
+        // each, through the real produce -> handle_incoming_datagram RX dispatch.
+        let groups = (MAX_ORDERED_GROUPS as u32) * 3;
+        let mut delivered_total = 0usize;
+        for g in 1..=groups {
+            client
+                .send_reliable_ordered(
+                    OrderedGroupId(g as u16),
+                    format!("g{g}").into_bytes(),
+                    PriorityTier::P3ReliableGameplay,
+                    None,
+                    now,
+                )
+                .unwrap();
+            let mut buf = [0u8; 1500];
+            if let Some((_, len)) = client.produce_outgoing_datagram(now, &mut buf).unwrap() {
+                let d = server
+                    .handle_incoming_datagram(client_addr, &mut buf[..len], now)
+                    .unwrap();
+                delivered_total += d.len();
+            }
+        }
+
+        // Every in-order message was still delivered (the bound never blocks delivery)...
+        assert!(delivered_total > 0);
+        // ...but the live-group map never exceeds the cap despite far more group ids.
+        assert!(
+            server.hot.ordered_groups.len() <= MAX_ORDERED_GROUPS,
+            "ordered_groups grew to {} (cap {})",
+            server.hot.ordered_groups.len(),
+            MAX_ORDERED_GROUPS
+        );
+        assert_eq!(
+            server.hot.ordered_groups.len(),
+            server.hot.ordered_group_order.len()
+        );
     }
 
     #[test]
