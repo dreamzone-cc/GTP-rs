@@ -4,7 +4,7 @@ use crate::state::{ConnectionCold, ConnectionHot, OutgoingControlFrame};
 use gtp_cc::{calculate_backpressure, BackpressureLevel, CongestionController};
 use gtp_crypto::DirectionalKeys;
 use gtp_recovery::{RetransmissionRecord, SentPacketRecord};
-use gtp_scheduler::{OrderedGroupReceiver, SchedulableItem};
+use gtp_scheduler::SchedulableItem;
 use gtp_types::{
     ConnectionId, FragmentId, GenerationId, MessageClass, MessageId, MonotonicTime, OrderedGroupId,
     PriorityTier, Result, StateKey, StateSequence, TransmissionId, TransportError,
@@ -422,12 +422,10 @@ impl GtpConnection {
                             payload: payload.to_vec(),
                         });
                     } else {
-                        // Ordered reliable delivery
-                        let group = self
-                            .hot
-                            .ordered_groups
-                            .entry(group_id.as_u16())
-                            .or_insert_with(|| OrderedGroupReceiver::new(group_id));
+                        // Ordered reliable delivery. FR-2: the bounded accessor caps
+                        // the number of live groups so a peer cannot exhaust memory by
+                        // choosing many distinct wire-supplied group_ids.
+                        let group = self.hot.ordered_group_mut(group_id);
 
                         // ORD-2: a full reorder buffer isolates THIS frame only —
                         // the datagram (and its ACK bookkeeping) survives.
@@ -808,7 +806,9 @@ impl GtpConnection {
     fn build_control_frame(ctrl: &OutgoingControlFrame) -> Frame<'_> {
         match ctrl {
             OutgoingControlFrame::Ping { nonce } => Frame::Ping { nonce: *nonce },
-            OutgoingControlFrame::PathChallenge { data, .. } => Frame::PathChallenge { data: *data },
+            OutgoingControlFrame::PathChallenge { data, .. } => {
+                Frame::PathChallenge { data: *data }
+            }
             OutgoingControlFrame::PathResponse { data, .. } => Frame::PathResponse { data: *data },
             OutgoingControlFrame::MtuProbe {
                 probe_id,
@@ -955,6 +955,56 @@ mod tests {
         let server =
             GtpConnection::new_with_role(cid, client_addr, true, false, GtpConfig::default());
         (client, server)
+    }
+
+    /// FR-2 / TEST-2: the receive-side ordered-group map must stay bounded even when a
+    /// peer streams reliable-ordered traffic across far more distinct `group_id`s than
+    /// `MAX_ORDERED_GROUPS`. Before the bound this map grew once per wire-chosen group
+    /// id with nothing ever reclaiming it — a remote memory-exhaustion vector.
+    #[test]
+    fn ordered_group_map_stays_bounded_under_many_wire_group_ids() {
+        use crate::state::MAX_ORDERED_GROUPS;
+        let cid = ConnectionId(0xF12_0000_0000_0002);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(2_000_000);
+
+        // Drive many more distinct ordered groups than the cap, one in-order message
+        // each, through the real produce -> handle_incoming_datagram RX dispatch.
+        let groups = (MAX_ORDERED_GROUPS as u32) * 3;
+        let mut delivered_total = 0usize;
+        for g in 1..=groups {
+            client
+                .send_reliable_ordered(
+                    OrderedGroupId(g as u16),
+                    format!("g{g}").into_bytes(),
+                    PriorityTier::P3ReliableGameplay,
+                    None,
+                    now,
+                )
+                .unwrap();
+            let mut buf = [0u8; 1500];
+            if let Some((_, len)) = client.produce_outgoing_datagram(now, &mut buf).unwrap() {
+                let d = server
+                    .handle_incoming_datagram(client_addr, &mut buf[..len], now)
+                    .unwrap();
+                delivered_total += d.len();
+            }
+        }
+
+        // Every in-order message was still delivered (the bound never blocks delivery)...
+        assert!(delivered_total > 0);
+        // ...but the live-group map never exceeds the cap despite far more group ids.
+        assert!(
+            server.hot.ordered_groups.len() <= MAX_ORDERED_GROUPS,
+            "ordered_groups grew to {} (cap {})",
+            server.hot.ordered_groups.len(),
+            MAX_ORDERED_GROUPS
+        );
+        assert_eq!(
+            server.hot.ordered_groups.len(),
+            server.hot.ordered_group_order.len()
+        );
     }
 
     #[test]
@@ -1127,7 +1177,11 @@ mod tests {
         let total = 24 + sealed_len;
 
         let d = server
-            .handle_incoming_datagram("127.0.0.1:5000".parse().unwrap(), &mut late_buf[..total], now)
+            .handle_incoming_datagram(
+                "127.0.0.1:5000".parse().unwrap(),
+                &mut late_buf[..total],
+                now,
+            )
             .unwrap();
         assert!(
             d.is_empty(),
@@ -1229,7 +1283,9 @@ mod tests {
             .unwrap();
 
         // KEY_PHASE advertised on the sealed header
-        let header = gtp_wire::PacketHeader::decode(&post_buf[..post_len]).unwrap().0;
+        let header = gtp_wire::PacketHeader::decode(&post_buf[..post_len])
+            .unwrap()
+            .0;
         assert!(header.flags.key_phase());
 
         let delivered = server
@@ -1276,7 +1332,10 @@ mod tests {
             .produce_outgoing_datagram(now, &mut out)
             .unwrap()
             .unwrap();
-        assert_eq!(dest, new_server_addr, "challenge must target the new address");
+        assert_eq!(
+            dest, new_server_addr,
+            "challenge must target the new address"
+        );
 
         let client_active_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 

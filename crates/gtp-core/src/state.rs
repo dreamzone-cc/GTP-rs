@@ -6,7 +6,7 @@ use gtp_crypto::{
 use gtp_path::{AntiAmplificationLimiter, ConnectionState, PathValidator};
 use gtp_recovery::{AckTracker, LossDetector};
 use gtp_scheduler::{GameScheduler, OrderedGroupReceiver, StateTable};
-use gtp_types::{ConnectionId, MonotonicTime, PacketNumber};
+use gtp_types::{ConnectionId, MonotonicTime, OrderedGroupId, PacketNumber};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -81,6 +81,15 @@ impl DeliveredIndex {
 }
 
 /// Hot connection state: protocol engine fields for the inner send/receive loops.
+/// Maximum number of distinct receive-side ordered groups tracked at once (FR-2).
+///
+/// The `group_id` is chosen by the peer and read straight off the wire, so the map
+/// must be bounded or a peer can force unbounded allocation. A legitimate game uses a
+/// handful of ordered channels; 256 is far above any honest load. Eviction is
+/// insertion-order FIFO and costs only the freshness of the oldest group, never the
+/// correctness of an active one (the same trade-off as the `StateTable` bound).
+pub const MAX_ORDERED_GROUPS: usize = 256;
+
 pub struct ConnectionHot {
     pub connection_id: ConnectionId,
     pub next_packet_number: PacketNumber,
@@ -93,6 +102,10 @@ pub struct ConnectionHot {
     pub pacing: PacingEngine,
     pub scheduler: GameScheduler,
     pub ordered_groups: FxHashMap<u16, OrderedGroupReceiver>,
+    /// Insertion order of the live receive-side ordered groups (FR-2). Bounds the map
+    /// so a peer choosing many distinct `group_id`s off the wire cannot force unbounded
+    /// allocation (up to 65536 groups × 256 KB each).
+    pub ordered_group_order: VecDeque<u16>,
     /// RX-side freshness table (SEM-2): drops late sequenced state at the receiver.
     pub rx_state_table: StateTable,
     /// ReliableUnordered duplicate-delivery guard (ORD-4).
@@ -179,7 +192,9 @@ impl ConnectionHot {
             )
         };
 
-        Self::build(cid, peer_addr, tx, rx, None, tx_key, rx_key, tx_iv, rx_iv, false, true)
+        Self::build(
+            cid, peer_addr, tx, rx, None, tx_key, rx_key, tx_iv, rx_iv, false, true,
+        )
     }
 
     /// Builds a connection from directional handshake keys (SEC-1): `as_client`
@@ -291,6 +306,7 @@ impl ConnectionHot {
                     .unwrap_or(&(512 * 1024)),
             ),
             ordered_groups: FxHashMap::default(),
+            ordered_group_order: VecDeque::new(),
             rx_state_table: StateTable::new(),
             delivered_index: DeliveredIndex::new(4096),
             replay_window: ReplayWindow::new(),
@@ -315,6 +331,32 @@ impl ConnectionHot {
     /// Rotates BOTH direction keys in lockstep (SEC-6 / P2-5) and retains the old RX
     /// key for a grace window. Both peers must invoke this at the same logical point
     /// (documented limitation until a wire-level key update frame exists).
+    /// Returns the receive-side ordered group for `group_id`, creating it if new and
+    /// evicting the oldest group once `MAX_ORDERED_GROUPS` is reached (FR-2).
+    ///
+    /// Updating an already-tracked group does not touch the insertion order, so the
+    /// bound only trims groups that have been idle the longest. Eviction drops that
+    /// group's reorder buffer; if it later receives more traffic it is recreated fresh.
+    pub fn ordered_group_mut(&mut self, group_id: OrderedGroupId) -> &mut OrderedGroupReceiver {
+        let key = group_id.as_u16();
+        if !self.ordered_groups.contains_key(&key) {
+            while self.ordered_group_order.len() >= MAX_ORDERED_GROUPS {
+                match self.ordered_group_order.pop_front() {
+                    Some(oldest) => {
+                        self.ordered_groups.remove(&oldest);
+                    }
+                    None => break,
+                }
+            }
+            self.ordered_groups
+                .insert(key, OrderedGroupReceiver::new(group_id));
+            self.ordered_group_order.push_back(key);
+        }
+        self.ordered_groups
+            .get_mut(&key)
+            .expect("group is present: just inserted or already tracked")
+    }
+
     pub fn ratchet_session_key(&mut self) {
         if matches!(self.tx_protector, Protector::Plaintext(_)) {
             return;
