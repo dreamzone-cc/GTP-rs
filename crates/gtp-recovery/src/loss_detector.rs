@@ -42,6 +42,11 @@ pub struct DeliveryRateSample {
 pub struct LossDetector {
     pub rtt_stats: RttStats,
     sent_packets: BTreeMap<u64, SentPacketRecord>,
+    /// FR-3 / PERF-2: running total of in-flight bytes, maintained incrementally so
+    /// `inflight_bytes()` is O(1) instead of an O(N) scan. This is the SINGLE source
+    /// of truth for in-flight accounting — the congestion controller no longer keeps
+    /// its own mirror counter, which is what let the two diverge (the R-1 regression).
+    inflight_bytes: u64,
     largest_acked_packet: Option<PacketNumber>,
     largest_sent_packet: u64,
     pub time_of_last_ack_eliciting_packet: MonotonicTime,
@@ -57,6 +62,7 @@ impl Default for LossDetector {
         Self {
             rtt_stats: RttStats::new(),
             sent_packets: BTreeMap::new(),
+            inflight_bytes: 0,
             largest_acked_packet: None,
             largest_sent_packet: 0,
             time_of_last_ack_eliciting_packet: MonotonicTime::ZERO,
@@ -80,16 +86,27 @@ impl LossDetector {
         }
         self.total_bytes_sent += record.bytes as u64;
         self.largest_sent_packet = self.largest_sent_packet.max(record.packet_number.as_u64());
+        if record.in_flight {
+            self.inflight_bytes = self.inflight_bytes.saturating_add(record.bytes as u64);
+        }
         self.sent_packets
             .insert(record.packet_number.as_u64(), record);
     }
 
+    /// In-flight bytes — the single source of truth for congestion accounting (FR-3),
+    /// maintained incrementally so this is O(1) (PERF-2). In debug builds it is checked
+    /// against a full scan of `sent_packets` so any missed update path fails loudly.
     pub fn inflight_bytes(&self) -> u64 {
-        self.sent_packets
-            .values()
-            .filter(|p| p.in_flight)
-            .map(|p| p.bytes as u64)
-            .sum()
+        debug_assert_eq!(
+            self.inflight_bytes,
+            self.sent_packets
+                .values()
+                .filter(|p| p.in_flight)
+                .map(|p| p.bytes as u64)
+                .sum::<u64>(),
+            "inflight_bytes counter drifted from the sent_packets scan"
+        );
+        self.inflight_bytes
     }
 
     /// True once at least one authenticated ACK from the peer has been processed.
@@ -202,6 +219,7 @@ impl LossDetector {
                 // ACK-only packets would otherwise leak phantom congestion debt.
                 if record.in_flight {
                     bytes_acked += record.bytes;
+                    self.inflight_bytes = self.inflight_bytes.saturating_sub(record.bytes as u64);
                 }
                 if pn == largest_pn {
                     let sample = now.duration_since(record.send_time);
@@ -282,6 +300,10 @@ impl LossDetector {
         for pn in lost_pns {
             if let Some(record) = self.sent_packets.remove(&pn) {
                 bytes_lost += record.bytes;
+                // in_flight is always true here (filtered above), but guard anyway.
+                if record.in_flight {
+                    self.inflight_bytes = self.inflight_bytes.saturating_sub(record.bytes as u64);
+                }
                 for frame in record.retransmittable_frames.clone() {
                     retransmittable.push(frame);
                 }
@@ -323,7 +345,6 @@ impl LossDetector {
 
         let mut retransmittable = Vec::new();
         let mut drained: Vec<u64> = Vec::new();
-        let mut bytes_drained: usize = 0;
 
         for (&pn, record) in &self.sent_packets {
             if drained.len() >= MAX_PTO_RETRANSMIT_BURST {
@@ -335,17 +356,27 @@ impl LossDetector {
             for frame in &record.retransmittable_frames {
                 retransmittable.push(frame.clone());
             }
-            bytes_drained = bytes_drained.saturating_add(record.bytes);
             drained.push(pn);
         }
 
+        let mut bytes_drained = 0u64;
         for pn in drained {
-            self.sent_packets.remove(&pn);
+            if let Some(record) = self.sent_packets.remove(&pn) {
+                if record.in_flight {
+                    bytes_drained = bytes_drained.saturating_add(record.bytes as u64);
+                }
+            }
         }
+        // FR-3: the drained records leave the in-flight set, so the single counter must
+        // shed their bytes. (This is exactly the debt that used to strand the CC mirror
+        // counter in R-1; with one source of truth it can no longer diverge.)
+        self.inflight_bytes = self.inflight_bytes.saturating_sub(bytes_drained);
 
         LossEvent {
             lost_packets: Vec::new(),
-            bytes_lost: bytes_drained,
+            // R-1: report the drained bytes so the congestion controller settles the
+            // debt for records that will never be acked or swept again.
+            bytes_lost: bytes_drained as usize,
             retransmittable,
         }
     }
@@ -658,6 +689,37 @@ mod tests {
             ev.lost_packets.is_empty(),
             "a PTO is a probe, not a loss declaration"
         );
+        assert_eq!(detector.inflight_bytes(), 0);
+    }
+
+    /// FR-3 / TEST-3: in-flight bytes are owned by a single incremental counter, and
+    /// every path that removes an outstanding record sheds its bytes from that counter.
+    /// A PTO drain is the case that stranded the old CC mirror counter (the R-1
+    /// regression); here the one source of truth reflects it immediately. Every
+    /// `inflight_bytes()` call also runs the debug-build drift check against the scan.
+    #[test]
+    fn inflight_is_a_single_source_and_pto_drain_sheds_it() {
+        let mut detector = LossDetector::new();
+        let now = MonotonicTime::from_micros(1_000_000);
+
+        // 5 in-flight ack-eliciting packets, 100 bytes each.
+        for pn in 1..=5 {
+            detector.on_packet_sent(record(pn));
+        }
+        assert_eq!(detector.inflight_bytes(), 500);
+
+        // A PTO sweep drains a bounded burst (MAX_PTO_RETRANSMIT_BURST = 2) and the
+        // single counter loses exactly those bytes — no debt is stranded.
+        detector.on_timeout(now);
+        assert_eq!(
+            detector.inflight_bytes(),
+            500 - (MAX_PTO_RETRANSMIT_BURST as u64) * 100,
+            "drained records must leave the single in-flight source"
+        );
+
+        // Acknowledging the rest settles in-flight to zero.
+        let ranges = [AckRange { gap: 0, length: 4 }];
+        let _ = detector.on_ack_received(PacketNumber(5), 0, &ranges, 1, now);
         assert_eq!(detector.inflight_bytes(), 0);
     }
 }

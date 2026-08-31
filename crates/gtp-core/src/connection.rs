@@ -741,7 +741,8 @@ impl GtpConnection {
         let send_budget = self
             .hot
             .pacing
-            .send_budget(self.hot.cc.cwnd(), self.hot.cc.inflight());
+            // FR-3: in-flight comes from the loss detector, the single source of truth.
+            .send_budget(self.hot.cc.cwnd(), self.hot.loss_detector.inflight_bytes());
 
         let should_ack = self.hot.ack_tracker.should_send_ack(now);
         let has_queued_data =
@@ -1075,7 +1076,7 @@ impl GtpConnection {
             smoothed_rtt: rtt.smoothed_rtt,
             min_rtt: rtt.min_rtt,
             cwnd_bytes: self.hot.cc.cwnd(),
-            inflight_bytes: self.hot.cc.inflight(),
+            inflight_bytes: self.hot.loss_detector.inflight_bytes(),
             pacing_rate_bps: self.hot.cc.pacing_rate(),
             backpressure,
             effective_queue_bytes: eff_queue,

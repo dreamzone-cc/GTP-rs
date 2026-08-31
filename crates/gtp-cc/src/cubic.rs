@@ -27,7 +27,6 @@ pub struct CubicCongestionController {
     origin_point: u64,
     smoothed_rtt: Duration,
     min_rtt: Duration,
-    inflight: u64,
     last_loss_time: Option<MonotonicTime>,
 }
 
@@ -87,7 +86,6 @@ impl CubicCongestionController {
             origin_point: initial_cwnd,
             smoothed_rtt: Duration::from_millis(50),
             min_rtt: Duration::from_millis(50),
-            inflight: 0,
             last_loss_time: None,
         }
     }
@@ -164,12 +162,11 @@ impl CubicCongestionController {
 }
 
 impl CongestionController for CubicCongestionController {
-    fn on_packet_sent(&mut self, _pn: PacketNumber, bytes: usize, _send_time: MonotonicTime) {
-        self.inflight = self.inflight.saturating_add(bytes as u64);
+    fn on_packet_sent(&mut self, _pn: PacketNumber, _bytes: usize, _send_time: MonotonicTime) {
+        // FR-3: in-flight accounting lives in the loss detector; nothing to mirror here.
     }
 
     fn on_ack(&mut self, ack_event: &AckEvent, now: MonotonicTime) {
-        self.inflight = self.inflight.saturating_sub(ack_event.bytes_acked as u64);
         if let Some(rtt) = ack_event.rtt_sample {
             self.on_rtt(rtt);
         }
@@ -181,7 +178,6 @@ impl CongestionController for CubicCongestionController {
     }
 
     fn on_loss(&mut self, loss_event: &LossEvent, now: MonotonicTime) {
-        self.inflight = self.inflight.saturating_sub(loss_event.bytes_lost as u64);
         if !loss_event.lost_packets.is_empty() {
             self.on_congestion_event(now);
         }
@@ -225,10 +221,6 @@ impl CongestionController for CubicCongestionController {
         let base_rate = (self.cwnd as f64 / rtt_secs) * self.pacing_gain;
         (base_rate.max(10_000.0)) as u64 // Minimum 10 KB/s
     }
-
-    fn inflight(&self) -> u64 {
-        self.inflight
-    }
 }
 
 #[cfg(test)]
@@ -243,9 +235,10 @@ mod tests {
         let initial_cwnd = cubic.cwnd();
         assert_eq!(initial_cwnd, 12_000);
 
-        // Simulate packet sent
+        // Simulate packet sent. FR-3: the controller no longer mirrors in-flight bytes
+        // (that is the loss detector's single source of truth), so this test now only
+        // exercises what CUBIC owns — the congestion window.
         cubic.on_packet_sent(PacketNumber(1), 1200, now);
-        assert_eq!(cubic.inflight(), 1200);
 
         // Simulate ACK received -> window grows
         let ack_ev = AckEvent {
@@ -256,7 +249,6 @@ mod tests {
         };
         cubic.on_ack(&ack_ev, now + Duration::from_millis(50));
         assert!(cubic.cwnd() > initial_cwnd);
-        assert_eq!(cubic.inflight(), 0);
 
         // Simulate Loss Event -> window reduces to beta * cwnd
         let current_cwnd = cubic.cwnd();
@@ -359,27 +351,9 @@ mod tests {
         assert_eq!(cubic.min_cwnd_bytes, 10_000);
     }
 
-    #[test]
-    fn pto_drained_bytes_leave_the_inflight_counter() {
-        // R-1: without settling the drained bytes, `inflight` ratchets up for the
-        // rest of the connection and `cwnd - inflight` collapses to zero, stalling
-        // the sender permanently even after the path recovers.
-        let mut cubic = CubicCongestionController::new(1200);
-        let now = MonotonicTime::from_micros(1_000_000);
-
-        cubic.on_packet_sent(PacketNumber(1), 1200, now);
-        cubic.on_packet_sent(PacketNumber(2), 1200, now);
-        assert_eq!(cubic.inflight(), 2400);
-
-        cubic.on_timeout(now);
-        let drained = LossEvent {
-            lost_packets: Vec::new(),
-            bytes_lost: 2400,
-            retransmittable: Vec::new(),
-        };
-        cubic.on_loss(&drained, now);
-
-        assert_eq!(cubic.inflight(), 0);
-        assert!(cubic.cwnd() > 0);
-    }
+    // R-1's `pto_drained_bytes_leave_the_inflight_counter` test was removed in the
+    // FR-3 merge: the controller no longer tracks in-flight bytes at all (that is now
+    // the loss detector's single source of truth). R-1's concern — that a PTO drain
+    // settles the in-flight debt rather than stranding it — is preserved by
+    // `inflight_is_a_single_source_and_pto_drain_sheds_it` in gtp-recovery.
 }

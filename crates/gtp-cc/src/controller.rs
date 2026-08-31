@@ -16,5 +16,8 @@ pub trait CongestionController: Send + Sync {
     fn on_timeout(&mut self, now: MonotonicTime);
     fn cwnd(&self) -> u64;
     fn pacing_rate(&self) -> u64; // Bytes per second
-    fn inflight(&self) -> u64;
+                                  // FR-3: in-flight accounting is owned solely by the loss detector
+                                  // (`LossDetector::inflight_bytes`). The controller no longer mirrors it, so the two
+                                  // can never diverge (the R-1 regression). Callers read in-flight from the recovery
+                                  // layer, which is the single source of truth derived from the outstanding set.
 }

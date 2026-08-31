@@ -162,7 +162,8 @@ impl<'a> ConnectionControl<'a> {
             pto_duration: rtt.pto_duration(),
 
             cwnd_bytes: gtp_cc::CongestionController::cwnd(&self.hot.cc),
-            inflight_bytes: gtp_cc::CongestionController::inflight(&self.hot.cc),
+            // FR-3: single source of truth for in-flight bytes is the loss detector.
+            inflight_bytes: self.hot.loss_detector.inflight_bytes(),
             pacing_rate_bps: gtp_cc::CongestionController::pacing_rate(&self.hot.cc),
             pacing_tokens_remaining: self.hot.pacing.tokens_bytes(),
             backpressure,
