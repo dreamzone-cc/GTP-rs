@@ -8,11 +8,21 @@ pub enum TransportError {
     BufferOverflow,
     AuthenticationFailed,
     CryptoFailure,
-    TruncatedFrame { needed: usize, available: usize },
+    TruncatedFrame {
+        needed: usize,
+        available: usize,
+    },
     MalformedFrame(&'static str),
     ReplayDetected,
     ProtocolViolation(&'static str),
     ResourceLimitExceeded(&'static str),
+    /// FR-1: an application message whose payload exceeds what fits in a single
+    /// datagram at the minimum MTU. Rejected at `send_*` so it can never stall its
+    /// scheduler tier (there is no fragmentation yet — see CORE-2). `max` is the
+    /// largest payload the caller may send for that class.
+    PayloadTooLarge {
+        max: usize,
+    },
     PathValidationFailed,
     Timeout,
     HandshakeTimeout,
@@ -41,6 +51,9 @@ impl fmt::Display for TransportError {
             Self::ReplayDetected => write!(f, "Replayed packet rejected"),
             Self::ProtocolViolation(reason) => write!(f, "Protocol violation: {}", reason),
             Self::ResourceLimitExceeded(reason) => write!(f, "Resource limit exceeded: {}", reason),
+            Self::PayloadTooLarge { max } => {
+                write!(f, "Message payload exceeds maximum of {} bytes", max)
+            }
             Self::PathValidationFailed => write!(f, "Path validation failed"),
             Self::Timeout => write!(f, "Operation timed out"),
             Self::HandshakeTimeout => write!(f, "X25519 cryptographic handshake timed out"),

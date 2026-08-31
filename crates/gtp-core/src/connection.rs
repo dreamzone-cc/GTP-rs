@@ -12,6 +12,12 @@ use gtp_types::{
 use gtp_wire::{Frame, FrameIterator, PacketBuilder, PacketHeader, MIN_COMMON_HEADER_LEN};
 use std::net::SocketAddr;
 
+/// Worst-case fixed framing overhead of a single application message, taken from the
+/// `Data` frame (type 1, message_id 8, state_key 6, sequence 4, generation 4,
+/// deadline 2, payload_len 2 = 27 bytes). `ReliableData` is smaller (21 bytes), so 27
+/// is a safe upper bound for every send class (FR-1).
+const MAX_MESSAGE_FRAME_OVERHEAD: usize = 27;
+
 /// High-level Game Transport Protocol Connection Engine with dedicated Control API.
 pub struct GtpConnection {
     pub hot: ConnectionHot,
@@ -121,6 +127,20 @@ impl GtpConnection {
     // Semantic Game Send API
     // ==========================================
 
+    /// Largest application payload that is guaranteed to fit in a single datagram at
+    /// the minimum MTU, after the packet header, the AEAD tag, and the worst-case
+    /// per-message frame overhead (the `Data` frame at 27 bytes).
+    ///
+    /// FR-1: `send_*` rejects anything larger with [`TransportError::PayloadTooLarge`]
+    /// instead of accepting it. Without fragmentation (CORE-2) an oversized message
+    /// can never be encoded into a datagram, so it would otherwise sit at the head of
+    /// its scheduler tier forever and silently stall every message queued behind it.
+    pub fn max_message_payload(&self) -> usize {
+        self.config.min_mtu.saturating_sub(
+            MIN_COMMON_HEADER_LEN + self.hot.tx_protector.tag_len() + MAX_MESSAGE_FRAME_OVERHEAD,
+        )
+    }
+
     pub fn send_unreliable(
         &mut self,
         payload: Vec<u8>,
@@ -128,6 +148,11 @@ impl GtpConnection {
         deadline: Option<MonotonicTime>,
         now: MonotonicTime,
     ) -> Result<MessageId> {
+        // FR-1: reject before consuming a message id so an oversized send leaves no gap.
+        let max = self.max_message_payload();
+        if payload.len() > max {
+            return Err(TransportError::PayloadTooLarge { max });
+        }
         let msg_id = MessageId(self.hot.next_message_id);
         self.hot.next_message_id += 1;
 
@@ -154,6 +179,11 @@ impl GtpConnection {
         payload: Vec<u8>,
         now: MonotonicTime,
     ) -> Result<MessageId> {
+        // FR-1: reject before consuming a message id so an oversized send leaves no gap.
+        let max = self.max_message_payload();
+        if payload.len() > max {
+            return Err(TransportError::PayloadTooLarge { max });
+        }
         let msg_id = MessageId(self.hot.next_message_id);
         self.hot.next_message_id += 1;
 
@@ -182,6 +212,11 @@ impl GtpConnection {
         deadline: Option<MonotonicTime>,
         now: MonotonicTime,
     ) -> Result<MessageId> {
+        // FR-1: reject before consuming a message id so an oversized send leaves no gap.
+        let max = self.max_message_payload();
+        if payload.len() > max {
+            return Err(TransportError::PayloadTooLarge { max });
+        }
         let msg_id = MessageId(self.hot.next_message_id);
         self.hot.next_message_id += 1;
 
@@ -207,6 +242,13 @@ impl GtpConnection {
         deadline: Option<MonotonicTime>,
         now: MonotonicTime,
     ) -> Result<MessageId> {
+        // FR-1: reject BEFORE consuming an order_seq. An oversized ordered message that
+        // burned a sequence number would leave a permanent gap the receiver waits on
+        // forever, stalling the entire group.
+        let max = self.max_message_payload();
+        if payload.len() > max {
+            return Err(TransportError::PayloadTooLarge { max });
+        }
         let order_seq = self
             .hot
             .next_order_seqs
@@ -1056,6 +1098,83 @@ mod tests {
         let server =
             GtpConnection::new_with_role(cid, client_addr, true, false, GtpConfig::default());
         (client, server)
+    }
+
+    /// FR-1 / TEST-1: a message larger than one datagram must be rejected by `send_*`,
+    /// and must never stall its scheduler tier. Before the guard, an oversized reliable
+    /// message sat at the head of its tier forever — `pop_next` could never fit it — so
+    /// every message queued behind it was silently never sent.
+    #[test]
+    fn oversized_payload_is_rejected_and_never_stalls_a_tier() {
+        let cid = ConnectionId(0xF11_0000_0000_0001);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(1_000_000);
+
+        let max = client.max_message_payload();
+        assert!(max > 0 && max < client.config.min_mtu);
+        let oversized = vec![0xABu8; max + 1];
+
+        // (a) Every send class rejects an oversized payload with the typed error.
+        assert!(matches!(
+            client.send_unreliable(oversized.clone(), PriorityTier::P1Input, None, now),
+            Err(TransportError::PayloadTooLarge { max: m }) if m == max
+        ));
+        assert!(matches!(
+            client.send_reliable_unordered(
+                oversized.clone(),
+                PriorityTier::P3ReliableGameplay,
+                None,
+                now
+            ),
+            Err(TransportError::PayloadTooLarge { .. })
+        ));
+        assert!(matches!(
+            client.send_reliable_ordered(
+                OrderedGroupId(1),
+                oversized.clone(),
+                PriorityTier::P3ReliableGameplay,
+                None,
+                now
+            ),
+            Err(TransportError::PayloadTooLarge { .. })
+        ));
+
+        // A rejected ordered send must NOT have consumed an order_seq — otherwise the
+        // receiver would wait forever on the missing sequence number.
+        assert!(
+            !client.hot.next_order_seqs.contains_key(&1),
+            "a rejected ordered send must not burn an order_seq"
+        );
+
+        // (b)+(c) A normal message on the SAME group still flows end-to-end: the tier
+        // was never stalled, and the ordered group starts cleanly at seq 0.
+        let payload = b"small_after_rejected_large".to_vec();
+        client
+            .send_reliable_ordered(
+                OrderedGroupId(1),
+                payload.clone(),
+                PriorityTier::P3ReliableGameplay,
+                None,
+                now,
+            )
+            .expect("a within-limit message must be accepted");
+
+        let mut buf = [0u8; 1500];
+        let (_, len) = client
+            .produce_outgoing_datagram(now, &mut buf)
+            .unwrap()
+            .expect("the small message must produce a datagram");
+        let delivered = server
+            .handle_incoming_datagram(client_addr, &mut buf[..len], now)
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].payload, payload);
+
+        // A payload exactly at the limit is still accepted.
+        assert!(client
+            .send_unreliable(vec![0u8; max], PriorityTier::P1Input, None, now)
+            .is_ok());
     }
 
     #[test]
