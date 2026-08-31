@@ -194,7 +194,55 @@ impl GtpEndpoint {
             GtpConfig::competitive_fps(),
         );
 
-        Ok(self.register_connection(cid, conn).await)
+        let async_conn = self.register_connection(cid, conn).await;
+
+        // 5. Establishment confirmation. The server accepts the session only after
+        // it verifies this HandshakeFinish; a Finish that is lost — or that races
+        // ahead of the server's connection registration — leaves the session
+        // half-open, and the client would stream application data into a black hole
+        // with no way to notice. So do not declare the connection established on
+        // faith: enqueue an ack-eliciting Ping (which the tx loop sends), wait for
+        // the server's ACK, and retransmit the HandshakeFinish until that ACK
+        // arrives — mirroring the ClientHello retransmission above. An ACK can only
+        // come from a peer that decrypted our traffic, which proves it accepted and
+        // registered the connection.
+        let fin_datagram_len = fin_hdr_len + fin_frame_len;
+        let mut confirmed = false;
+        'confirm: for _ in 0..8 {
+            {
+                let mut guard = async_conn.conn.lock().await;
+                let now = MonotonicTime::now();
+                let _ = guard.control().send_ping(0x00C0_FFEE, now);
+            }
+            // Poll for the server's ACK for up to ~400ms (≈ several RTTs).
+            for _ in 0..8 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if async_conn
+                    .conn
+                    .lock()
+                    .await
+                    .hot
+                    .loss_detector
+                    .has_received_ack()
+                {
+                    confirmed = true;
+                    break 'confirm;
+                }
+            }
+            // No confirmation yet: the Finish may have been lost. Retransmit it.
+            let _ = self
+                .socket
+                .send_to(&fin_buf[..fin_datagram_len], peer_addr)
+                .await;
+        }
+
+        // If still unconfirmed after the retransmit budget, return the connection
+        // anyway: a genuinely one-way or dead path should still hand the caller a
+        // handle (the dead link is observable via telemetry — Total RX Packets stays
+        // 0) rather than blocking connect() indefinitely.
+        let _ = confirmed;
+
+        Ok(async_conn)
     }
 
     /// Registers a connection built from externally supplied directional keys.
@@ -320,7 +368,28 @@ impl GtpEndpoint {
                                         });
 
                                         let cookie = stateless_tokens.generate_cookie(src, now);
-                                        if let Some((existing_pair, _, _, _, _)) = psh.get(&cid) {
+                                        // Reuse the stored server ephemeral ONLY for a genuine
+                                        // ClientHello retransmit — one carrying the SAME client
+                                        // key material. A ClientHello for this CID that carries
+                                        // DIFFERENT client material is a new handshake (a fresh
+                                        // client that happens to reuse the connection id, or a
+                                        // stale entry left by an earlier attempt): it must
+                                        // supersede the stale entry, otherwise the ServerHello
+                                        // advertises an ephemeral derived against the OLD client
+                                        // key and the client_proof in the eventual
+                                        // HandshakeFinish can never match — the session then
+                                        // half-opens (server never accepts, client streams into a
+                                        // black hole). Keying the pending state on (CID + client
+                                        // ephemeral) instead of the CID alone closes that seam.
+                                        let is_retransmit = psh.get(&cid).is_some_and(
+                                            |(_, stored_pk, stored_nonce, _, _)| {
+                                                *stored_pk == client_public_key
+                                                    && *stored_nonce == client_nonce
+                                            },
+                                        );
+                                        if let Some((existing_pair, _, _, _, _)) =
+                                            psh.get(&cid).filter(|_| is_retransmit)
+                                        {
                                             (existing_pair.public_key, existing_pair.nonce, cookie)
                                         } else {
                                             let server_pair = EphemeralKeyPair::generate();

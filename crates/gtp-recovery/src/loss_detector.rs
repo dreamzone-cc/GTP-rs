@@ -92,6 +92,18 @@ impl LossDetector {
             .sum()
     }
 
+    /// True once at least one authenticated ACK from the peer has been processed.
+    ///
+    /// The client uses this as a handshake-establishment signal: an ACK can only
+    /// be produced by a peer that decrypted our traffic, which in turn means it
+    /// accepted and registered the connection. Until it flips true the peer may
+    /// never have completed acceptance (a lost HandshakeFinish leaves the session
+    /// half-open), so `connect()` retransmits the Finish rather than declaring the
+    /// connection established on faith.
+    pub fn has_received_ack(&self) -> bool {
+        self.largest_acked_packet.is_some()
+    }
+
     /// PTO duration with RFC 9002 §6.2 exponential backoff, capped at `max_pto`.
     pub fn pto_duration_with_backoff(&self, max_pto: Duration) -> Duration {
         let factor = 1u64 << self.pto_count.min(MAX_PTO_BACKOFF_EXPONENT);
