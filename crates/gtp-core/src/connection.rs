@@ -671,6 +671,19 @@ impl GtpConnection {
         }
     }
 
+    /// Restores control frames drained in step 3b of `produce_outgoing_datagram` when the
+    /// datagram they were appended to is rejected before transmission. `drained` is in
+    /// front-to-back order, so it is pushed back in reverse to preserve the original
+    /// queue order at the front.
+    fn requeue_controls(
+        queue: &mut std::collections::VecDeque<OutgoingControlFrame>,
+        drained: Vec<OutgoingControlFrame>,
+    ) {
+        for ctrl in drained.into_iter().rev() {
+            queue.push_front(ctrl);
+        }
+    }
+
     pub fn produce_outgoing_datagram(
         &mut self,
         now: MonotonicTime,
@@ -777,16 +790,24 @@ impl GtpConnection {
         let mut override_dest: Option<SocketAddr> = None;
 
         // R-7: a control frame aimed at an address other than the active path takes
-        // the whole datagram and is sent there. An ACK must never ride along: the
-        // real peer would never receive it, and our packet-number state would leak
-        // to an address that has not completed path validation.
-        let directed_ahead = matches!(
-            self.hot.control_queue.front(),
-            Some(
+        // over this datagram (override_dest) and is sent there. An ACK must never ride
+        // along: the real peer would never receive it, and our packet-number state
+        // would leak to an address that has not completed path validation. The drain in
+        // step 3b scans the WHOLE queue, so this guard must too — a directed frame
+        // sitting BEHIND another control frame (e.g. a queued Ping) is reached during the
+        // drain, and a front-only check would miss it and let the ACK ride to the probe
+        // address. Suppressing the ACK whenever any directed frame is queued is
+        // conservative: at worst the ACK is deferred one datagram (peek does not commit),
+        // never sent to the wrong peer.
+        let active_path = self.hot.active_path;
+        let directed_ahead = self.hot.control_queue.iter().any(|f| {
+            matches!(
+                f,
                 OutgoingControlFrame::PathResponse { dest, .. }
-                    | OutgoingControlFrame::PathChallenge { dest, .. },
-            ) if *dest != self.hot.active_path
-        );
+                    | OutgoingControlFrame::PathChallenge { dest, .. }
+                    if *dest != active_path
+            )
+        });
 
         // 3. Attach ACK Frame if needed.
         // R-3: peek only — the tracker is committed in step 8, after the datagram
@@ -800,7 +821,14 @@ impl GtpConnection {
             }
         }
 
-        // 3b. Drain protocol control frames as REAL frames (Core-C1 fix)
+        // 3b. Drain protocol control frames as REAL frames (Core-C1 fix).
+        // Unlike the data `popped` vec, a drained control frame is REMOVED from
+        // control_queue: if the datagram is later rejected (seal/finish failure,
+        // anti-amplification) it must be restored, or it is lost. `close_frame_sent`
+        // likewise must not be set until the datagram actually commits — otherwise a
+        // Close rejected by anti-amplification would be recorded as sent but never leave.
+        let mut drained_controls: Vec<OutgoingControlFrame> = Vec::new();
+        let mut close_drained = false;
         while let Some(ctrl) = self.hot.control_queue.pop_front() {
             if override_dest.is_some() {
                 // A directed frame owns this datagram; push the rest back.
@@ -816,18 +844,17 @@ impl GtpConnection {
             }
             let is_close = matches!(ctrl, OutgoingControlFrame::Close { .. });
             let frame = Self::build_control_frame(&ctrl);
-            match builder.append_frame(&frame) {
-                Ok(_) => {
-                    ack_eliciting = true;
-                    if is_close {
-                        self.hot.close_frame_sent = true;
-                    }
+            let appended = builder.append_frame(&frame).is_ok();
+            if appended {
+                ack_eliciting = true;
+                if is_close {
+                    close_drained = true;
                 }
-                Err(_) => {
-                    // Does not fit this datagram — retry next time at the front.
-                    self.hot.control_queue.push_front(ctrl);
-                    break;
-                }
+                drained_controls.push(ctrl);
+            } else {
+                // Does not fit this datagram — retry next time at the front.
+                self.hot.control_queue.push_front(ctrl);
+                break;
             }
         }
 
@@ -868,6 +895,7 @@ impl GtpConnection {
         let unencrypted_len = match finish_result {
             Ok(len) => len,
             Err(e) => {
+                Self::requeue_controls(&mut self.hot.control_queue, drained_controls);
                 Self::requeue_popped(&mut self.hot.scheduler, popped, now, &mut self.cold);
                 return Err(e);
             }
@@ -877,6 +905,7 @@ impl GtpConnection {
         let final_payload_len = unsealed_payload_len + self.hot.tx_protector.tag_len();
         if final_payload_len > u16::MAX as usize {
             // WIR-3: reject instead of truncating the declared length.
+            Self::requeue_controls(&mut self.hot.control_queue, drained_controls);
             Self::requeue_popped(&mut self.hot.scheduler, popped, now, &mut self.cold);
             return Err(TransportError::BufferOverflow);
         }
@@ -898,6 +927,7 @@ impl GtpConnection {
             Ok(len) => len,
             Err(e) => {
                 // R-4: a seal failure must not swallow the popped items either.
+                Self::requeue_controls(&mut self.hot.control_queue, drained_controls);
                 Self::requeue_popped(&mut self.hot.scheduler, popped, now, &mut self.cold);
                 return Err(e);
             }
@@ -905,15 +935,22 @@ impl GtpConnection {
 
         let total_datagram_len = header_len + sealed_payload_len;
 
-        // Check Anti-Amplification Limiter — on rejection, every popped item is
-        // re-queued; nothing reliable is lost to the gate.
+        // Check Anti-Amplification Limiter — on rejection, every popped item AND every
+        // drained control frame is re-queued; nothing reliable is lost to the gate.
         if !self.hot.anti_amplification.can_send(total_datagram_len) {
+            Self::requeue_controls(&mut self.hot.control_queue, drained_controls);
             Self::requeue_popped(&mut self.hot.scheduler, popped, now, &mut self.cold);
             return Ok(None);
         }
         self.hot
             .anti_amplification
             .on_bytes_sent(total_datagram_len);
+
+        // The datagram is now committed to transmission: only here is a drained Close
+        // recorded as sent (deferred from step 3b so a rejected datagram cannot mark it).
+        if close_drained {
+            self.hot.close_frame_sent = true;
+        }
 
         // 7. Record In-Flight and CC Telemetry. P1-3: ACK-only datagrams carry no
         // congestion debt — cc accounting counts ack-eliciting traffic only.
@@ -943,11 +980,12 @@ impl GtpConnection {
             self.hot.ack_tracker.commit_ack_sent(now);
         }
 
-        // R-6: retire the pre-ratchet RX key once the grace window has elapsed so a
-        // compromised old key cannot be used to inject packets for the rest of the
-        // session, and so the retired material is dropped (and zeroized) promptly.
-        self.hot.tick_rx_key_grace();
-
+        // R-6: the pre-ratchet RX-key grace window is aged only on the RECEIVE path (see
+        // handle_incoming_datagram) — it protects still-in-flight INBOUND packets sealed
+        // with the old key, so it must count inbound datagrams, not outbound ones. Aging
+        // it here on TX too coupled retirement to send volume: a send-heavy peer could
+        // exhaust the window within one RTT and drop the old RX key before the reordered
+        // inbound packets it was meant to keep openable had arrived.
         let dest = override_dest.unwrap_or(self.hot.active_path);
         Ok(Some((dest, total_datagram_len)))
     }
@@ -2003,6 +2041,157 @@ mod tests {
         assert!(
             !server.hot.ack_tracker.should_send_ack(now),
             "the ACK is only committed once it is actually on the wire"
+        );
+    }
+
+    /// R-7 (seam gap): the ACK-suppression guard must hold even when the directed frame
+    /// sits BEHIND another control frame. The guard originally inspected only
+    /// `control_queue.front()`, but step 3b drains the whole queue — so a queued Ping
+    /// ahead of a directed PATH_CHALLENGE let the ACK through to the probe address and
+    /// committed the ACK the real peer needed.
+    ///
+    /// Negative check: restore the front-only guard and this fails — with a Ping at the
+    /// front, `directed_ahead` is false, the ACK rides to `probe_addr`, and
+    /// `should_send_ack` flips to false (committed).
+    #[test]
+    fn directed_control_behind_a_frame_still_carries_no_ack() {
+        let cid = ConnectionId(0xD17E_0000_0000_000B);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(11_000_000);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let probe_addr: SocketAddr = "127.0.0.1:5200".parse().unwrap();
+
+        // The server owes an ACK.
+        client
+            .send_unreliable(b"input".to_vec(), PriorityTier::P1Input, None, now)
+            .unwrap();
+        let mut buf = [0u8; 1500];
+        let (_, len) = client
+            .produce_outgoing_datagram(now, &mut buf)
+            .unwrap()
+            .unwrap();
+        server
+            .handle_incoming_datagram(client_addr, &mut buf[..len], now)
+            .unwrap();
+        assert!(server.hot.ack_tracker.should_send_ack(now));
+
+        // A Ping is queued AHEAD of a directed challenge. The datagram is still taken
+        // over by the challenge and directed at the probe address.
+        server.control().send_ping(0xFEED, now).unwrap();
+        server
+            .control()
+            .trigger_path_challenge(probe_addr, [0x33; 8], now)
+            .unwrap();
+
+        let mut out = [0u8; 1500];
+        let (dest, out_len) = server
+            .produce_outgoing_datagram(now, &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(dest, probe_addr, "the directed challenge owns the datagram");
+
+        let kinds = opened_frame_kinds(&mut out[..out_len], server.hot.tx_key, server.hot.tx_iv);
+        assert!(
+            kinds.contains(&"PathChallenge"),
+            "the directed datagram must still carry the challenge, got {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"Ack"),
+            "an ACK must not ride even when the directed frame is behind another, got {kinds:?}"
+        );
+        assert!(
+            server.hot.ack_tracker.should_send_ack(now),
+            "the ACK the genuine peer needs must stay pending, not commit to the probe"
+        );
+    }
+
+    /// A control frame drained into a datagram that is then REJECTED by
+    /// anti-amplification must be returned to the queue, and a Close must not be marked
+    /// sent until the datagram commits. Before the fix only the data `popped` items were
+    /// requeued: the drained Close was lost and `close_frame_sent` was set for a datagram
+    /// that never left.
+    ///
+    /// Negative check: skip `requeue_controls` on the anti-amp path and the queue is left
+    /// empty; stop deferring `close_frame_sent` and it is true here despite no send.
+    #[test]
+    fn drained_control_is_restored_when_the_datagram_is_rejected() {
+        let cid = ConnectionId(0xC105_0000_0000_000C);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let mut server =
+            GtpConnection::new_with_role(cid, client_addr, false, false, GtpConfig::default());
+        // Force the unvalidated state: a fresh limiter with zero received bytes has zero
+        // send budget, so can_send rejects — exactly the amplification-limited window.
+        server.hot.anti_amplification = gtp_path::AntiAmplificationLimiter::new();
+        let now = MonotonicTime::from_micros(12_000_000);
+        assert!(!server.hot.anti_amplification.is_validated());
+
+        server
+            .hot
+            .control_queue
+            .push_back(OutgoingControlFrame::Close {
+                error_code: 7,
+                reason: "bye".to_string(),
+            });
+
+        let mut out = [0u8; 1500];
+        let produced = server.produce_outgoing_datagram(now, &mut out).unwrap();
+
+        assert!(
+            produced.is_none(),
+            "anti-amplification must reject the datagram from the unvalidated peer"
+        );
+        assert_eq!(
+            server.hot.control_queue.len(),
+            1,
+            "the drained Close must be restored for a later attempt"
+        );
+        assert!(matches!(
+            server.hot.control_queue.front(),
+            Some(OutgoingControlFrame::Close { error_code: 7, .. })
+        ));
+        assert!(
+            !server.hot.close_frame_sent,
+            "close_frame_sent must stay false until the Close actually goes out"
+        );
+    }
+
+    /// R-6 (seam): the post-ratchet RX-key grace window tracks INBOUND reordering, so it
+    /// must be aged only on the receive path. A send-heavy peer emitting many datagrams
+    /// within one RTT must not retire its old RX key early.
+    ///
+    /// Negative check: restore the TX-path `tick_rx_key_grace()` and this fails — the
+    /// window drains to zero and `rx_protector_prev` is dropped by send-only activity.
+    #[test]
+    fn outbound_traffic_does_not_age_the_rx_key_grace_window() {
+        use crate::state::RX_PREV_KEY_GRACE_PACKETS;
+        let cid = ConnectionId(0x8AC8_0000_0000_000D);
+        let (mut client, _server) = loopback_pair(cid);
+        let mut now = MonotonicTime::from_micros(13_000_000);
+
+        client.control().ratchet_key();
+        assert_eq!(client.hot.rx_prev_grace_packets, RX_PREV_KEY_GRACE_PACKETS);
+        assert!(client.hot.rx_protector_prev.is_some());
+
+        // Produce well past a full window of outbound datagrams — receiving nothing.
+        let mut buf = [0u8; 1500];
+        for _ in 0..(RX_PREV_KEY_GRACE_PACKETS + 8) {
+            now += Duration::from_millis(1);
+            client
+                .send_unreliable(b"tx".to_vec(), PriorityTier::P1Input, None, now)
+                .unwrap();
+            client
+                .produce_outgoing_datagram(now, &mut buf)
+                .unwrap()
+                .expect("client keeps producing datagrams");
+        }
+
+        assert_eq!(
+            client.hot.rx_prev_grace_packets, RX_PREV_KEY_GRACE_PACKETS,
+            "outbound traffic must not age the inbound grace window"
+        );
+        assert!(
+            client.hot.rx_protector_prev.is_some(),
+            "the retained RX key must survive send-only activity"
         );
     }
 }
