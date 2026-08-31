@@ -26,7 +26,6 @@ pub struct CubicCongestionController {
     epoch_start: Option<MonotonicTime>,
     origin_point: u64,
     smoothed_rtt: Duration,
-    min_rtt: Duration,
     last_loss_time: Option<MonotonicTime>,
 }
 
@@ -85,7 +84,6 @@ impl CubicCongestionController {
             epoch_start: None,
             origin_point: initial_cwnd,
             smoothed_rtt: Duration::from_millis(50),
-            min_rtt: Duration::from_millis(50),
             last_loss_time: None,
         }
     }
@@ -131,6 +129,14 @@ impl CubicCongestionController {
         self.min_cwnd_bytes
     }
 
+    /// The RTT the controller currently uses for pacing and the once-per-RTT loss
+    /// guard. FR-4: this is a mirror of the loss detector's `RttStats::smoothed_rtt`
+    /// (the single source of truth), synced on every ACK — never an independent
+    /// estimate. Exposed so telemetry and tests can confirm the two stay identical.
+    pub fn smoothed_rtt(&self) -> Duration {
+        self.smoothed_rtt
+    }
+
     fn on_congestion_event(&mut self, now: MonotonicTime) {
         // Prevent multiple window reductions in the same RTT
         if let Some(last_loss) = self.last_loss_time {
@@ -167,9 +173,10 @@ impl CongestionController for CubicCongestionController {
     }
 
     fn on_ack(&mut self, ack_event: &AckEvent, now: MonotonicTime) {
-        if let Some(rtt) = ack_event.rtt_sample {
-            self.on_rtt(rtt);
-        }
+        // FR-3: in-flight is owned by the loss detector; nothing to subtract here.
+        // FR-4: the RTT used for pacing and the once-per-RTT loss guard is synced from
+        // the loss detector (the single source of truth) via `on_rtt`, called by the
+        // connection after each ACK — no second RTT estimate is derived here.
         // CC-2: the window only grows on NEW acknowledgements carrying bytes —
         // duplicate/empty ACK frames must not inflate cwnd.
         if ack_event.bytes_acked > 0 {
@@ -189,12 +196,11 @@ impl CongestionController for CubicCongestionController {
         }
     }
 
-    fn on_rtt(&mut self, rtt_sample: Duration) {
-        // CC-4: true EWMA instead of storing the raw last sample, so the once-per-RTT
-        // loss guard and the pacing rate do not jitter with single observations.
-        self.smoothed_rtt =
-            Duration::from_micros((self.smoothed_rtt.as_micros() * 7 + rtt_sample.as_micros()) / 8);
-        self.min_rtt = self.min_rtt.min(rtt_sample);
+    fn on_rtt(&mut self, smoothed_rtt: Duration) {
+        // FR-4: `smoothed_rtt` is the authoritative value from the loss detector's
+        // RttStats (the single RTT source), not a raw sample. The controller stores it
+        // directly and no longer keeps a second EWMA that could drift from RttStats.
+        self.smoothed_rtt = smoothed_rtt;
     }
 
     fn on_timeout(&mut self, now: MonotonicTime) {

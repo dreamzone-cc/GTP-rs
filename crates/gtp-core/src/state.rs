@@ -335,7 +335,7 @@ impl ConnectionHot {
             control_queue: VecDeque::new(),
             close_frame_sent: false,
             anti_amplification: anti_amp,
-            path_validator: PathValidator::new(peer_addr),
+            path_validator: PathValidator::new(),
             next_message_id: 1,
             next_order_seqs: FxHashMap::default(),
             packets_since_ratchet: 0,

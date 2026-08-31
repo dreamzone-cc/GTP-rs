@@ -4,32 +4,32 @@ use std::net::SocketAddr;
 pub const PATH_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Validates network paths and manages NAT rebinding via PATH_CHALLENGE/PATH_RESPONSE frames.
-#[derive(Clone, Debug)]
+///
+/// FR-4: the validator does NOT track the active path. The active path is owned solely
+/// by the connection (`ConnectionHot::active_path`); the validator only verifies a
+/// challenge/response and reports success, and the connection performs the migration.
+/// This keeps a single source of truth for the active address (the validator previously
+/// held a duplicate copy that nothing read and that could silently diverge).
+#[derive(Clone, Debug, Default)]
 pub struct PathValidator {
-    active_path: SocketAddr,
     pending_challenge: Option<(SocketAddr, [u8; 8], MonotonicTime)>,
 }
 
 impl PathValidator {
-    pub fn new(initial_path: SocketAddr) -> Self {
+    pub fn new() -> Self {
         Self {
-            active_path: initial_path,
             pending_challenge: None,
         }
-    }
-
-    pub fn active_path(&self) -> SocketAddr {
-        self.active_path
-    }
-
-    pub fn is_active_path(&self, addr: SocketAddr) -> bool {
-        self.active_path == addr
     }
 
     pub fn start_challenge(&mut self, new_addr: SocketAddr, nonce: [u8; 8], now: MonotonicTime) {
         self.pending_challenge = Some((new_addr, nonce, now));
     }
 
+    /// Verifies a PATH_RESPONSE against the pending challenge. Returns `true` when the
+    /// response is valid (correct source, matching nonce, within the timeout); the
+    /// caller then migrates its own active path. The pending challenge is cleared on a
+    /// successful match so a nonce cannot be replayed.
     pub fn validate_response(
         &mut self,
         addr: SocketAddr,
@@ -41,7 +41,6 @@ impl PathValidator {
                 && response_data == &expected_nonce
                 && now.duration_since(start_time) <= PATH_CHALLENGE_TIMEOUT
             {
-                self.active_path = addr;
                 self.pending_challenge = None;
                 return true;
             }
@@ -56,28 +55,28 @@ mod tests {
 
     #[test]
     fn test_path_validation_and_nat_rebinding() {
-        let initial_addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
         let new_addr: SocketAddr = "192.168.1.100:6000".parse().unwrap(); // NAT port changed!
-        let mut validator = PathValidator::new(initial_addr);
-
-        assert!(validator.is_active_path(initial_addr));
-        assert!(!validator.is_active_path(new_addr));
+        let mut validator = PathValidator::new();
 
         let now = MonotonicTime::from_micros(1_000_000);
         let challenge_nonce = [1, 2, 3, 4, 5, 6, 7, 8];
         validator.start_challenge(new_addr, challenge_nonce, now);
 
-        // Incorrect response data -> rejected
+        // Wrong nonce -> rejected, and the challenge stays pending for a real response.
         assert!(!validator.validate_response(new_addr, &[0; 8], now + Duration::from_millis(50)));
-        assert_eq!(validator.active_path(), initial_addr);
 
-        // Correct response data -> active path switched to new_addr
+        // Wrong source address -> rejected even with the correct nonce.
+        let attacker: SocketAddr = "10.0.0.9:6000".parse().unwrap();
+        assert!(!validator.validate_response(attacker, &challenge_nonce, now));
+
+        // Correct source + nonce within the timeout -> validated (the caller migrates).
         assert!(validator.validate_response(
             new_addr,
             &challenge_nonce,
             now + Duration::from_millis(50)
         ));
-        assert_eq!(validator.active_path(), new_addr);
-        assert!(validator.is_active_path(new_addr));
+
+        // The pending challenge was consumed: the same nonce cannot be replayed.
+        assert!(!validator.validate_response(new_addr, &challenge_nonce, now));
     }
 }

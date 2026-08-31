@@ -1001,7 +1001,7 @@ async fn main() -> Result<()> {
                     .await;
 
                 // Real cryptographic path validation
-                let mut path_val = gtp_path::PathValidator::new(addr_1);
+                let mut path_val = gtp_path::PathValidator::new();
                 let nonce = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11];
                 let now = gtp::MonotonicTime::now();
                 path_val.start_challenge(addr_2, nonce, now);
