@@ -650,7 +650,8 @@ impl GtpConnection {
         let send_budget = self
             .hot
             .pacing
-            .send_budget(self.hot.cc.cwnd(), self.hot.cc.inflight());
+            // FR-3: in-flight comes from the loss detector, the single source of truth.
+            .send_budget(self.hot.cc.cwnd(), self.hot.loss_detector.inflight_bytes());
 
         let should_ack = self.hot.ack_tracker.should_send_ack(now);
         let has_queued_data =
@@ -808,7 +809,9 @@ impl GtpConnection {
     fn build_control_frame(ctrl: &OutgoingControlFrame) -> Frame<'_> {
         match ctrl {
             OutgoingControlFrame::Ping { nonce } => Frame::Ping { nonce: *nonce },
-            OutgoingControlFrame::PathChallenge { data, .. } => Frame::PathChallenge { data: *data },
+            OutgoingControlFrame::PathChallenge { data, .. } => {
+                Frame::PathChallenge { data: *data }
+            }
             OutgoingControlFrame::PathResponse { data, .. } => Frame::PathResponse { data: *data },
             OutgoingControlFrame::MtuProbe {
                 probe_id,
@@ -934,7 +937,7 @@ impl GtpConnection {
             smoothed_rtt: rtt.smoothed_rtt,
             min_rtt: rtt.min_rtt,
             cwnd_bytes: self.hot.cc.cwnd(),
-            inflight_bytes: self.hot.cc.inflight(),
+            inflight_bytes: self.hot.loss_detector.inflight_bytes(),
             pacing_rate_bps: self.hot.cc.pacing_rate(),
             backpressure,
             effective_queue_bytes: eff_queue,
@@ -1127,7 +1130,11 @@ mod tests {
         let total = 24 + sealed_len;
 
         let d = server
-            .handle_incoming_datagram("127.0.0.1:5000".parse().unwrap(), &mut late_buf[..total], now)
+            .handle_incoming_datagram(
+                "127.0.0.1:5000".parse().unwrap(),
+                &mut late_buf[..total],
+                now,
+            )
             .unwrap();
         assert!(
             d.is_empty(),
@@ -1229,7 +1236,9 @@ mod tests {
             .unwrap();
 
         // KEY_PHASE advertised on the sealed header
-        let header = gtp_wire::PacketHeader::decode(&post_buf[..post_len]).unwrap().0;
+        let header = gtp_wire::PacketHeader::decode(&post_buf[..post_len])
+            .unwrap()
+            .0;
         assert!(header.flags.key_phase());
 
         let delivered = server
@@ -1276,7 +1285,10 @@ mod tests {
             .produce_outgoing_datagram(now, &mut out)
             .unwrap()
             .unwrap();
-        assert_eq!(dest, new_server_addr, "challenge must target the new address");
+        assert_eq!(
+            dest, new_server_addr,
+            "challenge must target the new address"
+        );
 
         let client_active_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
