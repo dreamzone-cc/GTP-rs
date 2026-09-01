@@ -287,11 +287,9 @@ impl GtpConnection {
         datagram: &mut [u8],
         now: MonotonicTime,
     ) -> Result<Vec<ReceivedMessage>> {
+        let datagram_len = datagram.len();
         self.cold.total_rx_packets += 1;
-        self.cold.total_rx_bytes += datagram.len() as u64;
-        self.hot
-            .anti_amplification
-            .on_bytes_received(datagram.len());
+        self.cold.total_rx_bytes += datagram_len as u64;
 
         // 1. Decode Packet Header
         let (header, header_consumed) = PacketHeader::decode(datagram)?;
@@ -359,6 +357,14 @@ impl GtpConnection {
             Ok(len) => {
                 // Commit replay state only after successful authentication (SEC-3).
                 self.hot.replay_window.commit(header.packet_number);
+                // A-5: only bytes this connection actually authenticated may raise the
+                // 3x anti-amplification budget. Counting on arrival — before the header
+                // was decoded, before the connection id was matched, before the replay
+                // window and before AEAD — let any forged datagram buy its sender 3x its
+                // own length toward an address that was never validated, which is exactly
+                // the amplification the limit exists to prevent. RFC 9000 §8.1 is explicit
+                // that datagrams discarded as unprocessable are not counted.
+                self.hot.anti_amplification.on_bytes_received(datagram_len);
                 // A legitimate authenticated packet proves peer reachability.
                 self.hot.anti_amplification.mark_validated();
                 // R-6: age the post-ratchet grace window on the receive path too.
@@ -2224,6 +2230,114 @@ mod tests {
     ///
     /// Negative check: skip `requeue_controls` on the anti-amp path and the queue is left
     /// empty; stop deferring `close_frame_sent` and it is true here despite no send.
+    /// A-5 regression: the anti-amplification counter must reflect bytes the connection
+    /// actually **authenticated**, not bytes that merely arrived.
+    ///
+    /// `on_bytes_received` used to run in the first three lines of the RX path — before
+    /// the header was decoded, before the connection id was matched, before the replay
+    /// window, and before AEAD. Every forged or random datagram therefore bought the
+    /// sender 3x its own length in send budget toward an address that was never
+    /// validated, which is precisely the amplification the 3x limit exists to prevent.
+    /// RFC 9000 §8.1 is explicit that datagrams discarded as unprocessable are not
+    /// counted.
+    ///
+    /// This drives the real `handle_incoming_datagram` path, not the limiter directly.
+    #[test]
+    fn unauthenticated_datagrams_earn_no_anti_amplification_budget() {
+        let cid = ConnectionId(0x0A05_0000_0000_00A5);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(15_000_000);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Force the amplification-limited window: a fresh limiter has zero received
+        // bytes, hence zero send budget toward an address it has not validated.
+        server.hot.anti_amplification = gtp_path::AntiAmplificationLimiter::new();
+        assert_eq!(server.hot.anti_amplification.bytes_received(), 0);
+        assert!(!server.hot.anti_amplification.can_send(1));
+
+        // Two genuine datagrams from the real client.
+        let mut buf_a = [0u8; 1500];
+        client
+            .send_unreliable(b"first".to_vec(), PriorityTier::P1Input, None, now)
+            .unwrap();
+        let (_, len_a) = client
+            .produce_outgoing_datagram(now, &mut buf_a)
+            .unwrap()
+            .unwrap();
+
+        let mut buf_b = [0u8; 1500];
+        client
+            .send_unreliable(b"second".to_vec(), PriorityTier::P1Input, None, now)
+            .unwrap();
+        let (_, len_b) = client
+            .produce_outgoing_datagram(now, &mut buf_b)
+            .unwrap()
+            .unwrap();
+
+        // 1. Random bytes: not even attributable to this connection.
+        let mut garbage = vec![0xA5u8; 1200];
+        let _ = server.handle_incoming_datagram(client_addr, &mut garbage[..], now);
+        assert_eq!(
+            server.hot.anti_amplification.bytes_received(),
+            0,
+            "an unattributable datagram must not be counted"
+        );
+
+        // 2. Well-formed and correctly addressed, but forged: the header decodes, the
+        //    connection id matches, the replay window admits it — and only AEAD rejects
+        //    it. This is the worst case for the defender.
+        let mut forged = buf_a;
+        forged[len_a - 1] ^= 0xFF;
+        let res = server.handle_incoming_datagram(client_addr, &mut forged[..len_a], now);
+        assert!(res.is_err(), "tampered ciphertext must fail authentication");
+        assert!(
+            !server.hot.anti_amplification.is_validated(),
+            "a forged datagram must never validate the peer"
+        );
+        assert_eq!(
+            server.hot.anti_amplification.bytes_received(),
+            0,
+            "a datagram that failed authentication must not be counted ({len_a} forged bytes)"
+        );
+        assert!(
+            !server.hot.anti_amplification.can_send(1),
+            "the 3x budget must still be zero after a forged datagram"
+        );
+
+        // 3. Correctly formed, but addressed to a different connection: rejected at the
+        //    connection-id check — the other pre-authentication exit.
+        let other_cid = ConnectionId(0x0A05_0000_0000_00FF);
+        let mut other =
+            GtpConnection::new_with_role(other_cid, client_addr, true, false, GtpConfig::default());
+        other.hot.anti_amplification = gtp_path::AntiAmplificationLimiter::new();
+        let mut misaddressed = buf_a;
+        let res = other.handle_incoming_datagram(client_addr, &mut misaddressed[..len_a], now);
+        assert!(
+            res.is_err(),
+            "a datagram for another connection must be rejected"
+        );
+        assert_eq!(
+            other.hot.anti_amplification.bytes_received(),
+            0,
+            "a datagram rejected at the connection-id check must not be counted"
+        );
+
+        // 4. The genuine datagram is counted in full, and validates the peer.
+        let delivered = server
+            .handle_incoming_datagram(client_addr, &mut buf_b[..len_b], now)
+            .unwrap();
+        assert!(
+            !delivered.is_empty(),
+            "the genuine datagram carries a message"
+        );
+        assert_eq!(
+            server.hot.anti_amplification.bytes_received(),
+            len_b as u64,
+            "an authenticated datagram must be counted in full"
+        );
+        assert!(server.hot.anti_amplification.is_validated());
+    }
+
     #[test]
     fn drained_control_is_restored_when_the_datagram_is_rejected() {
         let cid = ConnectionId(0xC105_0000_0000_000C);
