@@ -32,6 +32,27 @@ impl RttStats {
         Self::default()
     }
 
+    /// Resets the estimator when the connection migrates to a **validated** new path
+    /// (RFC 9000 §9.4, X-1).
+    ///
+    /// Samples taken on the old path describe the old path. `min_rtt` in particular
+    /// only ever decreases, so without this reset the *old* path's floor keeps
+    /// defining `rtt_inflation = smoothed_rtt / min_rtt` for the rest of the session:
+    /// after migrating from a 10ms path to a 60ms one the inflation reads 6x forever
+    /// and the engine is told to shed level-of-detail on the path it just chose as
+    /// better. Silent, permanent, and it punishes a successful migration.
+    ///
+    /// `max_ack_delay` is a property of the **peer**, not of the path, so it survives
+    /// the reset; everything else returns to its initial value and the first sample on
+    /// the new path re-seeds the estimator.
+    pub fn reset_for_new_path(&mut self) {
+        let max_ack_delay = self.max_ack_delay;
+        *self = Self {
+            max_ack_delay,
+            ..Self::default()
+        };
+    }
+
     pub fn update(&mut self, send_to_ack_duration: Duration, ack_delay: Duration) {
         // RFC 9002 §5.2: min_rtt is tracked from the *unadjusted* latest sample so a
         // peer over-reporting ack_delay cannot drag min_rtt (and every derived
@@ -87,6 +108,26 @@ impl RttStats {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reset_for_new_path_drops_old_path_samples_but_keeps_the_peer_property() {
+        let mut stats = RttStats::new();
+        stats.max_ack_delay = Duration::from_millis(11);
+        for _ in 0..8 {
+            stats.update(Duration::from_millis(10), Duration::from_micros(0));
+        }
+        assert_eq!(stats.min_rtt, Duration::from_millis(10));
+
+        stats.reset_for_new_path();
+
+        // max_ack_delay is negotiated with the peer, not measured on the path.
+        assert_eq!(stats.max_ack_delay, Duration::from_millis(11));
+        // The old path's floor is gone: the next sample re-seeds the estimator.
+        assert_eq!(stats.min_rtt, RttStats::new().min_rtt);
+        stats.update(Duration::from_millis(60), Duration::from_micros(0));
+        assert_eq!(stats.min_rtt, Duration::from_millis(60));
+        assert_eq!(stats.smoothed_rtt, Duration::from_millis(60));
+    }
     use super::*;
 
     #[test]

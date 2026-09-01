@@ -559,6 +559,11 @@ impl GtpConnection {
                     {
                         let old_addr = self.hot.active_path;
                         self.hot.active_path = src_addr;
+                        // X-1 / RFC 9000 §9.4: the RTT estimator describes the path it
+                        // was sampled on. `min_rtt` only ever decreases, so carrying it
+                        // across a migration pins `rtt_inflation` — and with it the
+                        // engine's backpressure — high for the rest of the session.
+                        self.hot.loss_detector.rtt_stats.reset_for_new_path();
                         self.event_queue.push(ControlEvent::PathMigrated {
                             old_addr,
                             new_addr: src_addr,
@@ -1628,6 +1633,112 @@ mod tests {
     /// Core-C1 + PATH-5: path migration works through the PROTOCOL — a challenge
     /// reaches the peer as a real PathChallenge, the echo is a real PathResponse
     /// directed at the challenger's source address, and the challenger migrates.
+    /// X-1 regression: RFC 9000 §9.4 requires the RTT estimator to be reset when a
+    /// connection migrates to a validated new path. Without that reset `min_rtt` stays
+    /// latched to the *old* path's floor forever — `min_rtt` only ever decreases — so
+    /// `rtt_inflation = smoothed_rtt / min_rtt` never returns to ~1.0 and the engine is
+    /// told to shed level-of-detail for the rest of the session, on the very path it
+    /// just validated as better. Silent, permanent, and it punishes a successful
+    /// migration.
+    #[test]
+    fn min_rtt_follows_the_new_path_after_migration() {
+        use crate::control::ControlEvent;
+        let cid = ConnectionId(0x1A7B_0000_0000_00E1);
+        let (mut client, mut server) = loopback_pair(cid);
+        // Time advances across the migration handshake so every incidental RTT sample
+        // it produces is *slower* than both paths — otherwise the handshake itself
+        // would silently set the floor and mask what this test is about.
+        let t0 = MonotonicTime::from_micros(9_000_000);
+        let t1 = t0 + Duration::from_millis(50);
+        let t2 = t1 + Duration::from_millis(50);
+        let new_server_addr: SocketAddr = "127.0.0.1:6200".parse().unwrap();
+        let client_active_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let zero = Duration::from_micros(0);
+
+        // 1. Settle the estimator on a fast path (10ms, steady): not congested.
+        for _ in 0..8 {
+            client
+                .hot
+                .loss_detector
+                .rtt_stats
+                .update(Duration::from_millis(10), zero);
+        }
+        assert_eq!(
+            client.hot.loss_detector.rtt_stats.min_rtt,
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            client.feedback(t0).backpressure,
+            BackpressureLevel::Low,
+            "a steady 10ms path must not read as congested"
+        );
+
+        // 2. Migrate through the protocol: challenge -> directed echo -> response.
+        client
+            .control()
+            .trigger_path_challenge(new_server_addr, [0xE1; 8], t0)
+            .unwrap();
+        let mut out = [0u8; 1500];
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut challenge_buf = out;
+        server
+            .handle_incoming_datagram(client_active_addr, &mut challenge_buf[..len], t1)
+            .unwrap();
+        let (_, resp_len) = server
+            .produce_outgoing_datagram(t1, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut resp_buf = out;
+        client
+            .handle_incoming_datagram(new_server_addr, &mut resp_buf[..resp_len], t2)
+            .unwrap();
+        assert_eq!(
+            client.hot.active_path, new_server_addr,
+            "migration must fire"
+        );
+        assert!(client
+            .drain_events()
+            .iter()
+            .any(|e| matches!(e, ControlEvent::PathMigrated { .. })));
+
+        // The window between the reset and the first sample on the new path must be
+        // safe to read: `min_rtt` carries its "no sample yet" sentinel there, and the
+        // backpressure model must degrade to Low rather than to a garbage inflation.
+        assert_eq!(
+            client.feedback(t2).backpressure,
+            BackpressureLevel::Low,
+            "a freshly reset estimator must not read as congested"
+        );
+
+        // 3. The new path is genuinely slower, and steady at 60ms.
+        for _ in 0..8 {
+            client
+                .hot
+                .loss_detector
+                .rtt_stats
+                .update(Duration::from_millis(60), zero);
+        }
+
+        let fb = client.feedback(t2);
+        let inflation = fb.smoothed_rtt.as_micros() as f64 / fb.min_rtt.as_micros().max(1) as f64;
+        assert!(
+            fb.min_rtt >= Duration::from_millis(50),
+            "min_rtt is still latched at {:?} from the pre-migration path",
+            fb.min_rtt
+        );
+        assert_eq!(
+            fb.backpressure,
+            BackpressureLevel::Low,
+            "steady traffic on the migrated path must not read as congestion \
+             (smoothed {:?} / min {:?} = {inflation:.2}x)",
+            fb.smoothed_rtt,
+            fb.min_rtt
+        );
+    }
+
     #[test]
     fn path_migration_via_protocol() {
         use crate::control::ControlEvent;
