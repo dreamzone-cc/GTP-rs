@@ -38,6 +38,10 @@ type PendingServerHandshakeMap = Arc<
 /// receive channel and a reliable message would otherwise have to be dropped (N-2).
 const RECEIVE_OVERFLOW_CLOSE_CODE: u16 = 8;
 
+/// Close code reported to the peer when the application has dropped its handle for a
+/// connection, so nothing is left to deliver to (N-2).
+const APPLICATION_GONE_CLOSE_CODE: u16 = 9;
+
 /// Decides whether a received datagram may be inspected as an unauthenticated
 /// handshake packet (N-1).
 ///
@@ -628,10 +632,24 @@ impl GtpEndpoint {
                                         }
                                     },
                                     // The application dropped its handle: there is
-                                    // nothing left to deliver to, so the routing entry
-                                    // is dead weight.
+                                    // nothing left to deliver to. Retiring the routing
+                                    // entry is not enough on its own — `spawn_tx_loop`
+                                    // exits only on `is_closed()`, so the connection
+                                    // would keep a task alive, keep the GtpConnection
+                                    // alive with it, and keep PTO-retransmitting to a
+                                    // peer whose replies are no longer routed anywhere:
+                                    // one leaked task, connection and traffic stream per
+                                    // handle the application drops. Closing it lets the
+                                    // TX loop finish and tells the peer why.
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
                                         guard.cold.total_dropped_frames += (produced - idx) as u64;
+                                        if guard.hot.state.is_active() {
+                                            let _ = guard.control().graceful_close(
+                                                APPLICATION_GONE_CLOSE_CODE,
+                                                "application handle dropped",
+                                                now,
+                                            );
+                                        }
                                         evict = true;
                                         break;
                                     }
@@ -825,9 +843,13 @@ mod tests {
     }
 
     /// N-2: an application that drops its handle leaves a `Closed` channel behind. The
-    /// RX loop must retire the routing entry instead of decrypting into a void forever.
+    /// routing entry must go, and so must the connection itself — `spawn_tx_loop` exits
+    /// only on `is_closed()`, so an evicted-but-Established connection keeps a task
+    /// alive, keeps the `GtpConnection` alive with it, and keeps PTO-retransmitting to a
+    /// peer whose replies no longer reach it. This asserts the whole lifecycle, not just
+    /// the map entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn dropping_the_application_handle_evicts_the_routing_entry() {
+    async fn dropping_the_application_handle_closes_the_connection_and_ends_the_tx_loop() {
         let server_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
@@ -840,14 +862,18 @@ mod tests {
         let cli = ep.connect(cid, server_addr, true).await.unwrap();
         let srv = server_ep.accept().await.unwrap();
 
-        assert!(
-            server_ep.connections.read().await.contains_key(&cid),
-            "the connection must be routable while the application holds it"
-        );
+        // Take our own reference BEFORE the handle goes, so the connection stays
+        // observable after it has been evicted from the routing map.
+        let conn_arc = {
+            let conns = server_ep.connections.read().await;
+            let (arc, _) = conns.get(&cid).expect("routable while the app holds it");
+            Arc::clone(arc)
+        };
 
         // The application is gone; its Receiver goes with it.
         drop(srv);
 
+        // 1. The routing entry is retired.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let _ = cli
@@ -855,13 +881,44 @@ mod tests {
                 .await;
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             if !server_ep.connections.read().await.contains_key(&cid) {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
                 break;
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the routing entry survived the application dropping its handle"
+            );
         }
-        panic!("the routing entry survived the application dropping its handle");
+
+        // 2. The connection itself reaches Closed, which is what lets the TX loop stop.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !conn_arc.lock().await.hot.state.is_closed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the connection stayed open after eviction, so the TX loop never exits"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // 3. The TX task has actually ended: it held the only other strong reference
+        //    once the map entry was removed, so the count falling to ours proves it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Arc::strong_count(&conn_arc) > 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the TX task is still holding the connection: strong_count = {}",
+                Arc::strong_count(&conn_arc)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // 4. And it is not still transmitting to a peer that can no longer be heard.
+        let before = conn_arc.lock().await.cold.total_tx_packets;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let after = conn_arc.lock().await.cold.total_tx_packets;
+        assert_eq!(
+            before, after,
+            "the connection kept transmitting after it was closed and evicted"
+        );
     }
 
     /// N-2: drops must be counted, and counted for the whole tail a close discards —

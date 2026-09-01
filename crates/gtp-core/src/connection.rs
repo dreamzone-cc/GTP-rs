@@ -563,23 +563,34 @@ impl GtpConnection {
                         .path_validator
                         .validate_response(src_addr, &data, now)
                     {
-                        let old_addr = self.hot.active_path;
-                        self.hot.active_path = src_addr;
-                        // X-1 / RFC 9000 §9.4: the RTT estimator describes the path it
-                        // was sampled on. `min_rtt` only ever decreases, so carrying it
-                        // across a migration pins `rtt_inflation` — and with it the
-                        // engine's backpressure — high for the rest of the session.
-                        // Packets already in flight on the old path must not re-seed
-                        // the estimator once it is cleared, so the migration also raises
-                        // the sampling floor to the next packet number.
-                        let first_pn_on_new_path = self.hot.next_packet_number;
-                        self.hot
-                            .loss_detector
-                            .on_path_migration(first_pn_on_new_path);
-                        self.event_queue.push(ControlEvent::PathMigrated {
-                            old_addr,
-                            new_addr: src_addr,
-                        });
+                        // A challenge answered from the address already in use is a
+                        // reachability / NAT-keepalive probe (RFC 9000 §8.2.4), not a
+                        // migration — and `trigger_path_challenge` is public API, so
+                        // applications legitimately do this. Running the migration path
+                        // for it would clear the RTT estimator, raise the sampling floor
+                        // above every in-flight packet, and emit a `PathMigrated` whose
+                        // old and new addresses are identical. The probe still counts as
+                        // answered: `validate_response` consumed the pending challenge.
+                        if src_addr != self.hot.active_path {
+                            let old_addr = self.hot.active_path;
+                            self.hot.active_path = src_addr;
+                            // X-1 / RFC 9000 §9.4: the RTT estimator describes the path
+                            // it was sampled on. `min_rtt` only ever decreases, so
+                            // carrying it across a migration pins `rtt_inflation` — and
+                            // with it the engine's backpressure — high for the rest of
+                            // the session. Packets already in flight on the old path
+                            // must not re-seed the estimator once it is cleared, so the
+                            // migration also raises the sampling floor to the next
+                            // packet number.
+                            let first_pn_on_new_path = self.hot.next_packet_number;
+                            self.hot
+                                .loss_detector
+                                .on_path_migration(first_pn_on_new_path);
+                            self.event_queue.push(ControlEvent::PathMigrated {
+                                old_addr,
+                                new_addr: src_addr,
+                            });
+                        }
                     }
                 }
 
@@ -1756,6 +1767,87 @@ mod tests {
     /// through the protocol and then delivers a late acknowledgement for a packet the
     /// connection actually sent on the old path — the case that used to re-seed a
     /// freshly reset `min_rtt` with a measurement belonging to neither path.
+    /// X-1 follow-up: challenging the address the connection is ALREADY using is the
+    /// standard reachability / NAT-keepalive probe (RFC 9000 §8.2.4), and
+    /// `trigger_path_challenge` is public API, so applications do it. It must not be
+    /// mistaken for a migration: doing so clears the RTT estimator, raises the sampling
+    /// floor above every in-flight packet, and reports a `PathMigrated` from an address
+    /// to itself.
+    #[test]
+    fn path_challenge_to_the_active_path_is_not_a_migration() {
+        use crate::control::ControlEvent;
+        let cid = ConnectionId(0x1A7B_0000_0000_00E3);
+        let (mut client, mut server) = loopback_pair(cid);
+        let t0 = MonotonicTime::from_micros(13_000_000);
+        let t1 = t0 + Duration::from_millis(50);
+        let t2 = t1 + Duration::from_millis(50);
+        let client_active_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        // The client's active path, i.e. exactly where it is already sending.
+        let current_peer = client.hot.active_path;
+        let zero = Duration::from_micros(0);
+
+        // Settle the estimator on the current path.
+        for _ in 0..8 {
+            client
+                .hot
+                .loss_detector
+                .rtt_stats
+                .update(Duration::from_millis(10), zero);
+        }
+        assert_eq!(
+            client.hot.loss_detector.rtt_stats.min_rtt,
+            Duration::from_millis(10)
+        );
+
+        // Probe the address already in use.
+        client
+            .control()
+            .trigger_path_challenge(current_peer, [0xE3; 8], t0)
+            .unwrap();
+        let mut out = [0u8; 1500];
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut challenge_buf = out;
+        server
+            .handle_incoming_datagram(client_active_addr, &mut challenge_buf[..len], t1)
+            .unwrap();
+        let (_, resp_len) = server
+            .produce_outgoing_datagram(t1, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut resp_buf = out;
+        client
+            .handle_incoming_datagram(current_peer, &mut resp_buf[..resp_len], t2)
+            .unwrap();
+
+        assert_eq!(
+            client.hot.active_path, current_peer,
+            "the active path must not move"
+        );
+        assert!(
+            !client
+                .drain_events()
+                .iter()
+                .any(|e| matches!(e, ControlEvent::PathMigrated { .. })),
+            "a probe of the active path must not report a migration"
+        );
+        // A reset would leave `min_rtt` at its sentinel: the only acknowledgement in
+        // flight covers the challenge packet, which predates the reset and is barred by
+        // the sampling floor, so nothing would re-seed it.
+        assert_eq!(
+            client.hot.loss_detector.rtt_stats.min_rtt,
+            Duration::from_millis(10),
+            "the RTT estimator was cleared by a probe of the active path"
+        );
+        assert_ne!(
+            client.hot.loss_detector.rtt_stats.smoothed_rtt,
+            gtp_recovery::RttStats::new().smoothed_rtt,
+            "smoothed_rtt fell back to the initial constant, so a reset happened"
+        );
+    }
+
     #[test]
     fn migration_bars_pre_migration_packets_from_reseeding_min_rtt() {
         use crate::control::ControlEvent;

@@ -45,6 +45,20 @@ impl RttStats {
     /// `max_ack_delay` is a property of the **peer**, not of the path, so it survives
     /// the reset; everything else returns to its initial value and the first sample on
     /// the new path re-seeds the estimator.
+    ///
+    /// **The `INITIAL_RTT` window is deliberate.** Between the migration and the first
+    /// acknowledgement covering a packet actually sent on the new path, `smoothed_rtt`
+    /// reads 100 ms, and `CubicCongestionController::pacing_rate` divides the congestion
+    /// window by it — so the pacing rate is understated for that window. Three things
+    /// bound it: it lasts one round trip plus one send interval; `first_sample` is set
+    /// here, so the first new sample *replaces* the estimate outright instead of being
+    /// blended into it; and RFC 9000 §9.4 asks for exactly this reset (it asks for the
+    /// congestion window too, which is not reset here — leaving the pacing rate more
+    /// permissive during the window than full conformance would be, not less).
+    /// Measured against a live 50 ms path carrying ~6 KB/s, the understated rate is
+    /// still ~1.7 MB/s: real, bounded, and far above the offered load. Keeping the old
+    /// path's `smoothed_rtt` instead would close the window but compute PTO from a stale
+    /// low RTT right after migrating to a slower path, which is the worse trade.
     pub fn reset_for_new_path(&mut self) {
         let max_ack_delay = self.max_ack_delay;
         *self = Self {
