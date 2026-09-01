@@ -34,6 +34,24 @@ type PendingServerHandshakeMap = Arc<
     >,
 >;
 
+/// Decides whether a received datagram may be inspected as an unauthenticated
+/// handshake packet (N-1).
+///
+/// Handshake frames are only ever emitted inside **long-header** packets
+/// (`ClientHello`, `ServerHello` and `HandshakeFinish` are all built with
+/// `PacketHeader::new_long`), while every established-connection datagram carries a
+/// short header. Without that gate the routing loop read `payload[0]` of a short
+/// header packet — which is the first byte of AEAD *ciphertext* — and compared it
+/// against `FRAME_TYPE_CLIENT_HELLO` / `_SERVER_HELLO` / `_HANDSHAKE_FINISH`
+/// (`0x0B`, `0x0C`, `0x0D`). Ciphertext bytes are uniformly distributed, so 3 of 256
+/// datagrams entered a handshake branch, failed to decode as a handshake frame, and
+/// were then dropped by the branch's unconditional `continue` — a silent, permanent
+/// **1.172%** loss floor on every connection, applied before decryption and
+/// therefore invisible to every layer below.
+fn is_handshake_candidate(header: &PacketHeader, header_len: usize, datagram_len: usize) -> bool {
+    header.flags.is_long_header() && header_len < datagram_len
+}
+
 /// Async GTP Endpoint running on top of Tokio with automated X25519 Handshake and Anti-Amplification defense.
 pub struct GtpEndpoint {
     socket: Arc<UdpSocket>,
@@ -331,8 +349,10 @@ impl GtpEndpoint {
 
                 let cid = header.connection_id;
 
-                // 1. Check for Handshake Frames in unauthenticated / handshake packets
-                if header_len < datagram.len() {
+                // 1. Check for Handshake Frames in unauthenticated / handshake packets.
+                // N-1: gated on the long-header bit — a short header means an
+                // established connection, whose payload is ciphertext, not frames.
+                if is_handshake_candidate(&header, header_len, datagram.len()) {
                     let frame_payload = &datagram[header_len..];
                     if !frame_payload.is_empty() {
                         let frame_type = frame_payload[0];
@@ -591,6 +611,80 @@ impl GtpEndpoint {
 mod tests {
     use super::*;
     use gtp_types::PriorityTier;
+
+    /// N-1 regression, deterministic: drive a real sealed connection until it emits a
+    /// datagram whose first ciphertext byte collides with a handshake frame type, then
+    /// assert the routing gate still treats it as ordinary traffic. Before the gate this
+    /// exact datagram entered a handshake branch and was dropped by its `continue`.
+    #[test]
+    fn short_header_ciphertext_colliding_with_handshake_types_is_still_routed() {
+        let cid = ConnectionId(0xA11C_E000_1234_5678);
+        let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let mut conn = GtpConnection::new(cid, peer, true);
+
+        let mut out = [0u8; 1500];
+        let mut now = MonotonicTime::from_micros(1_000_000);
+        let mut collisions = 0usize;
+
+        // 3/256 of datagrams collide, so a few hundred sends make this practically certain
+        // while keeping the test deterministic in cost.
+        for i in 0..4096u32 {
+            now += gtp_types::Duration::from_millis(1);
+            conn.send_unreliable(
+                format!("n1-probe-{i}").into_bytes(),
+                PriorityTier::P1Input,
+                None,
+                now,
+            )
+            .expect("probe send fits the datagram budget");
+
+            let Ok(Some((_, len))) = conn.produce_outgoing_datagram(now, &mut out) else {
+                continue;
+            };
+            let (header, header_len) =
+                PacketHeader::decode(&out[..len]).expect("self-produced datagram decodes");
+
+            // Established traffic must always use the short header — that is what makes
+            // the gate a sound discriminator in the first place.
+            assert!(
+                !header.flags.is_long_header(),
+                "established-connection traffic must carry a short header"
+            );
+
+            if header_len >= len {
+                continue;
+            }
+            let first_payload_byte = out[header_len];
+            if matches!(
+                first_payload_byte,
+                FRAME_TYPE_CLIENT_HELLO | FRAME_TYPE_SERVER_HELLO | FRAME_TYPE_HANDSHAKE_FINISH
+            ) {
+                collisions += 1;
+                assert!(
+                    !is_handshake_candidate(&header, header_len, len),
+                    "datagram whose ciphertext starts with 0x{first_payload_byte:02X} was \
+                     routed into the handshake path and would be dropped (N-1)"
+                );
+            }
+            if collisions >= 3 {
+                return;
+            }
+        }
+
+        panic!("no ciphertext/handshake-type collision produced in 4096 datagrams — the probe is broken, not the gate");
+    }
+
+    /// The gate must not cost the handshake anything: all three handshake frames are
+    /// emitted in long-header packets and must still be inspected.
+    #[test]
+    fn long_header_handshake_packets_are_still_inspected() {
+        let cid = ConnectionId(7);
+        let header = PacketHeader::new_long(1, cid, PacketNumber(0), 0, 64);
+        assert!(is_handshake_candidate(&header, 28, 128));
+
+        // A long header with no payload carries nothing to inspect.
+        assert!(!is_handshake_candidate(&header, 28, 28));
+    }
 
     #[tokio::test]
     async fn test_async_endpoint_tokio_e2e() {
