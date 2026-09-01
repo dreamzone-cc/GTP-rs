@@ -584,7 +584,8 @@ impl GtpEndpoint {
                         if let Ok(msgs) =
                             guard.handle_incoming_datagram(src, &mut datagram_copy, now)
                         {
-                            for msg in msgs {
+                            let produced = msgs.len();
+                            for (idx, msg) in msgs.into_iter().enumerate() {
                                 match tx.try_send(msg) {
                                     Ok(()) => {}
                                     Err(mpsc::error::TrySendError::Full(msg)) => match msg.class {
@@ -608,7 +609,13 @@ impl GtpEndpoint {
                                         // told why.
                                         MessageClass::ReliableUnordered
                                         | MessageClass::ReliableOrdered { .. } => {
-                                            guard.cold.total_dropped_frames += 1;
+                                            // This message and every one still behind it
+                                            // in this datagram go undelivered, so the
+                                            // counter has to account for the whole tail,
+                                            // not just the message that tripped the
+                                            // overflow.
+                                            guard.cold.total_dropped_frames +=
+                                                (produced - idx) as u64;
                                             if guard.hot.state.is_active() {
                                                 let _ = guard.control().graceful_close(
                                                     RECEIVE_OVERFLOW_CLOSE_CODE,
@@ -624,6 +631,7 @@ impl GtpEndpoint {
                                     // nothing left to deliver to, so the routing entry
                                     // is dead weight.
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        guard.cold.total_dropped_frames += (produced - idx) as u64;
                                         evict = true;
                                         break;
                                     }
@@ -749,6 +757,149 @@ mod tests {
 
         // A long header with no payload carries nothing to inspect.
         assert!(!is_handshake_candidate(&header, 28, 28));
+    }
+
+    /// Saturates one connection's application channel while a second one stays healthy,
+    /// and hands back both endpoints so a test can inspect the routing map directly.
+    /// These two live inside the crate on purpose: asserting on eviction and on
+    /// `total_dropped_frames` needs private state, and neither is worth widening the
+    /// public API for.
+    #[cfg(test)]
+    async fn saturate_one_of_two_connections(
+        flood: usize,
+        reliable: bool,
+    ) -> (
+        GtpEndpoint,
+        GtpEndpoint,
+        GtpEndpoint,
+        AsyncGtpConnection,
+        AsyncGtpConnection,
+        AsyncGtpConnection,
+        AsyncGtpConnection,
+        ConnectionId,
+        ConnectionId,
+    ) {
+        let server_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+        let cid_a = ConnectionId(0xEEEE_0000_0000_0001);
+        let cid_b = ConnectionId(0xEEEE_0000_0000_0002);
+
+        let ep_a = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let cli_a = ep_a.connect(cid_a, server_addr, true).await.unwrap();
+        let srv_a = server_ep.accept().await.unwrap();
+
+        let ep_b = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let cli_b = ep_b.connect(cid_b, server_addr, true).await.unwrap();
+        let srv_b = server_ep.accept().await.unwrap();
+
+        for i in 0..flood {
+            let _ = if reliable {
+                cli_a
+                    .send_reliable_unordered(
+                        format!("r-{i}").into_bytes(),
+                        PriorityTier::P3ReliableGameplay,
+                    )
+                    .await
+            } else {
+                cli_a
+                    .send_unreliable(format!("u-{i}").into_bytes(), PriorityTier::P1Input)
+                    .await
+            };
+            if i % 400 == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        // `srv_b` is handed back deliberately: dropping it would close B's channel and
+        // the RX loop would retire B as a gone application, which is a different test.
+        (
+            server_ep, ep_a, ep_b, cli_a, cli_b, srv_a, srv_b, cid_a, cid_b,
+        )
+    }
+
+    /// N-2: an application that drops its handle leaves a `Closed` channel behind. The
+    /// RX loop must retire the routing entry instead of decrypting into a void forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_the_application_handle_evicts_the_routing_entry() {
+        let server_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+        let cid = ConnectionId(0xEEEE_0000_0000_0009);
+
+        let ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let cli = ep.connect(cid, server_addr, true).await.unwrap();
+        let srv = server_ep.accept().await.unwrap();
+
+        assert!(
+            server_ep.connections.read().await.contains_key(&cid),
+            "the connection must be routable while the application holds it"
+        );
+
+        // The application is gone; its Receiver goes with it.
+        drop(srv);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let _ = cli
+                .send_unreliable(b"still-here".to_vec(), PriorityTier::P1Input)
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !server_ep.connections.read().await.contains_key(&cid) {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        panic!("the routing entry survived the application dropping its handle");
+    }
+
+    /// N-2: drops must be counted, and counted for the whole tail a close discards —
+    /// otherwise a silent policy is also an unmeasurable one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overflow_drops_are_counted_and_the_other_connection_survives() {
+        let (server_ep, _ep_a, _ep_b, _cli_a, cli_b, _srv_a, _srv_b, cid_a, cid_b) =
+            saturate_one_of_two_connections(1600, false).await;
+
+        let dropped = {
+            let conns = server_ep.connections.read().await;
+            let (conn_arc, _) = conns.get(&cid_a).expect("A is still routable");
+            let guard = conn_arc.lock().await;
+            guard.cold.total_dropped_frames
+        };
+        assert!(
+            dropped > 0,
+            "a saturated unreliable stream must register drops, got {dropped}"
+        );
+
+        // B was never touched: still routable, and still delivering.
+        assert!(
+            server_ep.connections.read().await.contains_key(&cid_b),
+            "B must be unaffected by A's overflow"
+        );
+        for i in 0..10 {
+            let _ = cli_b
+                .send_unreliable(format!("b-{i}").into_bytes(), PriorityTier::P1Input)
+                .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let b_rx = {
+            let conns = server_ep.connections.read().await;
+            let (conn_arc, _) = conns.get(&cid_b).unwrap();
+            let guard = conn_arc.lock().await;
+            guard.cold.total_rx_packets
+        };
+        assert!(b_rx > 0, "B stopped receiving while A was saturated");
     }
 
     #[tokio::test]

@@ -569,7 +569,13 @@ impl GtpConnection {
                         // was sampled on. `min_rtt` only ever decreases, so carrying it
                         // across a migration pins `rtt_inflation` — and with it the
                         // engine's backpressure — high for the rest of the session.
-                        self.hot.loss_detector.rtt_stats.reset_for_new_path();
+                        // Packets already in flight on the old path must not re-seed
+                        // the estimator once it is cleared, so the migration also raises
+                        // the sampling floor to the next packet number.
+                        let first_pn_on_new_path = self.hot.next_packet_number;
+                        self.hot
+                            .loss_detector
+                            .on_path_migration(first_pn_on_new_path);
                         self.event_queue.push(ControlEvent::PathMigrated {
                             old_addr,
                             new_addr: src_addr,
@@ -1745,6 +1751,80 @@ mod tests {
         );
     }
 
+    /// X-1 follow-up, wiring: the migration must raise the loss detector's sampling
+    /// floor to the connection's NEXT packet number. This drives a real migration
+    /// through the protocol and then delivers a late acknowledgement for a packet the
+    /// connection actually sent on the old path — the case that used to re-seed a
+    /// freshly reset `min_rtt` with a measurement belonging to neither path.
+    #[test]
+    fn migration_bars_pre_migration_packets_from_reseeding_min_rtt() {
+        use crate::control::ControlEvent;
+        let cid = ConnectionId(0x1A7B_0000_0000_00E2);
+        let (mut client, mut server) = loopback_pair(cid);
+        let t0 = MonotonicTime::from_micros(11_000_000);
+        let t1 = t0 + Duration::from_millis(50);
+        let t2 = t1 + Duration::from_millis(50);
+        let new_server_addr: SocketAddr = "127.0.0.1:6300".parse().unwrap();
+        let client_active_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // 1. A real packet leaves on the OLD path; remember its packet number.
+        let mut out = [0u8; 1500];
+        client
+            .send_unreliable(b"old-path".to_vec(), PriorityTier::P1Input, None, t0)
+            .unwrap();
+        let (_, sent_len) = client
+            .produce_outgoing_datagram(t0, &mut out)
+            .unwrap()
+            .unwrap();
+        let (sent_header, _) = PacketHeader::decode(&out[..sent_len]).unwrap();
+        let pre_migration_pn = sent_header.packet_number;
+
+        // 2. Migrate through the protocol.
+        client
+            .control()
+            .trigger_path_challenge(new_server_addr, [0xE2; 8], t0)
+            .unwrap();
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut challenge_buf = out;
+        server
+            .handle_incoming_datagram(client_active_addr, &mut challenge_buf[..len], t1)
+            .unwrap();
+        let (_, resp_len) = server
+            .produce_outgoing_datagram(t1, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut resp_buf = out;
+        client
+            .handle_incoming_datagram(new_server_addr, &mut resp_buf[..resp_len], t2)
+            .unwrap();
+        assert_eq!(client.hot.active_path, new_server_addr);
+        assert!(client
+            .drain_events()
+            .iter()
+            .any(|e| matches!(e, ControlEvent::PathMigrated { .. })));
+
+        // 3. A late, FAST acknowledgement for the pre-migration packet. Without the
+        //    sampling floor this sets `min_rtt` to ~5ms on a path that is nowhere near
+        //    that quick, and the inflation ratio never recovers.
+        let ranges = [gtp_wire::AckRange { gap: 0, length: 0 }];
+        client.hot.loss_detector.on_ack_received(
+            pre_migration_pn,
+            0,
+            &ranges,
+            1,
+            t2 + Duration::from_millis(5),
+        );
+        assert_eq!(
+            client.hot.loss_detector.rtt_stats.min_rtt,
+            gtp_recovery::RttStats::new().min_rtt,
+            "a packet sent before the migration re-seeded min_rtt with {:?}",
+            client.hot.loss_detector.rtt_stats.min_rtt
+        );
+    }
+
     #[test]
     fn path_migration_via_protocol() {
         use crate::control::ControlEvent;
@@ -2242,6 +2322,16 @@ mod tests {
     /// counted.
     ///
     /// This drives the real `handle_incoming_datagram` path, not the limiter directly.
+    ///
+    /// **What this test does NOT prove.** It establishes the negative — that nothing
+    /// unattributable or unauthenticated raises the budget — and that an authenticated
+    /// datagram is counted in full. It does *not* exercise the 3x arithmetic itself,
+    /// and cannot: a successful authentication calls `mark_validated()` on the very next
+    /// line, after which `can_send` returns true unconditionally and the counter stops
+    /// gating anything. The limit's own behaviour (the 3x boundary, the off-by-one at
+    /// the edge, and its removal after validation) is covered one layer down, by
+    /// `gtp_path::anti_amplification::tests::test_anti_amplification_3x_boundary`.
+    /// The coverage is split across the two layers, not missing.
     #[test]
     fn unauthenticated_datagrams_earn_no_anti_amplification_budget() {
         let cid = ConnectionId(0x0A05_0000_0000_00A5);
