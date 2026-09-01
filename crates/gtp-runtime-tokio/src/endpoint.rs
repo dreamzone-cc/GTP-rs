@@ -2,7 +2,7 @@ use crate::async_connection::AsyncGtpConnection;
 use gtp_core::{GtpConfig, GtpConnection, ReceivedMessage};
 use gtp_crypto::{derive_directional_handshake_session_keys, EphemeralKeyPair};
 use gtp_path::StatelessTokenManager;
-use gtp_types::{ConnectionId, MonotonicTime, PacketNumber, Result, TransportError};
+use gtp_types::{ConnectionId, MessageClass, MonotonicTime, PacketNumber, Result, TransportError};
 use gtp_wire::frame::{
     Frame, FRAME_TYPE_CLIENT_HELLO, FRAME_TYPE_HANDSHAKE_FINISH, FRAME_TYPE_SERVER_HELLO,
 };
@@ -33,6 +33,10 @@ type PendingServerHandshakeMap = Arc<
         >,
     >,
 >;
+
+/// Close code reported to the peer when an application stops draining its own
+/// receive channel and a reliable message would otherwise have to be dropped (N-2).
+const RECEIVE_OVERFLOW_CLOSE_CODE: u16 = 8;
 
 /// Decides whether a received datagram may be inspected as an unauthenticated
 /// handshake packet (N-1).
@@ -562,21 +566,82 @@ impl GtpEndpoint {
 
                 // 2. Regular Game Data Datagram Handling: Strictly routed by ConnectionId
                 let mut datagram_copy = datagram.to_vec();
-                let conns = connections.read().await;
-                if let Some((conn_arc, tx)) = conns.get(&cid) {
-                    let mut guard = conn_arc.lock().await;
-                    if let Ok(msgs) = guard.handle_incoming_datagram(src, &mut datagram_copy, now) {
-                        for msg in msgs {
-                            let _ = tx.send(msg).await;
+                let mut evict = false;
+
+                // N-2: this scope holds BOTH the connection map's read lock and this
+                // connection's mutex, and it is entered by the single RX task that
+                // serves every connection on this socket. Nothing inside it may await
+                // on anything an application controls. Delivery therefore never awaits:
+                // `try_send` decides immediately, and the class decides what a full
+                // channel means. Awaiting here used to park the whole endpoint — no
+                // other connection was served, no new client could be registered, and
+                // the saturated connection's own application could not retake its lock,
+                // which closed a circular wait between the RX loop and that application.
+                {
+                    let conns = connections.read().await;
+                    if let Some((conn_arc, tx)) = conns.get(&cid) {
+                        let mut guard = conn_arc.lock().await;
+                        if let Ok(msgs) =
+                            guard.handle_incoming_datagram(src, &mut datagram_copy, now)
+                        {
+                            for msg in msgs {
+                                match tx.try_send(msg) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(msg)) => match msg.class {
+                                        // Droppable by contract, and the receive-side
+                                        // state table already applied supersession
+                                        // upstream, so what is dropped here is surplus.
+                                        MessageClass::Unreliable
+                                        | MessageClass::UnreliableSequenced { .. } => {
+                                            guard.cold.total_dropped_frames += 1;
+                                        }
+                                        // Reliable classes were already acknowledged to
+                                        // the peer, so the sender will never retransmit
+                                        // them: dropping is silent data loss, and for an
+                                        // ordered group it breaks the ordering of
+                                        // everything after it. Growing without bound
+                                        // turns a slow consumer into memory exhaustion,
+                                        // and waiting is the stall being fixed here. An
+                                        // application that cannot keep up with its own
+                                        // reliable stream cannot continue safely, so the
+                                        // connection ends explicitly and the peer is
+                                        // told why.
+                                        MessageClass::ReliableUnordered
+                                        | MessageClass::ReliableOrdered { .. } => {
+                                            guard.cold.total_dropped_frames += 1;
+                                            if guard.hot.state.is_active() {
+                                                let _ = guard.control().graceful_close(
+                                                    RECEIVE_OVERFLOW_CLOSE_CODE,
+                                                    "receive queue overflow",
+                                                    now,
+                                                );
+                                            }
+                                            evict = true;
+                                            break;
+                                        }
+                                    },
+                                    // The application dropped its handle: there is
+                                    // nothing left to deliver to, so the routing entry
+                                    // is dead weight.
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        evict = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // CORE-4: evict closed connections so routing state does not leak
+                        if guard.hot.state.is_closed() {
+                            evict = true;
                         }
                     }
-                    // CORE-4: evict closed connections so routing state does not leak
-                    if guard.hot.state.is_closed() {
-                        drop(guard);
-                        drop(conns);
-                        connections.write().await.remove(&cid);
-                        continue;
-                    }
+                }
+                // Both guards are released by the scope above, in that order, BEFORE
+                // the map write below — taking the write lock while still holding the
+                // read guard would deadlock this task against itself.
+                if evict {
+                    connections.write().await.remove(&cid);
+                    continue;
                 }
             }
         });
