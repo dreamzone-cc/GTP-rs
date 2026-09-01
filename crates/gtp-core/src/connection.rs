@@ -287,11 +287,9 @@ impl GtpConnection {
         datagram: &mut [u8],
         now: MonotonicTime,
     ) -> Result<Vec<ReceivedMessage>> {
+        let datagram_len = datagram.len();
         self.cold.total_rx_packets += 1;
-        self.cold.total_rx_bytes += datagram.len() as u64;
-        self.hot
-            .anti_amplification
-            .on_bytes_received(datagram.len());
+        self.cold.total_rx_bytes += datagram_len as u64;
 
         // 1. Decode Packet Header
         let (header, header_consumed) = PacketHeader::decode(datagram)?;
@@ -359,6 +357,14 @@ impl GtpConnection {
             Ok(len) => {
                 // Commit replay state only after successful authentication (SEC-3).
                 self.hot.replay_window.commit(header.packet_number);
+                // A-5: only bytes this connection actually authenticated may raise the
+                // 3x anti-amplification budget. Counting on arrival — before the header
+                // was decoded, before the connection id was matched, before the replay
+                // window and before AEAD — let any forged datagram buy its sender 3x its
+                // own length toward an address that was never validated, which is exactly
+                // the amplification the limit exists to prevent. RFC 9000 §8.1 is explicit
+                // that datagrams discarded as unprocessable are not counted.
+                self.hot.anti_amplification.on_bytes_received(datagram_len);
                 // A legitimate authenticated packet proves peer reachability.
                 self.hot.anti_amplification.mark_validated();
                 // R-6: age the post-ratchet grace window on the receive path too.
@@ -557,12 +563,34 @@ impl GtpConnection {
                         .path_validator
                         .validate_response(src_addr, &data, now)
                     {
-                        let old_addr = self.hot.active_path;
-                        self.hot.active_path = src_addr;
-                        self.event_queue.push(ControlEvent::PathMigrated {
-                            old_addr,
-                            new_addr: src_addr,
-                        });
+                        // A challenge answered from the address already in use is a
+                        // reachability / NAT-keepalive probe (RFC 9000 §8.2.4), not a
+                        // migration — and `trigger_path_challenge` is public API, so
+                        // applications legitimately do this. Running the migration path
+                        // for it would clear the RTT estimator, raise the sampling floor
+                        // above every in-flight packet, and emit a `PathMigrated` whose
+                        // old and new addresses are identical. The probe still counts as
+                        // answered: `validate_response` consumed the pending challenge.
+                        if src_addr != self.hot.active_path {
+                            let old_addr = self.hot.active_path;
+                            self.hot.active_path = src_addr;
+                            // X-1 / RFC 9000 §9.4: the RTT estimator describes the path
+                            // it was sampled on. `min_rtt` only ever decreases, so
+                            // carrying it across a migration pins `rtt_inflation` — and
+                            // with it the engine's backpressure — high for the rest of
+                            // the session. Packets already in flight on the old path
+                            // must not re-seed the estimator once it is cleared, so the
+                            // migration also raises the sampling floor to the next
+                            // packet number.
+                            let first_pn_on_new_path = self.hot.next_packet_number;
+                            self.hot
+                                .loss_detector
+                                .on_path_migration(first_pn_on_new_path);
+                            self.event_queue.push(ControlEvent::PathMigrated {
+                                old_addr,
+                                new_addr: src_addr,
+                            });
+                        }
                     }
                 }
 
@@ -1628,6 +1656,267 @@ mod tests {
     /// Core-C1 + PATH-5: path migration works through the PROTOCOL — a challenge
     /// reaches the peer as a real PathChallenge, the echo is a real PathResponse
     /// directed at the challenger's source address, and the challenger migrates.
+    /// X-1 regression: RFC 9000 §9.4 requires the RTT estimator to be reset when a
+    /// connection migrates to a validated new path. Without that reset `min_rtt` stays
+    /// latched to the *old* path's floor forever — `min_rtt` only ever decreases — so
+    /// `rtt_inflation = smoothed_rtt / min_rtt` never returns to ~1.0 and the engine is
+    /// told to shed level-of-detail for the rest of the session, on the very path it
+    /// just validated as better. Silent, permanent, and it punishes a successful
+    /// migration.
+    #[test]
+    fn min_rtt_follows_the_new_path_after_migration() {
+        use crate::control::ControlEvent;
+        let cid = ConnectionId(0x1A7B_0000_0000_00E1);
+        let (mut client, mut server) = loopback_pair(cid);
+        // Time advances across the migration handshake so every incidental RTT sample
+        // it produces is *slower* than both paths — otherwise the handshake itself
+        // would silently set the floor and mask what this test is about.
+        let t0 = MonotonicTime::from_micros(9_000_000);
+        let t1 = t0 + Duration::from_millis(50);
+        let t2 = t1 + Duration::from_millis(50);
+        let new_server_addr: SocketAddr = "127.0.0.1:6200".parse().unwrap();
+        let client_active_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let zero = Duration::from_micros(0);
+
+        // 1. Settle the estimator on a fast path (10ms, steady): not congested.
+        for _ in 0..8 {
+            client
+                .hot
+                .loss_detector
+                .rtt_stats
+                .update(Duration::from_millis(10), zero);
+        }
+        assert_eq!(
+            client.hot.loss_detector.rtt_stats.min_rtt,
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            client.feedback(t0).backpressure,
+            BackpressureLevel::Low,
+            "a steady 10ms path must not read as congested"
+        );
+
+        // 2. Migrate through the protocol: challenge -> directed echo -> response.
+        client
+            .control()
+            .trigger_path_challenge(new_server_addr, [0xE1; 8], t0)
+            .unwrap();
+        let mut out = [0u8; 1500];
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut challenge_buf = out;
+        server
+            .handle_incoming_datagram(client_active_addr, &mut challenge_buf[..len], t1)
+            .unwrap();
+        let (_, resp_len) = server
+            .produce_outgoing_datagram(t1, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut resp_buf = out;
+        client
+            .handle_incoming_datagram(new_server_addr, &mut resp_buf[..resp_len], t2)
+            .unwrap();
+        assert_eq!(
+            client.hot.active_path, new_server_addr,
+            "migration must fire"
+        );
+        assert!(client
+            .drain_events()
+            .iter()
+            .any(|e| matches!(e, ControlEvent::PathMigrated { .. })));
+
+        // The window between the reset and the first sample on the new path must be
+        // safe to read: `min_rtt` carries its "no sample yet" sentinel there, and the
+        // backpressure model must degrade to Low rather than to a garbage inflation.
+        assert_eq!(
+            client.feedback(t2).backpressure,
+            BackpressureLevel::Low,
+            "a freshly reset estimator must not read as congested"
+        );
+
+        // 3. The new path is genuinely slower, and steady at 60ms.
+        for _ in 0..8 {
+            client
+                .hot
+                .loss_detector
+                .rtt_stats
+                .update(Duration::from_millis(60), zero);
+        }
+
+        let fb = client.feedback(t2);
+        let inflation = fb.smoothed_rtt.as_micros() as f64 / fb.min_rtt.as_micros().max(1) as f64;
+        assert!(
+            fb.min_rtt >= Duration::from_millis(50),
+            "min_rtt is still latched at {:?} from the pre-migration path",
+            fb.min_rtt
+        );
+        assert_eq!(
+            fb.backpressure,
+            BackpressureLevel::Low,
+            "steady traffic on the migrated path must not read as congestion \
+             (smoothed {:?} / min {:?} = {inflation:.2}x)",
+            fb.smoothed_rtt,
+            fb.min_rtt
+        );
+    }
+
+    /// X-1 follow-up, wiring: the migration must raise the loss detector's sampling
+    /// floor to the connection's NEXT packet number. This drives a real migration
+    /// through the protocol and then delivers a late acknowledgement for a packet the
+    /// connection actually sent on the old path — the case that used to re-seed a
+    /// freshly reset `min_rtt` with a measurement belonging to neither path.
+    /// X-1 follow-up: challenging the address the connection is ALREADY using is the
+    /// standard reachability / NAT-keepalive probe (RFC 9000 §8.2.4), and
+    /// `trigger_path_challenge` is public API, so applications do it. It must not be
+    /// mistaken for a migration: doing so clears the RTT estimator, raises the sampling
+    /// floor above every in-flight packet, and reports a `PathMigrated` from an address
+    /// to itself.
+    #[test]
+    fn path_challenge_to_the_active_path_is_not_a_migration() {
+        use crate::control::ControlEvent;
+        let cid = ConnectionId(0x1A7B_0000_0000_00E3);
+        let (mut client, mut server) = loopback_pair(cid);
+        let t0 = MonotonicTime::from_micros(13_000_000);
+        let t1 = t0 + Duration::from_millis(50);
+        let t2 = t1 + Duration::from_millis(50);
+        let client_active_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        // The client's active path, i.e. exactly where it is already sending.
+        let current_peer = client.hot.active_path;
+        let zero = Duration::from_micros(0);
+
+        // Settle the estimator on the current path.
+        for _ in 0..8 {
+            client
+                .hot
+                .loss_detector
+                .rtt_stats
+                .update(Duration::from_millis(10), zero);
+        }
+        assert_eq!(
+            client.hot.loss_detector.rtt_stats.min_rtt,
+            Duration::from_millis(10)
+        );
+
+        // Probe the address already in use.
+        client
+            .control()
+            .trigger_path_challenge(current_peer, [0xE3; 8], t0)
+            .unwrap();
+        let mut out = [0u8; 1500];
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut challenge_buf = out;
+        server
+            .handle_incoming_datagram(client_active_addr, &mut challenge_buf[..len], t1)
+            .unwrap();
+        let (_, resp_len) = server
+            .produce_outgoing_datagram(t1, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut resp_buf = out;
+        client
+            .handle_incoming_datagram(current_peer, &mut resp_buf[..resp_len], t2)
+            .unwrap();
+
+        assert_eq!(
+            client.hot.active_path, current_peer,
+            "the active path must not move"
+        );
+        assert!(
+            !client
+                .drain_events()
+                .iter()
+                .any(|e| matches!(e, ControlEvent::PathMigrated { .. })),
+            "a probe of the active path must not report a migration"
+        );
+        // A reset would leave `min_rtt` at its sentinel: the only acknowledgement in
+        // flight covers the challenge packet, which predates the reset and is barred by
+        // the sampling floor, so nothing would re-seed it.
+        assert_eq!(
+            client.hot.loss_detector.rtt_stats.min_rtt,
+            Duration::from_millis(10),
+            "the RTT estimator was cleared by a probe of the active path"
+        );
+        assert_ne!(
+            client.hot.loss_detector.rtt_stats.smoothed_rtt,
+            gtp_recovery::RttStats::new().smoothed_rtt,
+            "smoothed_rtt fell back to the initial constant, so a reset happened"
+        );
+    }
+
+    #[test]
+    fn migration_bars_pre_migration_packets_from_reseeding_min_rtt() {
+        use crate::control::ControlEvent;
+        let cid = ConnectionId(0x1A7B_0000_0000_00E2);
+        let (mut client, mut server) = loopback_pair(cid);
+        let t0 = MonotonicTime::from_micros(11_000_000);
+        let t1 = t0 + Duration::from_millis(50);
+        let t2 = t1 + Duration::from_millis(50);
+        let new_server_addr: SocketAddr = "127.0.0.1:6300".parse().unwrap();
+        let client_active_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // 1. A real packet leaves on the OLD path; remember its packet number.
+        let mut out = [0u8; 1500];
+        client
+            .send_unreliable(b"old-path".to_vec(), PriorityTier::P1Input, None, t0)
+            .unwrap();
+        let (_, sent_len) = client
+            .produce_outgoing_datagram(t0, &mut out)
+            .unwrap()
+            .unwrap();
+        let (sent_header, _) = PacketHeader::decode(&out[..sent_len]).unwrap();
+        let pre_migration_pn = sent_header.packet_number;
+
+        // 2. Migrate through the protocol.
+        client
+            .control()
+            .trigger_path_challenge(new_server_addr, [0xE2; 8], t0)
+            .unwrap();
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut challenge_buf = out;
+        server
+            .handle_incoming_datagram(client_active_addr, &mut challenge_buf[..len], t1)
+            .unwrap();
+        let (_, resp_len) = server
+            .produce_outgoing_datagram(t1, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut resp_buf = out;
+        client
+            .handle_incoming_datagram(new_server_addr, &mut resp_buf[..resp_len], t2)
+            .unwrap();
+        assert_eq!(client.hot.active_path, new_server_addr);
+        assert!(client
+            .drain_events()
+            .iter()
+            .any(|e| matches!(e, ControlEvent::PathMigrated { .. })));
+
+        // 3. A late, FAST acknowledgement for the pre-migration packet. Without the
+        //    sampling floor this sets `min_rtt` to ~5ms on a path that is nowhere near
+        //    that quick, and the inflation ratio never recovers.
+        let ranges = [gtp_wire::AckRange { gap: 0, length: 0 }];
+        client.hot.loss_detector.on_ack_received(
+            pre_migration_pn,
+            0,
+            &ranges,
+            1,
+            t2 + Duration::from_millis(5),
+        );
+        assert_eq!(
+            client.hot.loss_detector.rtt_stats.min_rtt,
+            gtp_recovery::RttStats::new().min_rtt,
+            "a packet sent before the migration re-seeded min_rtt with {:?}",
+            client.hot.loss_detector.rtt_stats.min_rtt
+        );
+    }
+
     #[test]
     fn path_migration_via_protocol() {
         use crate::control::ControlEvent;
@@ -2113,6 +2402,124 @@ mod tests {
     ///
     /// Negative check: skip `requeue_controls` on the anti-amp path and the queue is left
     /// empty; stop deferring `close_frame_sent` and it is true here despite no send.
+    /// A-5 regression: the anti-amplification counter must reflect bytes the connection
+    /// actually **authenticated**, not bytes that merely arrived.
+    ///
+    /// `on_bytes_received` used to run in the first three lines of the RX path — before
+    /// the header was decoded, before the connection id was matched, before the replay
+    /// window, and before AEAD. Every forged or random datagram therefore bought the
+    /// sender 3x its own length in send budget toward an address that was never
+    /// validated, which is precisely the amplification the 3x limit exists to prevent.
+    /// RFC 9000 §8.1 is explicit that datagrams discarded as unprocessable are not
+    /// counted.
+    ///
+    /// This drives the real `handle_incoming_datagram` path, not the limiter directly.
+    ///
+    /// **What this test does NOT prove.** It establishes the negative — that nothing
+    /// unattributable or unauthenticated raises the budget — and that an authenticated
+    /// datagram is counted in full. It does *not* exercise the 3x arithmetic itself,
+    /// and cannot: a successful authentication calls `mark_validated()` on the very next
+    /// line, after which `can_send` returns true unconditionally and the counter stops
+    /// gating anything. The limit's own behaviour (the 3x boundary, the off-by-one at
+    /// the edge, and its removal after validation) is covered one layer down, by
+    /// `gtp_path::anti_amplification::tests::test_anti_amplification_3x_boundary`.
+    /// The coverage is split across the two layers, not missing.
+    #[test]
+    fn unauthenticated_datagrams_earn_no_anti_amplification_budget() {
+        let cid = ConnectionId(0x0A05_0000_0000_00A5);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(15_000_000);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Force the amplification-limited window: a fresh limiter has zero received
+        // bytes, hence zero send budget toward an address it has not validated.
+        server.hot.anti_amplification = gtp_path::AntiAmplificationLimiter::new();
+        assert_eq!(server.hot.anti_amplification.bytes_received(), 0);
+        assert!(!server.hot.anti_amplification.can_send(1));
+
+        // Two genuine datagrams from the real client.
+        let mut buf_a = [0u8; 1500];
+        client
+            .send_unreliable(b"first".to_vec(), PriorityTier::P1Input, None, now)
+            .unwrap();
+        let (_, len_a) = client
+            .produce_outgoing_datagram(now, &mut buf_a)
+            .unwrap()
+            .unwrap();
+
+        let mut buf_b = [0u8; 1500];
+        client
+            .send_unreliable(b"second".to_vec(), PriorityTier::P1Input, None, now)
+            .unwrap();
+        let (_, len_b) = client
+            .produce_outgoing_datagram(now, &mut buf_b)
+            .unwrap()
+            .unwrap();
+
+        // 1. Random bytes: not even attributable to this connection.
+        let mut garbage = vec![0xA5u8; 1200];
+        let _ = server.handle_incoming_datagram(client_addr, &mut garbage[..], now);
+        assert_eq!(
+            server.hot.anti_amplification.bytes_received(),
+            0,
+            "an unattributable datagram must not be counted"
+        );
+
+        // 2. Well-formed and correctly addressed, but forged: the header decodes, the
+        //    connection id matches, the replay window admits it — and only AEAD rejects
+        //    it. This is the worst case for the defender.
+        let mut forged = buf_a;
+        forged[len_a - 1] ^= 0xFF;
+        let res = server.handle_incoming_datagram(client_addr, &mut forged[..len_a], now);
+        assert!(res.is_err(), "tampered ciphertext must fail authentication");
+        assert!(
+            !server.hot.anti_amplification.is_validated(),
+            "a forged datagram must never validate the peer"
+        );
+        assert_eq!(
+            server.hot.anti_amplification.bytes_received(),
+            0,
+            "a datagram that failed authentication must not be counted ({len_a} forged bytes)"
+        );
+        assert!(
+            !server.hot.anti_amplification.can_send(1),
+            "the 3x budget must still be zero after a forged datagram"
+        );
+
+        // 3. Correctly formed, but addressed to a different connection: rejected at the
+        //    connection-id check — the other pre-authentication exit.
+        let other_cid = ConnectionId(0x0A05_0000_0000_00FF);
+        let mut other =
+            GtpConnection::new_with_role(other_cid, client_addr, true, false, GtpConfig::default());
+        other.hot.anti_amplification = gtp_path::AntiAmplificationLimiter::new();
+        let mut misaddressed = buf_a;
+        let res = other.handle_incoming_datagram(client_addr, &mut misaddressed[..len_a], now);
+        assert!(
+            res.is_err(),
+            "a datagram for another connection must be rejected"
+        );
+        assert_eq!(
+            other.hot.anti_amplification.bytes_received(),
+            0,
+            "a datagram rejected at the connection-id check must not be counted"
+        );
+
+        // 4. The genuine datagram is counted in full, and validates the peer.
+        let delivered = server
+            .handle_incoming_datagram(client_addr, &mut buf_b[..len_b], now)
+            .unwrap();
+        assert!(
+            !delivered.is_empty(),
+            "the genuine datagram carries a message"
+        );
+        assert_eq!(
+            server.hot.anti_amplification.bytes_received(),
+            len_b as u64,
+            "an authenticated datagram must be counted in full"
+        );
+        assert!(server.hot.anti_amplification.is_validated());
+    }
+
     #[test]
     fn drained_control_is_restored_when_the_datagram_is_rejected() {
         let cid = ConnectionId(0xC105_0000_0000_000C);
