@@ -364,9 +364,32 @@ impl GtpConnection {
                 // own length toward an address that was never validated, which is exactly
                 // the amplification the limit exists to prevent. RFC 9000 §8.1 is explicit
                 // that datagrams discarded as unprocessable are not counted.
-                self.hot.anti_amplification.on_bytes_received(datagram_len);
-                // A legitimate authenticated packet proves peer reachability.
-                self.hot.anti_amplification.mark_validated();
+                //
+                // New-8 / RFC 9000 §9.3: amplification budget is a property of the
+                // PATH, not of the connection. Crediting every authenticated datagram
+                // to one connection-wide limiter — and, worse, marking that limiter
+                // validated — let reachability proven for one address unlock unlimited
+                // sending toward a different address the peer had merely named. The
+                // credit therefore follows `src_addr`:
+                //   - the active path keeps the old behaviour (an authenticated packet
+                //     from the address we are already using proves reachability);
+                //   - the address under challenge earns budget but is NOT validated —
+                //     only a matching PATH_RESPONSE can do that;
+                //   - any other address earns nothing at all.
+                if src_addr == self.hot.active_path {
+                    self.hot.anti_amplification.on_bytes_received(datagram_len);
+                    // A legitimate authenticated packet proves peer reachability.
+                    self.hot.anti_amplification.mark_validated();
+                } else if let Some((probe_addr, probe)) = self.hot.anti_amplification_probe.as_mut()
+                {
+                    // Honour the probe only while its challenge is still the pending
+                    // one, so probe state can never outlive the challenge that made it.
+                    if *probe_addr == src_addr
+                        && self.hot.path_validator.pending_addr() == Some(src_addr)
+                    {
+                        probe.on_bytes_received(datagram_len);
+                    }
+                }
                 // R-6: age the post-ratchet grace window on the receive path too.
                 self.hot.tick_rx_key_grace();
                 len
@@ -574,6 +597,20 @@ impl GtpConnection {
                         if src_addr != self.hot.active_path {
                             let old_addr = self.hot.active_path;
                             self.hot.active_path = src_addr;
+                            // New-8: the challenge just succeeded, so this address is
+                            // validated — promote its probe budget to the active slot.
+                            // The old path's budget is dropped, not remembered: by
+                            // design there is no path history, so returning to a former
+                            // address re-challenges it and it is capped at 3x again
+                            // until that challenge succeeds. Conservative on purpose —
+                            // remembering paths would require the unbounded map this
+                            // design deliberately avoids.
+                            let mut promoted = match self.hot.anti_amplification_probe.take() {
+                                Some((probe_addr, probe)) if probe_addr == src_addr => probe,
+                                _ => gtp_path::AntiAmplificationLimiter::new(),
+                            };
+                            promoted.mark_validated();
+                            self.hot.anti_amplification = promoted;
                             // X-1 / RFC 9000 §9.4: the RTT estimator describes the path
                             // it was sampled on. `min_rtt` only ever decreases, so
                             // carrying it across a migration pins `rtt_inflation` — and
@@ -965,6 +1002,26 @@ impl GtpConnection {
 
         // Check Anti-Amplification Limiter — on rejection, every popped item AND every
         // drained control frame is re-queued; nothing reliable is lost to the gate.
+        //
+        // New-8: the gate stays on the ACTIVE path's limiter, deliberately. Charging a
+        // directed datagram to the probe's own budget, which necessarily starts at zero
+        // bytes received, would refuse to emit the PATH_CHALLENGE that is the sole way
+        // that budget can ever grow: migration could never begin. The probe slot is
+        // therefore a RECEIVE-side accumulator and gates nothing outbound.
+        //
+        // Do NOT read that as "the directed frames are bounded anyway". They are not,
+        // and New-8's correctness must not be taken to depend on any such bound:
+        //   - `PathValidator` bounds the outgoing side only — at most one OUTSTANDING
+        //     CHALLENGE, because it holds a single `pending_challenge`.
+        //   - A PATH_RESPONSE is a different thing entirely: it is queued by the
+        //     handler for every INBOUND PATH_CHALLENGE (see `Frame::PathChallenge`),
+        //     addressed to whatever source the inbound datagram claimed, and nothing
+        //     bounds how many of them a peer can provoke. `control_queue` has no
+        //     length cap.
+        // That an unvalidated destination can therefore be sent to without passing a
+        // 3x limiter is a SEPARATE, PRE-EXISTING defect — the gate and the echo are
+        // byte-identical to their form before this commit. It is tracked as New-12 and
+        // is deliberately not addressed here; New-8 fixes the receive-side leak only.
         if !self.hot.anti_amplification.can_send(total_datagram_len) {
             Self::requeue_controls(&mut self.hot.control_queue, drained_controls);
             Self::requeue_popped(&mut self.hot.scheduler, popped, now, &mut self.cold);
@@ -2518,6 +2575,264 @@ mod tests {
             "an authenticated datagram must be counted in full"
         );
         assert!(server.hot.anti_amplification.is_validated());
+    }
+
+    // ---------------------------------------------------------------------------
+    // New-8: anti-amplification validation is per PATH, not per connection.
+    //
+    // RFC 9000 §9.3. Before the fix a single connection-wide limiter was marked
+    // validated by ANY authenticated datagram regardless of its source address, so
+    // reachability proven for one address silently authorised unlimited sending
+    // toward any other address. These five tests pin the corrected state machine.
+    // ---------------------------------------------------------------------------
+
+    /// Helper: one authenticated datagram from `from`, delivered to `to` as if it
+    /// arrived from `src`. Returns the datagram length actually delivered.
+    fn deliver_authenticated(
+        from: &mut GtpConnection,
+        to: &mut GtpConnection,
+        src: SocketAddr,
+        now: MonotonicTime,
+    ) -> usize {
+        let mut buf = [0u8; 1500];
+        from.send_unreliable(b"payload".to_vec(), PriorityTier::P1Input, None, now)
+            .unwrap();
+        let (_, len) = from
+            .produce_outgoing_datagram(now, &mut buf)
+            .unwrap()
+            .unwrap();
+        to.handle_incoming_datagram(src, &mut buf[..len], now)
+            .unwrap();
+        len
+    }
+
+    /// **The negative test.** This is the defect itself: an authenticated datagram
+    /// arriving from an address that is neither the active path nor under challenge
+    /// must earn no budget and must validate nothing. Before New-8 this test fails on
+    /// both assertions — the old code called `on_bytes_received` and `mark_validated`
+    /// on the connection-wide limiter without ever looking at `src_addr`.
+    #[test]
+    fn authenticated_bytes_from_an_unchallenged_address_earn_nothing() {
+        let cid = ConnectionId(0x0E08_0000_0000_0001);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(21_000_000);
+        let foreign: SocketAddr = "198.51.100.7:9999".parse().unwrap();
+
+        // Put the server back in the amplification-limited window.
+        server.hot.anti_amplification = gtp_path::AntiAmplificationLimiter::new();
+        assert!(!server.hot.anti_amplification.is_validated());
+
+        // A genuine, fully authenticated datagram — but sourced from an address the
+        // server never challenged and is not talking to.
+        deliver_authenticated(&mut client, &mut server, foreign, now);
+
+        assert!(
+            !server.hot.anti_amplification.is_validated(),
+            "an authenticated datagram from an unchallenged address must not validate \
+             the active path"
+        );
+        assert_eq!(
+            server.hot.anti_amplification.bytes_received(),
+            0,
+            "a foreign address must not raise the active path's 3x budget"
+        );
+        assert!(
+            server.hot.anti_amplification_probe.is_none(),
+            "a remote source must never be able to conjure probe state for itself"
+        );
+    }
+
+    /// (1) Validating A does not lift the limits on B.
+    #[test]
+    fn validating_the_active_path_does_not_validate_the_probe() {
+        let cid = ConnectionId(0x0E08_0000_0000_0002);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(22_000_000);
+        let path_b: SocketAddr = "127.0.0.1:6100".parse().unwrap();
+
+        // A is the active path and is validated by ordinary authenticated traffic.
+        let path_a = client.hot.active_path;
+        deliver_authenticated(&mut server, &mut client, path_a, now);
+        assert!(
+            client.hot.anti_amplification.is_validated(),
+            "A is validated"
+        );
+
+        // Locally begin validating B.
+        client
+            .control()
+            .trigger_path_challenge(path_b, [0xB1; 8], now)
+            .unwrap();
+        let (probe_addr, probe) = client
+            .hot
+            .anti_amplification_probe
+            .as_ref()
+            .expect("the challenge opened a probe slot");
+        assert_eq!(*probe_addr, path_b);
+        assert!(
+            !probe.is_validated(),
+            "A's validation must not carry over to B"
+        );
+        assert!(
+            !probe.can_send(1),
+            "B starts with an empty budget regardless of A's state"
+        );
+    }
+
+    /// (2) B stays under the 3x cap until it is validated — including the exact
+    /// boundary and the off-by-one just past it.
+    #[test]
+    fn probe_stays_capped_at_three_times_its_received_bytes() {
+        let cid = ConnectionId(0x0E08_0000_0000_0003);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(23_000_000);
+        let path_b: SocketAddr = "127.0.0.1:6100".parse().unwrap();
+
+        client
+            .control()
+            .trigger_path_challenge(path_b, [0xB2; 8], now)
+            .unwrap();
+
+        // Authenticated bytes arriving FROM B credit B's own budget.
+        let len = deliver_authenticated(&mut server, &mut client, path_b, now);
+
+        let (_, probe) = client
+            .hot
+            .anti_amplification_probe
+            .as_ref()
+            .expect("probe still open: the challenge has not been answered");
+        assert_eq!(
+            probe.bytes_received(),
+            len as u64,
+            "bytes from B must be credited to B"
+        );
+        assert!(
+            !probe.is_validated(),
+            "authenticated bytes are not path validation: only a PATH_RESPONSE is"
+        );
+        assert!(probe.can_send(3 * len), "the 3x boundary is allowed");
+        assert!(
+            !probe.can_send(3 * len + 1),
+            "one byte past 3x must be refused"
+        );
+
+        // And the active path's own budget is untouched by B's traffic.
+        assert_eq!(
+            client.hot.anti_amplification.bytes_received(),
+            0,
+            "B's bytes must not leak into A's budget"
+        );
+    }
+
+    /// (3) A successful PATH_RESPONSE validates B and promotes it to the active slot.
+    #[test]
+    fn successful_path_response_validates_and_promotes_the_probe() {
+        let cid = ConnectionId(0x0E08_0000_0000_0004);
+        let (mut client, mut server) = loopback_pair(cid);
+        let t0 = MonotonicTime::from_micros(24_000_000);
+        let t1 = t0 + Duration::from_millis(20);
+        let path_b: SocketAddr = "127.0.0.1:6100".parse().unwrap();
+        let client_active = client.hot.active_path;
+
+        client
+            .control()
+            .trigger_path_challenge(path_b, [0xB3; 8], t0)
+            .unwrap();
+        assert!(client.hot.anti_amplification_probe.is_some());
+
+        // Drive the challenge/response exchange through the protocol.
+        let mut out = [0u8; 1500];
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut challenge = out;
+        server
+            .handle_incoming_datagram(client_active, &mut challenge[..len], t1)
+            .unwrap();
+        let (_, resp_len) = server
+            .produce_outgoing_datagram(t1, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut response = out;
+        client
+            .handle_incoming_datagram(path_b, &mut response[..resp_len], t1)
+            .unwrap();
+
+        assert_eq!(client.hot.active_path, path_b, "migration completed");
+        assert!(
+            client.hot.anti_amplification.is_validated(),
+            "the validated probe became the active path's limiter"
+        );
+        assert!(
+            client.hot.anti_amplification_probe.is_none(),
+            "the probe slot is consumed by the promotion, leaving one bounded slot"
+        );
+    }
+
+    /// (4) A -> B -> A. Returning to a former address is deliberately conservative:
+    /// there is no path history, so A is challenged again and is capped at 3x until
+    /// that challenge succeeds. This test pins that chosen semantics — if a future
+    /// change introduces path memory, this is the test that must be revisited.
+    #[test]
+    fn returning_to_a_former_path_revalidates_it() {
+        let cid = ConnectionId(0x0E08_0000_0000_0005);
+        let (mut client, mut server) = loopback_pair(cid);
+        let t0 = MonotonicTime::from_micros(25_000_000);
+        let t1 = t0 + Duration::from_millis(20);
+        let t2 = t1 + Duration::from_millis(20);
+        let path_a = client.hot.active_path;
+        let path_b: SocketAddr = "127.0.0.1:6100".parse().unwrap();
+
+        let mut out = [0u8; 1500];
+
+        // --- A -> B ---
+        client
+            .control()
+            .trigger_path_challenge(path_b, [0xB4; 8], t0)
+            .unwrap();
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut challenge = out;
+        server
+            .handle_incoming_datagram(path_a, &mut challenge[..len], t1)
+            .unwrap();
+        let (_, resp_len) = server
+            .produce_outgoing_datagram(t1, &mut out)
+            .unwrap()
+            .unwrap();
+        let mut response = out;
+        client
+            .handle_incoming_datagram(path_b, &mut response[..resp_len], t1)
+            .unwrap();
+        assert_eq!(client.hot.active_path, path_b);
+
+        // --- back to A ---
+        client
+            .control()
+            .trigger_path_challenge(path_a, [0xB5; 8], t2)
+            .unwrap();
+        let (probe_addr, probe) = client
+            .hot
+            .anti_amplification_probe
+            .as_ref()
+            .expect("returning to A opens a fresh probe for A");
+        assert_eq!(*probe_addr, path_a);
+        assert!(
+            !probe.is_validated(),
+            "A must be re-validated on return: the design keeps no path history"
+        );
+        assert_eq!(
+            probe.bytes_received(),
+            0,
+            "A's former budget is gone, not remembered"
+        );
+        assert!(
+            !probe.can_send(1),
+            "A is capped again until its new challenge is answered"
+        );
     }
 
     #[test]

@@ -139,7 +139,17 @@ pub struct ConnectionHot {
     pub control_queue: VecDeque<OutgoingControlFrame>,
     /// Set once the CLOSE frame has been encoded into an outgoing datagram.
     pub close_frame_sent: bool,
+    /// Amplification budget for the **active** path only (New-8).
     pub anti_amplification: AntiAmplificationLimiter,
+    /// Amplification budget for the one address currently under path challenge
+    /// (New-8). `PathValidator` holds at most one pending challenge, so this is a
+    /// single slot rather than a map: an unbounded `Address -> state` map would let
+    /// a peer grow connection state by naming addresses, and would need an eviction
+    /// policy of its own. `None` whenever no challenge is outstanding.
+    ///
+    /// The address is only honoured while it matches
+    /// `path_validator.pending_addr()`, so probe state cannot outlive its challenge.
+    pub anti_amplification_probe: Option<(SocketAddr, AntiAmplificationLimiter)>,
     pub path_validator: PathValidator,
     pub next_message_id: u64,
     pub next_order_seqs: FxHashMap<u16, u32>,
@@ -335,6 +345,7 @@ impl ConnectionHot {
             control_queue: VecDeque::new(),
             close_frame_sent: false,
             anti_amplification: anti_amp,
+            anti_amplification_probe: None,
             path_validator: PathValidator::new(),
             next_message_id: 1,
             next_order_seqs: FxHashMap::default(),

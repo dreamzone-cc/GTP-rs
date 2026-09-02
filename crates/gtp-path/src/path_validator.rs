@@ -26,6 +26,16 @@ impl PathValidator {
         self.pending_challenge = Some((new_addr, nonce, now));
     }
 
+    /// Address of the challenge currently outstanding, if any.
+    ///
+    /// New-8: this is the single authority for which remote address may hold an
+    /// unvalidated anti-amplification budget. Only `start_challenge` — reachable
+    /// solely through the local `trigger_path_challenge` API — can set it, so a
+    /// remote peer cannot conjure probe state for an address of its choosing.
+    pub fn pending_addr(&self) -> Option<SocketAddr> {
+        self.pending_challenge.map(|(addr, _, _)| addr)
+    }
+
     /// Verifies a PATH_RESPONSE against the pending challenge. Returns `true` when the
     /// response is valid (correct source, matching nonce, within the timeout); the
     /// caller then migrates its own active path. The pending challenge is cleared on a
