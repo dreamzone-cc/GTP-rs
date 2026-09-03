@@ -55,6 +55,16 @@ pub struct LossDetector {
     total_bytes_acked: u64,
     last_delivery_rate_time: MonotonicTime,
     last_delivery_rate_bytes: u64,
+    /// Lowest packet number whose acknowledgement may seed the RTT estimator (X-1).
+    ///
+    /// `reset_for_new_path` clears the estimator, but the packets that were already in
+    /// flight on the OLD path outlive it in `sent_packets`. Their acknowledgements
+    /// arrive after the reset, when `min_rtt` is back at its "no sample yet" sentinel,
+    /// so the first such stale ACK would set `min_rtt` unconditionally — from a
+    /// measurement that spans the migration and describes neither path. If it lands
+    /// below the new path's true floor, `rtt_inflation` is inflated for the rest of the
+    /// session and the backpressure symptom X-1 removed comes straight back.
+    rtt_sample_floor: u64,
 }
 
 impl Default for LossDetector {
@@ -71,6 +81,7 @@ impl Default for LossDetector {
             total_bytes_acked: 0,
             last_delivery_rate_time: MonotonicTime::ZERO,
             last_delivery_rate_bytes: 0,
+            rtt_sample_floor: 0,
         }
     }
 }
@@ -78,6 +89,15 @@ impl Default for LossDetector {
 impl LossDetector {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Handles a **validated** path migration (X-1): the RTT estimator is reset per
+    /// RFC 9000 §9.4, and every packet already in flight on the old path is barred from
+    /// re-seeding it. `first_pn_on_new_path` is the next packet number the connection
+    /// will use, so every record below it predates the migration.
+    pub fn on_path_migration(&mut self, first_pn_on_new_path: PacketNumber) {
+        self.rtt_stats.reset_for_new_path();
+        self.rtt_sample_floor = first_pn_on_new_path.as_u64();
     }
 
     pub fn on_packet_sent(&mut self, record: SentPacketRecord) {
@@ -221,7 +241,11 @@ impl LossDetector {
                     bytes_acked += record.bytes;
                     self.inflight_bytes = self.inflight_bytes.saturating_sub(record.bytes as u64);
                 }
-                if pn == largest_pn {
+                // X-1: a packet sent before a path migration measures the old path (or
+                // worse, straddles the switch). It must never seed the estimator for the
+                // new one — least of all as the FIRST sample after a reset, which sets
+                // `min_rtt` unconditionally.
+                if pn == largest_pn && pn >= self.rtt_sample_floor {
                     let sample = now.duration_since(record.send_time);
                     self.rtt_stats.update(sample, ack_delay);
                     rtt_sample = Some(sample);
@@ -386,6 +410,76 @@ impl LossDetector {
 mod tests {
     use super::*;
     use gtp_types::{FragmentId, MessageId, TransmissionId};
+
+    /// X-1 follow-up: `reset_for_new_path` clears the estimator, but the packets that
+    /// were already in flight on the OLD path survive in `sent_packets`. Their late
+    /// acknowledgements arrive when `min_rtt` is back at its sentinel, so without a
+    /// sampling floor the first stale ACK sets `min_rtt` unconditionally — from a span
+    /// that describes neither path. If it lands below the new path's true floor the
+    /// backpressure inversion X-1 removed comes straight back.
+    #[test]
+    fn a_stale_ack_from_the_old_path_cannot_reseed_min_rtt_after_migration() {
+        let mut detector = LossDetector::new();
+        let t0 = MonotonicTime::from_micros(1_000_000);
+
+        // One packet in flight on the fast old path.
+        detector.on_packet_sent(SentPacketRecord {
+            packet_number: PacketNumber(1),
+            send_time: t0,
+            bytes: 100,
+            ack_eliciting: true,
+            in_flight: true,
+            retransmittable_frames: Vec::new(),
+        });
+
+        // Migrate: the next packet the connection will send is #5.
+        detector.on_path_migration(PacketNumber(5));
+        assert_eq!(
+            detector.rtt_stats.min_rtt,
+            RttStats::new().min_rtt,
+            "the estimator must be cleared by the migration"
+        );
+
+        // The old path's packet is acknowledged 10ms later — a fast sample that predates
+        // the migration. It must be ignored entirely.
+        let ranges = [AckRange { gap: 0, length: 0 }];
+        detector.on_ack_received(
+            PacketNumber(1),
+            0,
+            &ranges,
+            1,
+            t0 + Duration::from_millis(10),
+        );
+        assert_eq!(
+            detector.rtt_stats.min_rtt,
+            RttStats::new().min_rtt,
+            "a pre-migration packet re-seeded min_rtt: {:?}",
+            detector.rtt_stats.min_rtt
+        );
+
+        // A packet actually sent on the new path does seed it.
+        let t1 = t0 + Duration::from_millis(20);
+        detector.on_packet_sent(SentPacketRecord {
+            packet_number: PacketNumber(5),
+            send_time: t1,
+            bytes: 100,
+            ack_eliciting: true,
+            in_flight: true,
+            retransmittable_frames: Vec::new(),
+        });
+        detector.on_ack_received(
+            PacketNumber(5),
+            0,
+            &ranges,
+            1,
+            t1 + Duration::from_millis(60),
+        );
+        assert_eq!(
+            detector.rtt_stats.min_rtt,
+            Duration::from_millis(60),
+            "the new path's own sample must seed the estimator"
+        );
+    }
 
     fn record(pn: u64) -> SentPacketRecord {
         SentPacketRecord {
