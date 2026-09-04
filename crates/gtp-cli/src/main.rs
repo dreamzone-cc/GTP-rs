@@ -7,6 +7,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// N-5: renders an optional duration, marking "no sample yet" as `n/a`
+/// instead of the internal `u64::MAX` sentinel (18446744073709s).
+fn fmt_min_rtt(min_rtt: Option<gtp_types::Duration>) -> String {
+    match min_rtt {
+        Some(d) => format!("{:?}", d),
+        None => "n/a".to_string(),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "gtp-cli")]
 #[command(
@@ -219,7 +228,7 @@ async fn main() -> Result<()> {
             let metrics = conn.control().query_metrics(now);
             println!("{}", metrics.summary_line());
             println!("Smoothed RTT:   {:?}", metrics.smoothed_rtt);
-            println!("Min RTT:        {:?}", metrics.min_rtt);
+            println!("Min RTT:        {}", fmt_min_rtt(metrics.min_rtt));
             println!("CWND:           {} bytes", metrics.cwnd_bytes);
             println!("Pacing Rate:    {} bytes/sec", metrics.pacing_rate_bps);
             println!("Backpressure:   {:?}", metrics.backpressure);
@@ -430,7 +439,7 @@ async fn main() -> Result<()> {
             println!("Client Socket:          {}", local_addr);
             println!("Elapsed Time:           {:.2?}", elapsed);
             println!("Smoothed RTT:           {:?}", metrics.smoothed_rtt);
-            println!("Min RTT:                {:?}", metrics.min_rtt);
+            println!("Min RTT:                {}", fmt_min_rtt(metrics.min_rtt));
             println!("RTT Variance:           {:?}", metrics.rttvar);
             println!(
                 "Congestion Window:      {} bytes ({} KB)",
@@ -542,7 +551,7 @@ async fn main() -> Result<()> {
                         throughput_kbps / 1024.0
                     );
                     println!("  ├─ Smoothed RTT:    {:?}", metrics.smoothed_rtt);
-                    println!("  ├─ Min RTT:         {:?}", metrics.min_rtt);
+                    println!("  ├─ Min RTT:         {}", fmt_min_rtt(metrics.min_rtt));
                     println!("  ├─ CWND:            {} bytes", metrics.cwnd_bytes);
                     println!(
                         "  ├─ Pacing Rate:     {} KB/sec",

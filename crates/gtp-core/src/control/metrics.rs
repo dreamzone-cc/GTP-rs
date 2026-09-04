@@ -8,7 +8,9 @@ pub struct DetailedMetrics {
     pub latest_rtt: Duration,
     pub smoothed_rtt: Duration,
     pub rttvar: Duration,
-    pub min_rtt: Duration,
+    /// N-5: `None` until the first RTT sample is observed — the internal
+    /// `u64::MAX` sentinel never leaks into public telemetry.
+    pub min_rtt: Option<Duration>,
     pub pto_duration: Duration,
 
     // --- Congestion Control & Pacing ---
@@ -50,15 +52,40 @@ impl DetailedMetrics {
 
     /// Formatted human-readable single-line summary for logging.
     pub fn summary_line(&self) -> String {
+        // N-5: an unsampled minimum renders as `n/a`, not as 18446744073709s.
+        let min_rtt = match self.min_rtt {
+            Some(min) => format!("{:?}", min),
+            None => "n/a".to_string(),
+        };
         format!(
-            "RTT: {:?} (min {:?}) | CWND: {} KB | Inflight: {} KB | Rate: {} KB/s | Loss: {:.2}% | Backpressure: {:?}",
+            "RTT: {:?} (min {}) | CWND: {} KB | Inflight: {} KB | Rate: {} KB/s | Loss: {:.2}% | Backpressure: {:?}",
             self.smoothed_rtt,
-            self.min_rtt,
+            min_rtt,
             self.cwnd_bytes / 1024,
             self.inflight_bytes / 1024,
             self.pacing_rate_bps / 1024,
             self.loss_ratio() * 100.0,
             self.backpressure
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// N-5: the sentinel must not render in human-facing output.
+    #[test]
+    fn summary_line_marks_an_unsampled_min_rtt_as_na() {
+        let mut metrics = DetailedMetrics {
+            smoothed_rtt: Duration::from_millis(100),
+            ..DetailedMetrics::default()
+        };
+        assert!(metrics.min_rtt.is_none());
+        assert!(metrics.summary_line().contains("min n/a"));
+
+        metrics.min_rtt = Some(Duration::from_millis(40));
+        assert!(!metrics.summary_line().contains("n/a"));
+        assert!(metrics.summary_line().contains("min 40.000ms"));
     }
 }

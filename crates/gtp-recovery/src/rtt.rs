@@ -32,6 +32,21 @@ impl RttStats {
         Self::default()
     }
 
+    /// N-5: the observed minimum RTT, or `None` before the first sample.
+    ///
+    /// Internally `min_rtt` holds a `u64::MAX` sentinel until the first
+    /// `update`. That sentinel must never leak into metrics (it formats as
+    /// `18446744073709s`) or into backpressure math (it zeroes the
+    /// RTT-inflation axis). Consumers that need a plain value should fall
+    /// back to `INITIAL_RTT`, never to the sentinel.
+    pub fn min_rtt_sample(&self) -> Option<Duration> {
+        if self.first_sample {
+            None
+        } else {
+            Some(self.min_rtt)
+        }
+    }
+
     /// Resets the estimator when the connection migrates to a **validated** new path
     /// (RFC 9000 §9.4, X-1).
     ///

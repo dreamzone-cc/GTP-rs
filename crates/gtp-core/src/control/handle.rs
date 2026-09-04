@@ -166,14 +166,15 @@ impl<'a> ConnectionControl<'a> {
             eff_queue,
             gtp_cc::CongestionController::cwnd(&self.hot.cc),
             rtt.smoothed_rtt,
-            rtt.min_rtt,
+            rtt.min_rtt_sample(),
         );
 
         DetailedMetrics {
             latest_rtt: rtt.latest_rtt,
             smoothed_rtt: rtt.smoothed_rtt,
             rttvar: rtt.rttvar,
-            min_rtt: rtt.min_rtt,
+            // N-5: `None` until the first RTT sample — never the u64::MAX sentinel.
+            min_rtt: rtt.min_rtt_sample(),
             pto_duration: rtt.pto_duration(),
 
             cwnd_bytes: gtp_cc::CongestionController::cwnd(&self.hot.cc),

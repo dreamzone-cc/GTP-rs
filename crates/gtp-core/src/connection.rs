@@ -21,6 +21,11 @@ use std::net::SocketAddr;
 /// is a safe upper bound for every send class (FR-1).
 const MAX_MESSAGE_FRAME_OVERHEAD: usize = 27;
 
+/// N-4: consecutive PTO probe rounds without a single acknowledgement that
+/// establish persistent congestion and justify collapsing the congestion
+/// window (RFC 9002 §7.5). Fewer consecutive probes must leave `cwnd` intact.
+const PERSISTENT_CONGESTION_PTO_COUNT: u32 = 3;
+
 /// High-level Game Transport Protocol Connection Engine with dedicated Control API.
 pub struct GtpConnection {
     pub hot: ConnectionHot,
@@ -290,6 +295,14 @@ impl GtpConnection {
         datagram: &mut [u8],
         now: MonotonicTime,
     ) -> Result<Vec<ReceivedMessage>> {
+        // FR-5: a Closed connection processes no further input — no decryption,
+        // no dispatch, no bookkeeping. Late peer datagrams (including delayed
+        // CLOSE acknowledgements) are dropped at the door instead of being
+        // charged against counters or the replay window.
+        if self.hot.state == gtp_path::ConnectionState::Closed {
+            return Ok(Vec::new());
+        }
+
         let datagram_len = datagram.len();
         self.cold.total_rx_packets += 1;
         self.cold.total_rx_bytes += datagram_len as u64;
@@ -542,11 +555,14 @@ impl GtpConnection {
                         // the datagram (and its ACK bookkeeping) survives.
                         match group.on_incoming(order_seq, payload) {
                             Ok(ready_items) => {
-                                for item in ready_items {
+                                // FR-8: every drained payload is labelled with its
+                                // OWN order sequence, not the sequence of the frame
+                                // that happened to trigger the drain.
+                                for (seq, item) in ready_items {
                                     delivered_messages.push(ReceivedMessage {
                                         class: MessageClass::ReliableOrdered {
                                             group_id,
-                                            order_seq,
+                                            order_seq: seq,
                                         },
                                         payload: item,
                                     });
@@ -835,12 +851,23 @@ impl GtpConnection {
                 .pto_duration_with_backoff(self.config.pto_max_duration);
             if now.duration_since(self.hot.loss_detector.time_of_last_ack_eliciting_packet) >= pto {
                 let loss_ev = self.hot.loss_detector.on_timeout(now);
-                self.hot.cc.on_timeout(now);
-                // R-1: settle the in-flight debt for records the PTO sweep drained.
-                // They are gone from `sent_packets`, so no future ACK or loss sweep
-                // can ever repay them. `lost_packets` is empty, so this does NOT
-                // trigger an extra congestion event on top of `on_timeout`.
-                self.hot.cc.on_loss(&loss_ev, now);
+
+                // N-4 (RFC 9002 §7.5): a PTO is a probe, not congestion
+                // evidence — the window must not collapse just because one
+                // probe went unanswered. It collapses only on persistent
+                // congestion: PERSISTENT_CONGESTION_PTO_COUNT consecutive
+                // probe rounds with no acknowledgement in between
+                // (`pto_count` resets on every ACK received), which indicates
+                // the entire outstanding window was lost.
+                if self.hot.loss_detector.pto_count >= PERSISTENT_CONGESTION_PTO_COUNT {
+                    self.hot.cc.on_timeout(now);
+                }
+                // FU-4: no further CC call belongs here. The drained records'
+                // in-flight debt is settled inside the loss detector itself
+                // (FR-3: it is the single source of in-flight truth and the CC
+                // mirrors none), and the previous `cc.on_loss(&loss_ev, now)`
+                // was a no-op by construction — a PTO event's `lost_packets`
+                // is intentionally empty.
 
                 self.event_queue.push(ControlEvent::PtoTriggered {
                     pto_count: self.hot.loss_detector.pto_count,
@@ -1247,13 +1274,17 @@ impl GtpConnection {
     pub fn feedback(&self, now: MonotonicTime) -> NetworkFeedback {
         let rtt = self.hot.loss_detector.rtt_stats;
         let eff_queue = self.hot.scheduler.effective_queue_bytes(now);
-        let backpressure =
-            calculate_backpressure(eff_queue, self.hot.cc.cwnd(), rtt.smoothed_rtt, rtt.min_rtt);
+        let backpressure = calculate_backpressure(
+            eff_queue,
+            self.hot.cc.cwnd(),
+            rtt.smoothed_rtt,
+            rtt.min_rtt_sample(),
+        );
 
         NetworkFeedback {
             rtt: rtt.latest_rtt,
             smoothed_rtt: rtt.smoothed_rtt,
-            min_rtt: rtt.min_rtt,
+            min_rtt: rtt.min_rtt_sample(),
             cwnd_bytes: self.hot.cc.cwnd(),
             inflight_bytes: self.hot.loss_detector.inflight_bytes(),
             pacing_rate_bps: self.hot.cc.pacing_rate(),
@@ -1266,6 +1297,7 @@ impl GtpConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::MAX_ORDERED_GROUPS;
     use gtp_types::Duration;
 
     fn loopback_pair(cid: ConnectionId) -> (GtpConnection, GtpConnection) {
@@ -1853,11 +1885,14 @@ mod tests {
         }
 
         let fb = client.feedback(t2);
-        let inflation = fb.smoothed_rtt.as_micros() as f64 / fb.min_rtt.as_micros().max(1) as f64;
+        let min_rtt = fb
+            .min_rtt
+            .expect("eight samples were fed after the migration");
+        let inflation = fb.smoothed_rtt.as_micros() as f64 / min_rtt.as_micros().max(1) as f64;
         assert!(
-            fb.min_rtt >= Duration::from_millis(50),
+            min_rtt >= Duration::from_millis(50),
             "min_rtt is still latched at {:?} from the pre-migration path",
-            fb.min_rtt
+            min_rtt
         );
         assert_eq!(
             fb.backpressure,
@@ -1865,7 +1900,7 @@ mod tests {
             "steady traffic on the migrated path must not read as congestion \
              (smoothed {:?} / min {:?} = {inflation:.2}x)",
             fb.smoothed_rtt,
-            fb.min_rtt
+            min_rtt
         );
     }
 
@@ -3157,5 +3192,236 @@ mod tests {
             client.hot.rx_protector_prev.is_some(),
             "the retained RX key must survive send-only activity"
         );
+    }
+
+    /// N-4 (RFC 9002 §7.5): a PTO probe must not collapse the congestion
+    /// window — only persistent congestion (three consecutive probe rounds
+    /// with no acknowledgement) may.
+    #[test]
+    fn test_pto_probe_does_not_collapse_cwnd() {
+        let cid = ConnectionId(0x2A11_0000_0000_0001);
+        let (mut client, _server) = loopback_pair(cid);
+        let mut now = MonotonicTime::from_micros(12_000_000);
+
+        client
+            .send_reliable_unordered(vec![0x33; 100], PriorityTier::P3ReliableGameplay, None, now)
+            .unwrap();
+        let mut out = [0u8; 1500];
+        assert!(client
+            .produce_outgoing_datagram(now, &mut out)
+            .unwrap()
+            .is_some());
+        assert!(client.hot.loss_detector.inflight_bytes() > 0);
+
+        let cwnd0 = client.hot.cc.cwnd();
+        for round in 1..=3u32 {
+            let pto = client
+                .hot
+                .loss_detector
+                .pto_duration_with_backoff(client.config.pto_max_duration);
+            now = now + pto + Duration::from_millis(1);
+
+            let produced = client.produce_outgoing_datagram(now, &mut out);
+            assert!(
+                produced.unwrap().is_some(),
+                "PTO round {} must produce a retransmission datagram",
+                round
+            );
+
+            let cwnd = client.hot.cc.cwnd();
+            if round < PERSISTENT_CONGESTION_PTO_COUNT {
+                assert_eq!(
+                    cwnd, cwnd0,
+                    "a single unanswered PTO probe (round {}) must not collapse cwnd",
+                    round
+                );
+            } else {
+                assert!(
+                    cwnd < cwnd0,
+                    "persistent congestion ({} consecutive PTOs) must collapse cwnd: {} -> {}",
+                    round,
+                    cwnd0,
+                    cwnd
+                );
+            }
+        }
+    }
+
+    /// FR-8: messages drained from the reorder buffer must carry their OWN
+    /// order sequence, not the sequence of the frame that triggered the drain.
+    #[test]
+    fn test_ordered_group_drain_preserves_distinct_order_seq() {
+        let cid = ConnectionId(0x2A11_0000_0000_0002);
+        let (mut client, mut server) = loopback_pair(cid);
+        let mut now = MonotonicTime::from_micros(13_000_000);
+        let group = OrderedGroupId(5);
+
+        // One datagram per message so delivery order is fully controlled.
+        let mut datagrams = Vec::new();
+        for i in 0..4u32 {
+            client
+                .send_reliable_ordered(
+                    group,
+                    format!("msg{i}").into_bytes(),
+                    PriorityTier::P3ReliableGameplay,
+                    None,
+                    now,
+                )
+                .unwrap();
+            let mut buf = [0u8; 1500];
+            let (_, len) = client
+                .produce_outgoing_datagram(now, &mut buf)
+                .unwrap()
+                .unwrap();
+            datagrams.push(buf[..len].to_vec());
+            now += Duration::from_millis(1);
+        }
+
+        // Deliver out of order: D2 and D3 buffer, D0 delivers alone, D1
+        // triggers the drain of 1, 2, 3.
+        let client_source = server.hot.active_path;
+        let mut received = Vec::new();
+        for idx in [2usize, 3, 0, 1] {
+            let mut dgram = datagrams[idx].clone();
+            received.extend(
+                server
+                    .handle_incoming_datagram(client_source, &mut dgram, now)
+                    .unwrap(),
+            );
+        }
+
+        let mut ordered = received
+            .into_iter()
+            .filter_map(|m| match m.class {
+                MessageClass::ReliableOrdered { order_seq, .. } => Some((order_seq, m.payload)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(seq, _)| *seq);
+
+        let seqs: Vec<u32> = ordered.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1, 2, 3],
+            "each delivered message carries its own order_seq (FR-8)"
+        );
+        for (i, (_, payload)) in ordered.iter().enumerate() {
+            assert_eq!(*payload, format!("msg{i}").into_bytes());
+        }
+    }
+
+    /// FU-5: ordered-group eviction is least-recently-used, not
+    /// first-created: an early group that stays active survives the bound.
+    #[test]
+    fn ordered_group_eviction_is_lru_not_fifo() {
+        let cid = ConnectionId(0x2A11_0000_0000_0003);
+        let mut client = GtpConnection::new_with_role(
+            cid,
+            "127.0.0.1:6000".parse().unwrap(),
+            true,
+            true,
+            GtpConfig::default(),
+        );
+
+        // Fill the bounded map completely.
+        for id in 1..=(MAX_ORDERED_GROUPS as u16) {
+            client.hot.ordered_group_mut(OrderedGroupId(id));
+        }
+        // Touch the FIRST group: under FIFO it would be the next eviction
+        // victim; under LRU it must survive.
+        client.hot.ordered_group_mut(OrderedGroupId(1));
+
+        // Admitting one more group evicts the least recently used — group 2.
+        client
+            .hot
+            .ordered_group_mut(OrderedGroupId(MAX_ORDERED_GROUPS as u16 + 1));
+
+        assert!(
+            client.hot.ordered_groups.contains_key(&1),
+            "the touched early group must survive (LRU)"
+        );
+        assert!(
+            !client.hot.ordered_groups.contains_key(&2),
+            "the untouched second-oldest group is the eviction victim"
+        );
+        assert!(client
+            .hot
+            .ordered_groups
+            .contains_key(&(MAX_ORDERED_GROUPS as u16 + 1)));
+    }
+
+    /// FR-5: a Closed connection ignores incoming datagrams entirely — no
+    /// decryption, no dispatch, and no bookkeeping.
+    #[test]
+    fn closed_connection_ignores_incoming_datagrams() {
+        let cid = ConnectionId(0x2A11_0000_0000_0004);
+        let (mut client, mut server) = loopback_pair(cid);
+        let t0 = MonotonicTime::from_micros(14_000_000);
+
+        client
+            .send_unreliable(b"late".to_vec(), PriorityTier::P1Input, None, t0)
+            .unwrap();
+        let mut buf = [0u8; 1500];
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut buf)
+            .unwrap()
+            .unwrap();
+        let mut datagram = buf[..len].to_vec();
+
+        server.control().force_close(0).unwrap();
+        assert_eq!(server.hot.state, gtp_path::ConnectionState::Closed);
+
+        let rx_before = server.cold.total_rx_packets;
+        let msgs = server
+            .handle_incoming_datagram(client.hot.active_path, &mut datagram, t0)
+            .unwrap();
+        assert!(msgs.is_empty(), "a closed connection delivers nothing");
+        assert_eq!(
+            server.cold.total_rx_packets, rx_before,
+            "the FR-5 gate precedes all bookkeeping"
+        );
+    }
+
+    /// N-5: until the first RTT sample, `min_rtt` is `None` in both feedback
+    /// surfaces — the u64::MAX sentinel never reaches the application.
+    #[test]
+    fn unsampled_min_rtt_is_none_until_the_first_ack() {
+        let cid = ConnectionId(0x2A11_0000_0000_0005);
+        let (mut client, mut server) = loopback_pair(cid);
+        let t0 = MonotonicTime::from_micros(15_000_000);
+        let t1 = t0 + Duration::from_millis(5);
+
+        assert!(client.feedback(t0).min_rtt.is_none());
+        assert!(client.control().query_metrics(t0).min_rtt.is_none());
+
+        // One acknowledged exchange produces the first RTT sample.
+        client
+            .send_unreliable(b"ping".to_vec(), PriorityTier::P1Input, None, t0)
+            .unwrap();
+        let mut buf = [0u8; 1500];
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut buf)
+            .unwrap()
+            .unwrap();
+        let mut dgram = buf[..len].to_vec();
+        server
+            .handle_incoming_datagram(client.hot.active_path, &mut dgram, t1)
+            .unwrap();
+        let (_, resp_len) = server
+            .produce_outgoing_datagram(t1, &mut buf)
+            .unwrap()
+            .unwrap();
+        let mut resp = buf[..resp_len].to_vec();
+        client
+            .handle_incoming_datagram(
+                server.hot.active_path,
+                &mut resp,
+                t1 + Duration::from_millis(5),
+            )
+            .unwrap();
+
+        let fb = client.feedback(t1);
+        assert!(fb.min_rtt.is_some(), "first ACK seeds min_rtt");
+        assert!(client.control().query_metrics(t1).min_rtt.is_some());
     }
 }

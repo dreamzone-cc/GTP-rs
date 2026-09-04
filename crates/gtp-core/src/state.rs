@@ -377,22 +377,28 @@ impl ConnectionHot {
         }
     }
 
-    /// Rotates BOTH direction keys in lockstep (SEC-6 / P2-5) and retains the old RX
-    /// key for a grace window. Both peers must invoke this at the same logical point
-    /// (documented limitation until a wire-level key update frame exists).
-    /// Returns the receive-side ordered group for `group_id`, creating it if new and
-    /// evicting the oldest group once `MAX_ORDERED_GROUPS` is reached (FR-2).
+    /// Returns the receive-side ordered group for `group_id`, creating it if new
+    /// and evicting the least recently used group once `MAX_ORDERED_GROUPS` is
+    /// reached (FR-2 bounded; FU-5 upgrades the policy from FIFO-by-creation
+    /// to LRU).
     ///
-    /// Updating an already-tracked group does not touch the insertion order, so the
-    /// bound only trims groups that have been idle the longest. Eviction drops that
-    /// group's reorder buffer; if it later receives more traffic it is recreated fresh.
+    /// Every access — not just creation — refreshes the group's position in
+    /// the eviction order, so a long-lived but active group stays resident
+    /// while an idle one is trimmed first. Eviction drops that group's reorder
+    /// buffer; if the evicted group later receives more traffic it is
+    /// recreated fresh.
     pub fn ordered_group_mut(&mut self, group_id: OrderedGroupId) -> &mut OrderedGroupReceiver {
         let key = group_id.as_u16();
-        if !self.ordered_groups.contains_key(&key) {
+        if self.ordered_groups.contains_key(&key) {
+            // FU-5: touch — move to the most-recently-used end so eviction
+            // trims the least recently USED group, not the oldest created one.
+            self.ordered_group_order.retain(|k| *k != key);
+            self.ordered_group_order.push_back(key);
+        } else {
             while self.ordered_group_order.len() >= MAX_ORDERED_GROUPS {
                 match self.ordered_group_order.pop_front() {
-                    Some(oldest) => {
-                        self.ordered_groups.remove(&oldest);
+                    Some(lru) => {
+                        self.ordered_groups.remove(&lru);
                     }
                     None => break,
                 }
@@ -406,6 +412,9 @@ impl ConnectionHot {
             .expect("group is present: just inserted or already tracked")
     }
 
+    /// Rotates BOTH direction keys in lockstep (SEC-6 / P2-5) and retains the old RX
+    /// key for a grace window. Both peers must invoke this at the same logical point
+    /// (documented limitation until a wire-level key update frame exists).
     pub fn ratchet_session_key(&mut self) {
         if matches!(self.tx_protector, Protector::Plaintext(_)) {
             return;

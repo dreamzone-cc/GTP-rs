@@ -40,7 +40,10 @@ impl OrderedGroupReceiver {
         diff >= 0x8000_0000 && diff != 0
     }
 
-    pub fn on_incoming(&mut self, order_seq: u32, payload: &[u8]) -> Result<Vec<Vec<u8>>> {
+    /// FR-8: buffers or delivers an out-of-order payload and returns every
+    /// payload that became deliverable, each paired with **its own**
+    /// `order_seq` — not the sequence of the frame that triggered the drain.
+    pub fn on_incoming(&mut self, order_seq: u32, payload: &[u8]) -> Result<Vec<(u32, Vec<u8>)>> {
         // If already delivered or predecessor, ignore duplicate (wrap-safe)
         if Self::seq_is_stale(order_seq, self.next_expected) {
             return Ok(Vec::new());
@@ -50,14 +53,15 @@ impl OrderedGroupReceiver {
 
         if order_seq == self.next_expected {
             // Immediate in-order delivery
-            ready.push(payload.to_vec());
+            ready.push((order_seq, payload.to_vec()));
             self.next_expected = self.next_expected.wrapping_add(1);
 
             // Drain any contiguous buffered items
             while let Some(buffered) = self.reorder_buffer.remove(&self.next_expected) {
+                let delivered_seq = self.next_expected;
                 self.current_buffer_bytes =
                     self.current_buffer_bytes.saturating_sub(buffered.len());
-                ready.push(buffered);
+                ready.push((delivered_seq, buffered));
                 self.next_expected = self.next_expected.wrapping_add(1);
             }
         } else {
@@ -96,7 +100,7 @@ mod tests {
 
         // 1. Packet 0 arrives in order
         let ready0 = group.on_incoming(0, b"seq_0").unwrap();
-        assert_eq!(ready0, vec![b"seq_0".to_vec()]);
+        assert_eq!(ready0, vec![(0, b"seq_0".to_vec())]);
         assert_eq!(group.next_expected, 1);
 
         // 2. Packet 2 arrives out of order -> buffered
@@ -108,11 +112,16 @@ mod tests {
         let ready3 = group.on_incoming(3, b"seq_3").unwrap();
         assert!(ready3.is_empty());
 
-        // 4. Missing Packet 1 arrives -> delivers 1, 2, 3 in order!
+        // 4. Missing Packet 1 arrives -> delivers 1, 2, 3 in order! FR-8: each
+        //    drained payload carries its own order_seq, not the trigger's (1).
         let ready1 = group.on_incoming(1, b"seq_1").unwrap();
         assert_eq!(
             ready1,
-            vec![b"seq_1".to_vec(), b"seq_2".to_vec(), b"seq_3".to_vec()]
+            vec![
+                (1, b"seq_1".to_vec()),
+                (2, b"seq_2".to_vec()),
+                (3, b"seq_3".to_vec())
+            ]
         );
         assert_eq!(group.next_expected, 4);
     }
@@ -127,17 +136,17 @@ mod tests {
 
         assert_eq!(
             group.on_incoming(near_max, b"seq_max-1").unwrap(),
-            vec![b"seq_max-1".to_vec()]
+            vec![(near_max, b"seq_max-1".to_vec())]
         );
         assert_eq!(group.next_expected, u32::MAX);
         assert_eq!(
             group.on_incoming(u32::MAX, b"seq_max").unwrap(),
-            vec![b"seq_max".to_vec()]
+            vec![(u32::MAX, b"seq_max".to_vec())]
         );
         assert_eq!(group.next_expected, 0); // wrapped
         assert_eq!(
             group.on_incoming(0, b"seq_0").unwrap(),
-            vec![b"seq_0".to_vec()]
+            vec![(0, b"seq_0".to_vec())]
         );
         assert_eq!(group.next_expected, 1);
 
