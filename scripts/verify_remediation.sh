@@ -4,9 +4,29 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# The local rustup environment is broken (mangled argv[0]) — use the toolchain
-# binary directly, or override it via the CARGO_BIN environment variable.
-CARGO_BIN="${CARGO_BIN:-$HOME/.rustup/toolchains/1.85.0-x86_64-unknown-linux-gnu/bin/cargo}"
+# Resolve cargo in this order (the local rustup shims are broken — mangled
+# argv[0] — so a plain `cargo` may not work):
+#   1. explicit CARGO_BIN override,
+#   2. the toolchain pinned by rust-toolchain.toml, installed under ~/.rustup,
+#   3. whatever `cargo` resolves on PATH (if it actually runs),
+#   4. the newest toolchain present under ~/.rustup.
+PINNED="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml" 2>/dev/null | tr -d '[:space:]')"
+CARGO_BIN="${CARGO_BIN:-}"
+if [ -z "$CARGO_BIN" ] && [ -n "$PINNED" ]; then
+    candidate="$HOME/.rustup/toolchains/${PINNED}-x86_64-unknown-linux-gnu/bin/cargo"
+    [ -x "$candidate" ] && CARGO_BIN="$candidate"
+fi
+if [ -z "$CARGO_BIN" ]; then
+    if command -v cargo >/dev/null 2>&1 && cargo --version >/dev/null 2>&1; then
+        CARGO_BIN="$(command -v cargo)"
+    else
+        CARGO_BIN="$(ls -1 "$HOME"/.rustup/toolchains/*/bin/cargo 2>/dev/null | sort -V | tail -1)"
+    fi
+fi
+if [ -z "$CARGO_BIN" ]; then
+    echo "❌ no usable cargo found (set CARGO_BIN explicitly)"; exit 1
+fi
+echo "using cargo: $CARGO_BIN ($("$CARGO_BIN" --version 2>/dev/null))"
 
 cd "$ROOT"
 FAILED=0
