@@ -103,6 +103,9 @@ cargo run -p gtp-cli -- dissect 80000100011C11223344556677880000000000000001000F
   - [`GTP_Architecture_Decision_Paper_v1.0.md`](GTP_Architecture_Decision_Paper_v1.0.md): Architecture decision record.
   - Sub-specifications: `docs/specs/GTP-ARCH-01.md` through `docs/specs/GTP-TEST-01.md`.
 - **Reports & Operational Verification**:
+  - [`docs/reaudit/GTP-rs_Live_WAN_Testing_and_Verification_Report_AR.md`](docs/reaudit/GTP-rs_Live_WAN_Testing_and_Verification_Report_AR.md): **Official Comprehensive Live WAN Testing & Verification Report (Arabic)** — Empirical trans-continental testing to production VPS (`92.222.80.200`), 0.00% loss, 160 MB/s pacing, flat RSS.
+  - [`docs/reaudit/GTP-rs_Final_Audit_Conclusions_and_Findings_AR.md`](docs/reaudit/GTP-rs_Final_Audit_Conclusions_and_Findings_AR.md): **Final Comprehensive Audit Conclusions, Findings & Engineering Insights (Arabic)** — Master compendium of all 3 inspection cycles, core architectural conclusions, and defect closure.
+  - [`docs/reaudit/GTP-rs_Current_System_State_and_Verification_Report_AR.md`](docs/reaudit/GTP-rs_Current_System_State_and_Verification_Report_AR.md): **Current System State & Laboratory Re-Audit Report (Arabic)** — Evidence-based 134-test re-audit verifying N-1, N-2, New-8, New-12.
   - [`docs/GTP_COMPREHENSIVE_OPERATION_AND_IMPLEMENTATION_REPORT.md`](docs/GTP_COMPREHENSIVE_OPERATION_AND_IMPLEMENTATION_REPORT.md): Complete engineering report covering dynamic server accept, security audits, and multi-machine benchmarks.
   - [`docs/GTP_COMPREHENSIVE_STRESS_AND_STABILITY_TEST_REPORT.md`](docs/GTP_COMPREHENSIVE_STRESS_AND_STABILITY_TEST_REPORT.md): Comprehensive 6-stage stress, endurance, and stability testing report.
   - [`docs/GTP_COMPREHENSIVE_COMPLIANCE_AND_FEATURE_AUDIT_REPORT.md`](docs/GTP_COMPREHENSIVE_COMPLIANCE_AND_FEATURE_AUDIT_REPORT.md): Compliance audit report mapping all specification requirements.
