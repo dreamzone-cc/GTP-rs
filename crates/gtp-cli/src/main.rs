@@ -528,9 +528,20 @@ async fn main() -> Result<()> {
                     for i in 0..target_items {
                         let payload = format!("load_payload_id={:06}_time={:?}", i, Instant::now())
                             .into_bytes();
-                        conn.send_unreliable(payload, PriorityTier::P1Input).await?;
+                        loop {
+                            match conn.send_unreliable(payload.clone(), PriorityTier::P1Input).await {
+                                Ok(_) => break,
+                                Err(TransportError::ResourceLimitExceeded(_)) => {
+                                    tokio::task::yield_now().await;
+                                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
                         if sleep_ms > 0 {
                             tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        } else if i % 64 == 0 {
+                            tokio::task::yield_now().await;
                         }
                     }
 
