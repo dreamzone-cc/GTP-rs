@@ -6,6 +6,7 @@
 use gtp_types::ConnectionId;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use std::fmt;
 use zeroize::Zeroize;
 
 pub const KEY_LEN: usize = 32;
@@ -73,12 +74,24 @@ pub fn derive_session_keys(
 }
 
 /// Directional key material for a session (see `derive_directional_session_keys`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct SessionDirectionalKeys {
     pub client_tx_key: [u8; KEY_LEN],
     pub client_tx_iv: [u8; IV_LEN],
     pub server_tx_key: [u8; KEY_LEN],
     pub server_tx_iv: [u8; IV_LEN],
+}
+
+// SEC-14: raw key material must never render in logs or panic messages.
+impl fmt::Debug for SessionDirectionalKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionDirectionalKeys")
+            .field("client_tx_key", &"[REDACTED]")
+            .field("client_tx_iv", &"[REDACTED]")
+            .field("server_tx_key", &"[REDACTED]")
+            .field("server_tx_iv", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Derives per-direction AEAD keys and IVs from a master secret and connection ID.
@@ -137,5 +150,28 @@ mod tests {
         let (key1_repeat, iv1_repeat) = derive_session_keys(secret, cid1);
         assert_eq!(key1, key1_repeat);
         assert_eq!(iv1, iv1_repeat);
+    }
+
+    /// SEC-14: directional session keys must not render their raw bytes.
+    #[test]
+    fn debug_does_not_leak_session_directional_keys() {
+        let keys = derive_directional_session_keys(b"audit secret", ConnectionId(9));
+        let rendered = format!("{:?}", keys);
+        assert!(rendered.contains("SessionDirectionalKeys"));
+        for field in [
+            "client_tx_key",
+            "client_tx_iv",
+            "server_tx_key",
+            "server_tx_iv",
+        ] {
+            assert!(rendered.contains(field), "field {} should be named", field);
+            assert!(
+                rendered.contains("[REDACTED]"),
+                "field {} must be redacted",
+                field
+            );
+        }
+        assert!(!rendered.contains(&format!("{:?}", keys.client_tx_key)));
+        assert!(!rendered.contains(&format!("{:?}", keys.server_tx_iv)));
     }
 }

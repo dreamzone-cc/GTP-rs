@@ -228,7 +228,11 @@ impl<'a> Frame<'a> {
                 buf[offset..offset + 4].copy_from_slice(&ack_delay_us.to_be_bytes());
                 offset += 4;
 
-                buf[offset] = *range_count;
+                // WIR-2: write the clamped count so the header always matches
+                // the number of ranges actually serialized below — the raw
+                // count could exceed MAX_ACK_RANGES and the encoder would
+                // emit a frame its own decoder rejects.
+                buf[offset] = count as u8;
                 offset += 1;
 
                 for range in ranges.iter().take(count) {
@@ -386,7 +390,17 @@ impl<'a> Frame<'a> {
 
             Self::Close { error_code, reason } => {
                 let reason_bytes = reason.as_bytes();
-                let reason_len = reason_bytes.len().min(255) as u8;
+                // WIR-4: trim at a UTF-8 character boundary — a raw byte cut
+                // can split a multi-byte character, and the peer's
+                // `str::from_utf8` on the decoded reason would then reject
+                // the whole frame. A cut position is a character boundary
+                // iff the byte that follows it is not a UTF-8 continuation
+                // byte (10xxxxxx).
+                let mut reason_len = reason_bytes.len().min(255);
+                while reason_len < reason_bytes.len() && (reason_bytes[reason_len] & 0xC0) == 0x80 {
+                    reason_len -= 1;
+                }
+                let reason_len = reason_len as u8;
                 if buf.len() < offset + 2 + 1 + (reason_len as usize) {
                     return Err(TransportError::BufferOverflow);
                 }
@@ -737,6 +751,69 @@ mod tests {
 
         assert_eq!(len, consumed);
         assert_eq!(frame, decoded);
+    }
+
+    /// WIR-2: an ACK frame whose `range_count` exceeds the wire cap must
+    /// encode self-consistently — the written count matches the ranges
+    /// actually serialized, so the encoder can never emit a frame its own
+    /// decoder rejects.
+    #[test]
+    fn ack_frame_with_uncapped_range_count_encodes_self_consistently() {
+        let mut ranges = [AckRange::default(); MAX_ACK_RANGES];
+        for (i, range) in ranges.iter_mut().enumerate() {
+            *range = AckRange {
+                gap: 1,
+                length: (i + 1) as u32,
+            };
+        }
+        let frame = Frame::Ack {
+            largest_acked: PacketNumber(1000),
+            ack_delay_us: 0,
+            ranges,
+            range_count: 40, // exceeds MAX_ACK_RANGES (32)
+            ect0_count: 0,
+            ect1_count: 0,
+            ce_count: 0,
+        };
+
+        let mut buf = [0u8; 512];
+        let len = frame.encode(&mut buf).unwrap();
+        let (decoded, consumed) = Frame::decode(&buf[..len]).unwrap();
+        assert_eq!(len, consumed);
+        match decoded {
+            Frame::Ack { range_count, .. } => {
+                assert_eq!(range_count, MAX_ACK_RANGES as u8);
+            }
+            other => panic!("expected an Ack frame, got {:?}", other.frame_type()),
+        }
+    }
+
+    /// WIR-4: trimming the close reason at 255 bytes must land on a UTF-8
+    /// character boundary so the peer's `from_utf8` accepts the frame.
+    #[test]
+    fn close_reason_truncates_at_a_utf8_char_boundary() {
+        // 200 two-byte characters: the byte cap of 255 would split the 128th.
+        let reason = "é".repeat(200);
+        let frame = Frame::Close {
+            error_code: 7,
+            reason: &reason,
+        };
+
+        let mut buf = [0u8; 512];
+        let len = frame.encode(&mut buf).unwrap();
+        let (decoded, consumed) = Frame::decode(&buf[..len]).unwrap();
+        assert_eq!(len, consumed);
+        match decoded {
+            Frame::Close { reason, .. } => {
+                assert_eq!(
+                    reason.chars().count(),
+                    127,
+                    "127 whole characters fit in 254 bytes"
+                );
+                assert!(reason.chars().all(|c| c == 'é'));
+            }
+            other => panic!("expected a Close frame, got {:?}", other.frame_type()),
+        }
     }
 
     #[test]
