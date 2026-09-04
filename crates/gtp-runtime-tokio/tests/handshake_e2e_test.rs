@@ -73,7 +73,12 @@ async fn test_live_udp_x25519_multi_client_dynamic_accept() {
                 .await
                 .expect("Connect failed");
             let payload = format!("player_packet_cid_{:X}", cid.as_u64()).into_bytes();
-            conn.send_unreliable(payload.clone(), PriorityTier::P1Input)
+            // Use a RELIABLE send: this test asserts that each client's packet is
+            // delivered, which is a deterministic guarantee only for reliable
+            // classes. An unreliable packet is best-effort and may legitimately be
+            // dropped under the socket-buffer pressure of many concurrent clients,
+            // which made this test flaky for reasons unrelated to what it verifies.
+            conn.send_reliable_unordered(payload.clone(), PriorityTier::P3ReliableGameplay)
                 .await
                 .expect("Send failed");
             (cid, payload)

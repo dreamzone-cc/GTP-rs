@@ -68,6 +68,21 @@ impl<'a> ConnectionControl<'a> {
             .path_validator
             .start_challenge(new_addr, nonce, now);
 
+        // New-8: a challenge is the ONLY way an address acquires an amplification
+        // budget of its own, and starting one is a local decision — this method is
+        // the sole caller of `start_challenge`. The budget starts empty, so until
+        // `new_addr` sends us authenticated bytes we may not send it anything beyond
+        // the challenge itself. Re-challenging replaces any previous probe, keeping
+        // the slot bounded at one.
+        if new_addr == self.hot.active_path {
+            // A keep-alive probe of the path already in use borrows no new budget:
+            // that address is the validated active path.
+            self.hot.anti_amplification_probe = None;
+        } else {
+            self.hot.anti_amplification_probe =
+                Some((new_addr, gtp_path::AntiAmplificationLimiter::new()));
+        }
+
         self.hot
             .control_queue
             .push_back(OutgoingControlFrame::PathChallenge {
@@ -151,18 +166,20 @@ impl<'a> ConnectionControl<'a> {
             eff_queue,
             gtp_cc::CongestionController::cwnd(&self.hot.cc),
             rtt.smoothed_rtt,
-            rtt.min_rtt,
+            rtt.min_rtt_sample(),
         );
 
         DetailedMetrics {
             latest_rtt: rtt.latest_rtt,
             smoothed_rtt: rtt.smoothed_rtt,
             rttvar: rtt.rttvar,
-            min_rtt: rtt.min_rtt,
+            // N-5: `None` until the first RTT sample — never the u64::MAX sentinel.
+            min_rtt: rtt.min_rtt_sample(),
             pto_duration: rtt.pto_duration(),
 
             cwnd_bytes: gtp_cc::CongestionController::cwnd(&self.hot.cc),
-            inflight_bytes: gtp_cc::CongestionController::inflight(&self.hot.cc),
+            // FR-3: single source of truth for in-flight bytes is the loss detector.
+            inflight_bytes: self.hot.loss_detector.inflight_bytes(),
             pacing_rate_bps: gtp_cc::CongestionController::pacing_rate(&self.hot.cc),
             pacing_tokens_remaining: self.hot.pacing.tokens_bytes(),
             backpressure,

@@ -66,6 +66,9 @@ impl GtpConfig {
             initial_cwnd_packets: 20,
             min_cwnd_packets: 4,
             smss: 1200,
+            // N-6: deliberate preset tuning, now documented — a milder window
+            // reduction than RFC 8312's recommended 0.7 keeps the competitive
+            // FPS default latency-friendly after single-loss events.
             cubic_beta: 0.75,
             cubic_c: 0.4,
             pacing_gain: 1.25,

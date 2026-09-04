@@ -32,6 +32,56 @@ impl RttStats {
         Self::default()
     }
 
+    /// N-5: the observed minimum RTT, or `None` before the first sample.
+    ///
+    /// Internally `min_rtt` holds a `u64::MAX` sentinel until the first
+    /// `update`. That sentinel must never leak into metrics (it formats as
+    /// `18446744073709s`) or into backpressure math (it zeroes the
+    /// RTT-inflation axis). Consumers that need a plain value should fall
+    /// back to `INITIAL_RTT`, never to the sentinel.
+    pub fn min_rtt_sample(&self) -> Option<Duration> {
+        if self.first_sample {
+            None
+        } else {
+            Some(self.min_rtt)
+        }
+    }
+
+    /// Resets the estimator when the connection migrates to a **validated** new path
+    /// (RFC 9000 §9.4, X-1).
+    ///
+    /// Samples taken on the old path describe the old path. `min_rtt` in particular
+    /// only ever decreases, so without this reset the *old* path's floor keeps
+    /// defining `rtt_inflation = smoothed_rtt / min_rtt` for the rest of the session:
+    /// after migrating from a 10ms path to a 60ms one the inflation reads 6x forever
+    /// and the engine is told to shed level-of-detail on the path it just chose as
+    /// better. Silent, permanent, and it punishes a successful migration.
+    ///
+    /// `max_ack_delay` is a property of the **peer**, not of the path, so it survives
+    /// the reset; everything else returns to its initial value and the first sample on
+    /// the new path re-seeds the estimator.
+    ///
+    /// **The `INITIAL_RTT` window is deliberate.** Between the migration and the first
+    /// acknowledgement covering a packet actually sent on the new path, `smoothed_rtt`
+    /// reads 100 ms, and `CubicCongestionController::pacing_rate` divides the congestion
+    /// window by it — so the pacing rate is understated for that window. Three things
+    /// bound it: it lasts one round trip plus one send interval; `first_sample` is set
+    /// here, so the first new sample *replaces* the estimate outright instead of being
+    /// blended into it; and RFC 9000 §9.4 asks for exactly this reset (it asks for the
+    /// congestion window too, which is not reset here — leaving the pacing rate more
+    /// permissive during the window than full conformance would be, not less).
+    /// Measured against a live 50 ms path carrying ~6 KB/s, the understated rate is
+    /// still ~1.7 MB/s: real, bounded, and far above the offered load. Keeping the old
+    /// path's `smoothed_rtt` instead would close the window but compute PTO from a stale
+    /// low RTT right after migrating to a slower path, which is the worse trade.
+    pub fn reset_for_new_path(&mut self) {
+        let max_ack_delay = self.max_ack_delay;
+        *self = Self {
+            max_ack_delay,
+            ..Self::default()
+        };
+    }
+
     pub fn update(&mut self, send_to_ack_duration: Duration, ack_delay: Duration) {
         // RFC 9002 §5.2: min_rtt is tracked from the *unadjusted* latest sample so a
         // peer over-reporting ack_delay cannot drag min_rtt (and every derived
@@ -87,6 +137,26 @@ impl RttStats {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reset_for_new_path_drops_old_path_samples_but_keeps_the_peer_property() {
+        let mut stats = RttStats::new();
+        stats.max_ack_delay = Duration::from_millis(11);
+        for _ in 0..8 {
+            stats.update(Duration::from_millis(10), Duration::from_micros(0));
+        }
+        assert_eq!(stats.min_rtt, Duration::from_millis(10));
+
+        stats.reset_for_new_path();
+
+        // max_ack_delay is negotiated with the peer, not measured on the path.
+        assert_eq!(stats.max_ack_delay, Duration::from_millis(11));
+        // The old path's floor is gone: the next sample re-seeds the estimator.
+        assert_eq!(stats.min_rtt, RttStats::new().min_rtt);
+        stats.update(Duration::from_millis(60), Duration::from_micros(0));
+        assert_eq!(stats.min_rtt, Duration::from_millis(60));
+        assert_eq!(stats.smoothed_rtt, Duration::from_millis(60));
+    }
     use super::*;
 
     #[test]

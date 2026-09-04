@@ -26,8 +26,6 @@ pub struct CubicCongestionController {
     epoch_start: Option<MonotonicTime>,
     origin_point: u64,
     smoothed_rtt: Duration,
-    min_rtt: Duration,
-    inflight: u64,
     last_loss_time: Option<MonotonicTime>,
 }
 
@@ -86,8 +84,6 @@ impl CubicCongestionController {
             epoch_start: None,
             origin_point: initial_cwnd,
             smoothed_rtt: Duration::from_millis(50),
-            min_rtt: Duration::from_millis(50),
-            inflight: 0,
             last_loss_time: None,
         }
     }
@@ -133,6 +129,14 @@ impl CubicCongestionController {
         self.min_cwnd_bytes
     }
 
+    /// The RTT the controller currently uses for pacing and the once-per-RTT loss
+    /// guard. FR-4: this is a mirror of the loss detector's `RttStats::smoothed_rtt`
+    /// (the single source of truth), synced on every ACK — never an independent
+    /// estimate. Exposed so telemetry and tests can confirm the two stay identical.
+    pub fn smoothed_rtt(&self) -> Duration {
+        self.smoothed_rtt
+    }
+
     fn on_congestion_event(&mut self, now: MonotonicTime) {
         // Prevent multiple window reductions in the same RTT
         if let Some(last_loss) = self.last_loss_time {
@@ -164,15 +168,15 @@ impl CubicCongestionController {
 }
 
 impl CongestionController for CubicCongestionController {
-    fn on_packet_sent(&mut self, _pn: PacketNumber, bytes: usize, _send_time: MonotonicTime) {
-        self.inflight = self.inflight.saturating_add(bytes as u64);
+    fn on_packet_sent(&mut self, _pn: PacketNumber, _bytes: usize, _send_time: MonotonicTime) {
+        // FR-3: in-flight accounting lives in the loss detector; nothing to mirror here.
     }
 
     fn on_ack(&mut self, ack_event: &AckEvent, now: MonotonicTime) {
-        self.inflight = self.inflight.saturating_sub(ack_event.bytes_acked as u64);
-        if let Some(rtt) = ack_event.rtt_sample {
-            self.on_rtt(rtt);
-        }
+        // FR-3: in-flight is owned by the loss detector; nothing to subtract here.
+        // FR-4: the RTT used for pacing and the once-per-RTT loss guard is synced from
+        // the loss detector (the single source of truth) via `on_rtt`, called by the
+        // connection after each ACK — no second RTT estimate is derived here.
         // CC-2: the window only grows on NEW acknowledgements carrying bytes —
         // duplicate/empty ACK frames must not inflate cwnd.
         if ack_event.bytes_acked > 0 {
@@ -181,7 +185,6 @@ impl CongestionController for CubicCongestionController {
     }
 
     fn on_loss(&mut self, loss_event: &LossEvent, now: MonotonicTime) {
-        self.inflight = self.inflight.saturating_sub(loss_event.bytes_lost as u64);
         if !loss_event.lost_packets.is_empty() {
             self.on_congestion_event(now);
         }
@@ -193,12 +196,11 @@ impl CongestionController for CubicCongestionController {
         }
     }
 
-    fn on_rtt(&mut self, rtt_sample: Duration) {
-        // CC-4: true EWMA instead of storing the raw last sample, so the once-per-RTT
-        // loss guard and the pacing rate do not jitter with single observations.
-        self.smoothed_rtt =
-            Duration::from_micros((self.smoothed_rtt.as_micros() * 7 + rtt_sample.as_micros()) / 8);
-        self.min_rtt = self.min_rtt.min(rtt_sample);
+    fn on_rtt(&mut self, smoothed_rtt: Duration) {
+        // FR-4: `smoothed_rtt` is the authoritative value from the loss detector's
+        // RttStats (the single RTT source), not a raw sample. The controller stores it
+        // directly and no longer keeps a second EWMA that could drift from RttStats.
+        self.smoothed_rtt = smoothed_rtt;
     }
 
     fn on_timeout(&mut self, now: MonotonicTime) {
@@ -225,10 +227,6 @@ impl CongestionController for CubicCongestionController {
         let base_rate = (self.cwnd as f64 / rtt_secs) * self.pacing_gain;
         (base_rate.max(10_000.0)) as u64 // Minimum 10 KB/s
     }
-
-    fn inflight(&self) -> u64 {
-        self.inflight
-    }
 }
 
 #[cfg(test)]
@@ -243,9 +241,10 @@ mod tests {
         let initial_cwnd = cubic.cwnd();
         assert_eq!(initial_cwnd, 12_000);
 
-        // Simulate packet sent
+        // Simulate packet sent. FR-3: the controller no longer mirrors in-flight bytes
+        // (that is the loss detector's single source of truth), so this test now only
+        // exercises what CUBIC owns — the congestion window.
         cubic.on_packet_sent(PacketNumber(1), 1200, now);
-        assert_eq!(cubic.inflight(), 1200);
 
         // Simulate ACK received -> window grows
         let ack_ev = AckEvent {
@@ -256,7 +255,6 @@ mod tests {
         };
         cubic.on_ack(&ack_ev, now + Duration::from_millis(50));
         assert!(cubic.cwnd() > initial_cwnd);
-        assert_eq!(cubic.inflight(), 0);
 
         // Simulate Loss Event -> window reduces to beta * cwnd
         let current_cwnd = cubic.cwnd();
@@ -358,4 +356,10 @@ mod tests {
         assert_eq!(cubic.cwnd(), 50_000);
         assert_eq!(cubic.min_cwnd_bytes, 10_000);
     }
+
+    // R-1's `pto_drained_bytes_leave_the_inflight_counter` test was removed in the
+    // FR-3 merge: the controller no longer tracks in-flight bytes at all (that is now
+    // the loss detector's single source of truth). R-1's concern — that a PTO drain
+    // settles the in-flight debt rather than stranding it — is preserved by
+    // `inflight_is_a_single_source_and_pto_drain_sheds_it` in gtp-recovery.
 }

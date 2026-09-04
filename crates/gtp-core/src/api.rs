@@ -13,7 +13,9 @@ pub struct ReceivedMessage {
 pub struct NetworkFeedback {
     pub rtt: Duration,
     pub smoothed_rtt: Duration,
-    pub min_rtt: Duration,
+    /// N-5: `None` until the first RTT sample is observed (the internal
+    /// `u64::MAX` sentinel never reaches the application).
+    pub min_rtt: Option<Duration>,
     pub cwnd_bytes: u64,
     pub inflight_bytes: u64,
     pub pacing_rate_bps: u64,

@@ -6,7 +6,7 @@ use gtp_crypto::{
 use gtp_path::{AntiAmplificationLimiter, ConnectionState, PathValidator};
 use gtp_recovery::{AckTracker, LossDetector};
 use gtp_scheduler::{GameScheduler, OrderedGroupReceiver, StateTable};
-use gtp_types::{ConnectionId, MonotonicTime, PacketNumber};
+use gtp_types::{ConnectionId, MonotonicTime, OrderedGroupId, PacketNumber};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -80,7 +80,46 @@ impl DeliveredIndex {
     }
 }
 
+/// Number of datagrams for which the pre-ratchet RX key stays acceptable (R-6).
+///
+/// Wide enough to absorb reordering and in-flight packets around a key rotation,
+/// short enough that a leaked old key stops being useful almost immediately.
+pub const RX_PREV_KEY_GRACE_PACKETS: u32 = 256;
+
 /// Hot connection state: protocol engine fields for the inner send/receive loops.
+/// Maximum number of distinct receive-side ordered groups tracked at once (FR-2).
+///
+/// The `group_id` is chosen by the peer and read straight off the wire, so the map
+/// must be bounded or a peer can force unbounded allocation. A legitimate game uses a
+/// handful of ordered channels; 256 is far above any honest load. Eviction is
+/// insertion-order FIFO and costs only the freshness of the oldest group, never the
+/// correctness of an active one (the same trade-off as the `StateTable` bound).
+pub const MAX_ORDERED_GROUPS: usize = 256;
+
+/// New-12: the most `PathResponse` frames one INBOUND datagram may enqueue.
+///
+/// The value is not a tuning knob; it is what a conforming peer can produce. The
+/// outgoing path builds one `PathChallenge` per `trigger_path_challenge` call, and a
+/// directed control frame takes an entire datagram to itself (the drain stops at the
+/// first one), so a datagram carrying two challenges is not something this protocol's
+/// own send path emits. Answering only the first bounds the packet fan-out a single
+/// datagram can provoke, and costs a conforming peer nothing.
+pub const MAX_PATH_RESPONSES_PER_DATAGRAM: usize = 1;
+
+/// New-12: safety bound on `PathResponse` frames sitting in `control_queue` at once.
+///
+/// The answer policy replies only to the active path, so one queued response is the
+/// steady state; two leaves headroom for a response left over from a path promotion
+/// that has not drained yet. This is a backstop for challenges arriving faster than
+/// the queue drains, not the primary defence (that is the per-datagram cap).
+///
+/// Overflow drops the NEW response and keeps the queued ones: the older entry may be
+/// the legitimate exchange that arrived first, and a response is never retransmitted
+/// anyway — `retransmittable_frames` carries data frames only — so a dropped response
+/// is indistinguishable to the peer from ordinary wire loss, which the challenger
+/// already recovers from by issuing a fresh `PathChallenge`.
+pub const MAX_PENDING_PATH_RESPONSES: usize = 2;
+
 pub struct ConnectionHot {
     pub connection_id: ConnectionId,
     pub next_packet_number: PacketNumber,
@@ -93,6 +132,10 @@ pub struct ConnectionHot {
     pub pacing: PacingEngine,
     pub scheduler: GameScheduler,
     pub ordered_groups: FxHashMap<u16, OrderedGroupReceiver>,
+    /// Insertion order of the live receive-side ordered groups (FR-2). Bounds the map
+    /// so a peer choosing many distinct `group_id`s off the wire cannot force unbounded
+    /// allocation (up to 65536 groups × 256 KB each).
+    pub ordered_group_order: VecDeque<u16>,
     /// RX-side freshness table (SEM-2): drops late sequenced state at the receiver.
     pub rx_state_table: StateTable,
     /// ReliableUnordered duplicate-delivery guard (ORD-4).
@@ -104,6 +147,13 @@ pub struct ConnectionHot {
     pub rx_protector: Protector,
     /// Previous RX key retained for a grace window across a key ratchet (P2-5).
     pub rx_protector_prev: Option<Protector>,
+    /// Remaining datagrams for which `rx_protector_prev` stays acceptable.
+    ///
+    /// R-6: the retained key used to live for the rest of the connection, which
+    /// meant a compromised pre-ratchet key could inject packets forever and the
+    /// ratchet delivered no forward secrecy at all. The grace window is now finite;
+    /// when it expires the protector is dropped (and its key zeroized).
+    pub rx_prev_grace_packets: u32,
     pub tx_key: [u8; 32],
     pub rx_key: [u8; 32],
     pub tx_iv: [u8; 12],
@@ -113,7 +163,17 @@ pub struct ConnectionHot {
     pub control_queue: VecDeque<OutgoingControlFrame>,
     /// Set once the CLOSE frame has been encoded into an outgoing datagram.
     pub close_frame_sent: bool,
+    /// Amplification budget for the **active** path only (New-8).
     pub anti_amplification: AntiAmplificationLimiter,
+    /// Amplification budget for the one address currently under path challenge
+    /// (New-8). `PathValidator` holds at most one pending challenge, so this is a
+    /// single slot rather than a map: an unbounded `Address -> state` map would let
+    /// a peer grow connection state by naming addresses, and would need an eviction
+    /// policy of its own. `None` whenever no challenge is outstanding.
+    ///
+    /// The address is only honoured while it matches
+    /// `path_validator.pending_addr()`, so probe state cannot outlive its challenge.
+    pub anti_amplification_probe: Option<(SocketAddr, AntiAmplificationLimiter)>,
     pub path_validator: PathValidator,
     pub next_message_id: u64,
     pub next_order_seqs: FxHashMap<u16, u32>,
@@ -179,7 +239,9 @@ impl ConnectionHot {
             )
         };
 
-        Self::build(cid, peer_addr, tx, rx, None, tx_key, rx_key, tx_iv, rx_iv, false, true)
+        Self::build(
+            cid, peer_addr, tx, rx, None, tx_key, rx_key, tx_iv, rx_iv, false, true,
+        )
     }
 
     /// Builds a connection from directional handshake keys (SEC-1): `as_client`
@@ -291,12 +353,14 @@ impl ConnectionHot {
                     .unwrap_or(&(512 * 1024)),
             ),
             ordered_groups: FxHashMap::default(),
+            ordered_group_order: VecDeque::new(),
             rx_state_table: StateTable::new(),
             delivered_index: DeliveredIndex::new(4096),
             replay_window: ReplayWindow::new(),
             tx_protector,
             rx_protector,
             rx_protector_prev,
+            rx_prev_grace_packets: 0,
             tx_key,
             rx_key,
             tx_iv,
@@ -305,11 +369,47 @@ impl ConnectionHot {
             control_queue: VecDeque::new(),
             close_frame_sent: false,
             anti_amplification: anti_amp,
-            path_validator: PathValidator::new(peer_addr),
+            anti_amplification_probe: None,
+            path_validator: PathValidator::new(),
             next_message_id: 1,
             next_order_seqs: FxHashMap::default(),
             packets_since_ratchet: 0,
         }
+    }
+
+    /// Returns the receive-side ordered group for `group_id`, creating it if new
+    /// and evicting the least recently used group once `MAX_ORDERED_GROUPS` is
+    /// reached (FR-2 bounded; FU-5 upgrades the policy from FIFO-by-creation
+    /// to LRU).
+    ///
+    /// Every access — not just creation — refreshes the group's position in
+    /// the eviction order, so a long-lived but active group stays resident
+    /// while an idle one is trimmed first. Eviction drops that group's reorder
+    /// buffer; if the evicted group later receives more traffic it is
+    /// recreated fresh.
+    pub fn ordered_group_mut(&mut self, group_id: OrderedGroupId) -> &mut OrderedGroupReceiver {
+        let key = group_id.as_u16();
+        if self.ordered_groups.contains_key(&key) {
+            // FU-5: touch — move to the most-recently-used end so eviction
+            // trims the least recently USED group, not the oldest created one.
+            self.ordered_group_order.retain(|k| *k != key);
+            self.ordered_group_order.push_back(key);
+        } else {
+            while self.ordered_group_order.len() >= MAX_ORDERED_GROUPS {
+                match self.ordered_group_order.pop_front() {
+                    Some(lru) => {
+                        self.ordered_groups.remove(&lru);
+                    }
+                    None => break,
+                }
+            }
+            self.ordered_groups
+                .insert(key, OrderedGroupReceiver::new(group_id));
+            self.ordered_group_order.push_back(key);
+        }
+        self.ordered_groups
+            .get_mut(&key)
+            .expect("group is present: just inserted or already tracked")
     }
 
     /// Rotates BOTH direction keys in lockstep (SEC-6 / P2-5) and retains the old RX
@@ -329,6 +429,7 @@ impl ConnectionHot {
             Protector::Aead(GtpAeadProtector::new(new_rx_key, new_rx_iv)),
         );
         self.rx_protector_prev = Some(old_rx);
+        self.rx_prev_grace_packets = RX_PREV_KEY_GRACE_PACKETS;
         self.tx_protector = Protector::Aead(GtpAeadProtector::new(new_tx_key, new_tx_iv));
         self.tx_key = new_tx_key;
         self.rx_key = new_rx_key;
@@ -336,6 +437,20 @@ impl ConnectionHot {
         self.rx_iv = new_rx_iv;
         self.key_phase = !self.key_phase;
         self.packets_since_ratchet = 0;
+    }
+
+    /// Consumes one unit of the post-ratchet grace window and retires the previous
+    /// RX key when it runs out (R-6). Called once per processed datagram in each
+    /// direction so the window covers reordering across roughly one RTT of traffic.
+    pub fn tick_rx_key_grace(&mut self) {
+        if self.rx_protector_prev.is_none() {
+            return;
+        }
+        self.rx_prev_grace_packets = self.rx_prev_grace_packets.saturating_sub(1);
+        if self.rx_prev_grace_packets == 0 {
+            // Dropping the protector zeroizes the retired key material.
+            self.rx_protector_prev = None;
+        }
     }
 }
 

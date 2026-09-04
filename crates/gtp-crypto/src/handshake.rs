@@ -2,6 +2,7 @@ use gtp_types::ConnectionId;
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use sha2::Sha256;
+use std::fmt;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -67,12 +68,25 @@ impl EphemeralKeyPair {
 /// SEC-1: the client encrypts with `client_tx` (and opens with `server_tx`) while the
 /// server does the inverse. Sharing one key/IV across both directions would replay the
 /// same ChaCha20 keystream and Poly1305 one-time key for colliding packet numbers.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct DirectionalKeys {
     pub client_tx_key: [u8; 32],
     pub client_tx_iv: [u8; 12],
     pub server_tx_key: [u8; 32],
     pub server_tx_iv: [u8; 12],
+}
+
+// SEC-14: raw key material must never render in logs or panic messages —
+// a derived Debug would print every key byte verbatim.
+impl fmt::Debug for DirectionalKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirectionalKeys")
+            .field("client_tx_key", &"[REDACTED]")
+            .field("client_tx_iv", &"[REDACTED]")
+            .field("server_tx_key", &"[REDACTED]")
+            .field("server_tx_iv", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// (key, base IV) pair for one traffic direction.
@@ -213,6 +227,23 @@ mod tests {
     use crate::aead::GtpAeadProtector;
     use crate::protector::Protector;
     use gtp_types::PacketNumber;
+
+    /// SEC-14: handshake-derived directional keys must not render raw bytes.
+    #[test]
+    fn debug_does_not_leak_directional_keys() {
+        let keys = DirectionalKeys {
+            client_tx_key: [0xA1; 32],
+            client_tx_iv: [0xB2; 12],
+            server_tx_key: [0xC3; 32],
+            server_tx_iv: [0xD4; 12],
+        };
+        let rendered = format!("{:?}", keys);
+        assert!(rendered.contains("DirectionalKeys"));
+        assert_eq!(rendered.matches("[REDACTED]").count(), 4);
+        assert!(!rendered.contains("161")); // 0xA1
+        assert!(!rendered.contains("178")); // 0xB2
+        assert!(!rendered.contains(&format!("{:?}", keys.client_tx_key)));
+    }
 
     #[test]
     fn test_x25519_diffie_hellman_handshake_roundtrip() {

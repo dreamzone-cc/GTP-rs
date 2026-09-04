@@ -5,6 +5,44 @@ All notable changes to the Game Transport Protocol (GTP-rs) project will be docu
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 2026-09-04 comprehensive re-audit & remediation round
+
+Full evidence-based re-verification of all ~100 tracked defects and closure of every
+critical/high item: `docs/reaudit/Re-Audit-Report-2026-09.md` (as-found state) and
+`docs/reaudit/Closure-Matrix-2026-09.md` (post-remediation outcomes).
+
+### Fixed — merged ready branches
+- **N-1**: endpoint no longer misroutes encrypted data datagrams whose ciphertext begins with handshake-frame type bytes; dispatch is gated on the long-header bit.
+- **N-2**: the RX loop never awaits application delivery (`try_send` + slow-consumer isolation), eliminating endpoint-wide head-of-line blocking.
+- **X-1**: RTT estimator (incl. `min_rtt`) resets on validated path migration.
+- **A-5 / New-8**: anti-amplification bytes are counted only after AEAD authentication, and the 3× budget is per-path (probe-scoped), enabling migration under RFC 9000 §9.3.
+- **New-12**: PathChallenge reflection amplification closed — responses only to the active path, at most one per inbound datagram, at most two queued.
+
+### Fixed — this round
+- **N-3 / X-19**: scheduler DRR keeps a persistent round cursor with once-per-round quantum accrual and a deficit cap; P3/P4 no longer starve under sustained P1 pressure (shares follow the 35:15:5 weights).
+- **FR-7**: O(1) per-tier byte/item accounting replaces the per-enqueue scan.
+- **N-7**: scheduler tiers and ordered-group reorder buffers cap item counts, bounding zero-payload floods.
+- **N-4 / FU-4**: a PTO probe no longer collapses `cwnd`; the window collapses only on persistent congestion (three consecutive probe rounds without an ACK) per RFC 9002 §7.5; the inert `cc.on_loss` call and stale comments are removed.
+- **FR-8**: reorder-buffer drains label every delivered message with its own `order_seq` (`OrderedGroupReceiver::on_incoming` returns `(u32, Vec<u8>)` pairs).
+- **N-5**: `min_rtt` is `Option<Duration>` on every consumer surface (`NetworkFeedback`, `DetailedMetrics`, `calculate_backpressure`); unsampled minimums render as `n/a` instead of the `u64::MAX` sentinel.
+- **FU-5**: ordered-group eviction is LRU (access refreshes recency) instead of FIFO-by-creation; the misleading comment is gone.
+- **FR-5**: `handle_incoming_datagram` refuses all input once the connection is `Closed`.
+- **WIR-2**: the ACK encoder writes the clamped range count, never emitting a frame its own decoder rejects.
+- **WIR-4**: the Close reason is trimmed at a UTF-8 character boundary.
+- **SEC-14**: `DirectionalKeys` / `SessionDirectionalKeys` implement redacted `Debug` (`[REDACTED]`).
+- **N-6**: README/CLI `dissect` examples are now valid 28-byte long-header packets (verified live), path validation is documented as two-way, the `competitive_fps` β=0.75 preset tuning is documented, and `stress-suite` verdicts are computed from real counters (corrupted-frame counts, session completion, server accepts) instead of fixed strings.
+
+### Changed
+- **BREAKING API**: `NetworkFeedback::min_rtt` and `DetailedMetrics::min_rtt` are now `Option<Duration>` (N-5).
+- **BREAKING API**: `OrderedGroupReceiver::on_incoming` returns `Vec<(u32, Vec<u8>)>` (FR-8).
+- `calculate_backpressure` takes `min_rtt: Option<Duration>` (N-5).
+- `scripts/verify_remediation.sh` resolves cargo automatically (pinned toolchain → PATH → newest installed).
+- GTP-SEC-01 spec aligned with the implementation: AAD covers the full header, nonce documented as full-CID‖full-PN with the one-key-one-connection-direction invariant (X-2/X-3).
+
+### Added
+- `crates/gtp/tests/cross_layer_integration_test.rs`: full-seam recovery (loss → reorder store → PTO → complete in-order delivery with per-message sequences) and saturation-fairness scenarios.
+- New unit suites pinning every fix above (39 new tests this round; 135 total green, three identical consecutive full-gate runs).
+
 ## [0.2.0] - 2026-08-29
 
 ### Added

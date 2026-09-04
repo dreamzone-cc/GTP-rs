@@ -2,7 +2,7 @@ use crate::async_connection::AsyncGtpConnection;
 use gtp_core::{GtpConfig, GtpConnection, ReceivedMessage};
 use gtp_crypto::{derive_directional_handshake_session_keys, EphemeralKeyPair};
 use gtp_path::StatelessTokenManager;
-use gtp_types::{ConnectionId, MonotonicTime, PacketNumber, Result, TransportError};
+use gtp_types::{ConnectionId, MessageClass, MonotonicTime, PacketNumber, Result, TransportError};
 use gtp_wire::frame::{
     Frame, FRAME_TYPE_CLIENT_HELLO, FRAME_TYPE_HANDSHAKE_FINISH, FRAME_TYPE_SERVER_HELLO,
 };
@@ -33,6 +33,32 @@ type PendingServerHandshakeMap = Arc<
         >,
     >,
 >;
+
+/// Close code reported to the peer when an application stops draining its own
+/// receive channel and a reliable message would otherwise have to be dropped (N-2).
+const RECEIVE_OVERFLOW_CLOSE_CODE: u16 = 8;
+
+/// Close code reported to the peer when the application has dropped its handle for a
+/// connection, so nothing is left to deliver to (N-2).
+const APPLICATION_GONE_CLOSE_CODE: u16 = 9;
+
+/// Decides whether a received datagram may be inspected as an unauthenticated
+/// handshake packet (N-1).
+///
+/// Handshake frames are only ever emitted inside **long-header** packets
+/// (`ClientHello`, `ServerHello` and `HandshakeFinish` are all built with
+/// `PacketHeader::new_long`), while every established-connection datagram carries a
+/// short header. Without that gate the routing loop read `payload[0]` of a short
+/// header packet — which is the first byte of AEAD *ciphertext* — and compared it
+/// against `FRAME_TYPE_CLIENT_HELLO` / `_SERVER_HELLO` / `_HANDSHAKE_FINISH`
+/// (`0x0B`, `0x0C`, `0x0D`). Ciphertext bytes are uniformly distributed, so 3 of 256
+/// datagrams entered a handshake branch, failed to decode as a handshake frame, and
+/// were then dropped by the branch's unconditional `continue` — a silent, permanent
+/// **1.172%** loss floor on every connection, applied before decryption and
+/// therefore invisible to every layer below.
+fn is_handshake_candidate(header: &PacketHeader, header_len: usize, datagram_len: usize) -> bool {
+    header.flags.is_long_header() && header_len < datagram_len
+}
 
 /// Async GTP Endpoint running on top of Tokio with automated X25519 Handshake and Anti-Amplification defense.
 pub struct GtpEndpoint {
@@ -194,7 +220,55 @@ impl GtpEndpoint {
             GtpConfig::competitive_fps(),
         );
 
-        Ok(self.register_connection(cid, conn).await)
+        let async_conn = self.register_connection(cid, conn).await;
+
+        // 5. Establishment confirmation. The server accepts the session only after
+        // it verifies this HandshakeFinish; a Finish that is lost — or that races
+        // ahead of the server's connection registration — leaves the session
+        // half-open, and the client would stream application data into a black hole
+        // with no way to notice. So do not declare the connection established on
+        // faith: enqueue an ack-eliciting Ping (which the tx loop sends), wait for
+        // the server's ACK, and retransmit the HandshakeFinish until that ACK
+        // arrives — mirroring the ClientHello retransmission above. An ACK can only
+        // come from a peer that decrypted our traffic, which proves it accepted and
+        // registered the connection.
+        let fin_datagram_len = fin_hdr_len + fin_frame_len;
+        let mut confirmed = false;
+        'confirm: for _ in 0..8 {
+            {
+                let mut guard = async_conn.conn.lock().await;
+                let now = MonotonicTime::now();
+                let _ = guard.control().send_ping(0x00C0_FFEE, now);
+            }
+            // Poll for the server's ACK for up to ~400ms (≈ several RTTs).
+            for _ in 0..8 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if async_conn
+                    .conn
+                    .lock()
+                    .await
+                    .hot
+                    .loss_detector
+                    .has_received_ack()
+                {
+                    confirmed = true;
+                    break 'confirm;
+                }
+            }
+            // No confirmation yet: the Finish may have been lost. Retransmit it.
+            let _ = self
+                .socket
+                .send_to(&fin_buf[..fin_datagram_len], peer_addr)
+                .await;
+        }
+
+        // If still unconfirmed after the retransmit budget, return the connection
+        // anyway: a genuinely one-way or dead path should still hand the caller a
+        // handle (the dead link is observable via telemetry — Total RX Packets stays
+        // 0) rather than blocking connect() indefinitely.
+        let _ = confirmed;
+
+        Ok(async_conn)
     }
 
     /// Registers a connection built from externally supplied directional keys.
@@ -283,8 +357,10 @@ impl GtpEndpoint {
 
                 let cid = header.connection_id;
 
-                // 1. Check for Handshake Frames in unauthenticated / handshake packets
-                if header_len < datagram.len() {
+                // 1. Check for Handshake Frames in unauthenticated / handshake packets.
+                // N-1: gated on the long-header bit — a short header means an
+                // established connection, whose payload is ciphertext, not frames.
+                if is_handshake_candidate(&header, header_len, datagram.len()) {
                     let frame_payload = &datagram[header_len..];
                     if !frame_payload.is_empty() {
                         let frame_type = frame_payload[0];
@@ -320,7 +396,28 @@ impl GtpEndpoint {
                                         });
 
                                         let cookie = stateless_tokens.generate_cookie(src, now);
-                                        if let Some((existing_pair, _, _, _, _)) = psh.get(&cid) {
+                                        // Reuse the stored server ephemeral ONLY for a genuine
+                                        // ClientHello retransmit — one carrying the SAME client
+                                        // key material. A ClientHello for this CID that carries
+                                        // DIFFERENT client material is a new handshake (a fresh
+                                        // client that happens to reuse the connection id, or a
+                                        // stale entry left by an earlier attempt): it must
+                                        // supersede the stale entry, otherwise the ServerHello
+                                        // advertises an ephemeral derived against the OLD client
+                                        // key and the client_proof in the eventual
+                                        // HandshakeFinish can never match — the session then
+                                        // half-opens (server never accepts, client streams into a
+                                        // black hole). Keying the pending state on (CID + client
+                                        // ephemeral) instead of the CID alone closes that seam.
+                                        let is_retransmit = psh.get(&cid).is_some_and(
+                                            |(_, stored_pk, stored_nonce, _, _)| {
+                                                *stored_pk == client_public_key
+                                                    && *stored_nonce == client_nonce
+                                            },
+                                        );
+                                        if let Some((existing_pair, _, _, _, _)) =
+                                            psh.get(&cid).filter(|_| is_retransmit)
+                                        {
                                             (existing_pair.public_key, existing_pair.nonce, cookie)
                                         } else {
                                             let server_pair = EphemeralKeyPair::generate();
@@ -473,21 +570,104 @@ impl GtpEndpoint {
 
                 // 2. Regular Game Data Datagram Handling: Strictly routed by ConnectionId
                 let mut datagram_copy = datagram.to_vec();
-                let conns = connections.read().await;
-                if let Some((conn_arc, tx)) = conns.get(&cid) {
-                    let mut guard = conn_arc.lock().await;
-                    if let Ok(msgs) = guard.handle_incoming_datagram(src, &mut datagram_copy, now) {
-                        for msg in msgs {
-                            let _ = tx.send(msg).await;
+                let mut evict = false;
+
+                // N-2: this scope holds BOTH the connection map's read lock and this
+                // connection's mutex, and it is entered by the single RX task that
+                // serves every connection on this socket. Nothing inside it may await
+                // on anything an application controls. Delivery therefore never awaits:
+                // `try_send` decides immediately, and the class decides what a full
+                // channel means. Awaiting here used to park the whole endpoint — no
+                // other connection was served, no new client could be registered, and
+                // the saturated connection's own application could not retake its lock,
+                // which closed a circular wait between the RX loop and that application.
+                {
+                    let conns = connections.read().await;
+                    if let Some((conn_arc, tx)) = conns.get(&cid) {
+                        let mut guard = conn_arc.lock().await;
+                        if let Ok(msgs) =
+                            guard.handle_incoming_datagram(src, &mut datagram_copy, now)
+                        {
+                            let produced = msgs.len();
+                            for (idx, msg) in msgs.into_iter().enumerate() {
+                                match tx.try_send(msg) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(msg)) => match msg.class {
+                                        // Droppable by contract, and the receive-side
+                                        // state table already applied supersession
+                                        // upstream, so what is dropped here is surplus.
+                                        MessageClass::Unreliable
+                                        | MessageClass::UnreliableSequenced { .. } => {
+                                            guard.cold.total_dropped_frames += 1;
+                                        }
+                                        // Reliable classes were already acknowledged to
+                                        // the peer, so the sender will never retransmit
+                                        // them: dropping is silent data loss, and for an
+                                        // ordered group it breaks the ordering of
+                                        // everything after it. Growing without bound
+                                        // turns a slow consumer into memory exhaustion,
+                                        // and waiting is the stall being fixed here. An
+                                        // application that cannot keep up with its own
+                                        // reliable stream cannot continue safely, so the
+                                        // connection ends explicitly and the peer is
+                                        // told why.
+                                        MessageClass::ReliableUnordered
+                                        | MessageClass::ReliableOrdered { .. } => {
+                                            // This message and every one still behind it
+                                            // in this datagram go undelivered, so the
+                                            // counter has to account for the whole tail,
+                                            // not just the message that tripped the
+                                            // overflow.
+                                            guard.cold.total_dropped_frames +=
+                                                (produced - idx) as u64;
+                                            if guard.hot.state.is_active() {
+                                                let _ = guard.control().graceful_close(
+                                                    RECEIVE_OVERFLOW_CLOSE_CODE,
+                                                    "receive queue overflow",
+                                                    now,
+                                                );
+                                            }
+                                            evict = true;
+                                            break;
+                                        }
+                                    },
+                                    // The application dropped its handle: there is
+                                    // nothing left to deliver to. Retiring the routing
+                                    // entry is not enough on its own — `spawn_tx_loop`
+                                    // exits only on `is_closed()`, so the connection
+                                    // would keep a task alive, keep the GtpConnection
+                                    // alive with it, and keep PTO-retransmitting to a
+                                    // peer whose replies are no longer routed anywhere:
+                                    // one leaked task, connection and traffic stream per
+                                    // handle the application drops. Closing it lets the
+                                    // TX loop finish and tells the peer why.
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        guard.cold.total_dropped_frames += (produced - idx) as u64;
+                                        if guard.hot.state.is_active() {
+                                            let _ = guard.control().graceful_close(
+                                                APPLICATION_GONE_CLOSE_CODE,
+                                                "application handle dropped",
+                                                now,
+                                            );
+                                        }
+                                        evict = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // CORE-4: evict closed connections so routing state does not leak
+                        if guard.hot.state.is_closed() {
+                            evict = true;
                         }
                     }
-                    // CORE-4: evict closed connections so routing state does not leak
-                    if guard.hot.state.is_closed() {
-                        drop(guard);
-                        drop(conns);
-                        connections.write().await.remove(&cid);
-                        continue;
-                    }
+                }
+                // Both guards are released by the scope above, in that order, BEFORE
+                // the map write below — taking the write lock while still holding the
+                // read guard would deadlock this task against itself.
+                if evict {
+                    connections.write().await.remove(&cid);
+                    continue;
                 }
             }
         });
@@ -522,6 +702,262 @@ impl GtpEndpoint {
 mod tests {
     use super::*;
     use gtp_types::PriorityTier;
+
+    /// N-1 regression, deterministic: drive a real sealed connection until it emits a
+    /// datagram whose first ciphertext byte collides with a handshake frame type, then
+    /// assert the routing gate still treats it as ordinary traffic. Before the gate this
+    /// exact datagram entered a handshake branch and was dropped by its `continue`.
+    #[test]
+    fn short_header_ciphertext_colliding_with_handshake_types_is_still_routed() {
+        let cid = ConnectionId(0xA11C_E000_1234_5678);
+        let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let mut conn = GtpConnection::new(cid, peer, true);
+
+        let mut out = [0u8; 1500];
+        let mut now = MonotonicTime::from_micros(1_000_000);
+        let mut collisions = 0usize;
+
+        // 3/256 of datagrams collide, so a few hundred sends make this practically certain
+        // while keeping the test deterministic in cost.
+        for i in 0..4096u32 {
+            now += gtp_types::Duration::from_millis(1);
+            conn.send_unreliable(
+                format!("n1-probe-{i}").into_bytes(),
+                PriorityTier::P1Input,
+                None,
+                now,
+            )
+            .expect("probe send fits the datagram budget");
+
+            let Ok(Some((_, len))) = conn.produce_outgoing_datagram(now, &mut out) else {
+                continue;
+            };
+            let (header, header_len) =
+                PacketHeader::decode(&out[..len]).expect("self-produced datagram decodes");
+
+            // Established traffic must always use the short header — that is what makes
+            // the gate a sound discriminator in the first place.
+            assert!(
+                !header.flags.is_long_header(),
+                "established-connection traffic must carry a short header"
+            );
+
+            if header_len >= len {
+                continue;
+            }
+            let first_payload_byte = out[header_len];
+            if matches!(
+                first_payload_byte,
+                FRAME_TYPE_CLIENT_HELLO | FRAME_TYPE_SERVER_HELLO | FRAME_TYPE_HANDSHAKE_FINISH
+            ) {
+                collisions += 1;
+                assert!(
+                    !is_handshake_candidate(&header, header_len, len),
+                    "datagram whose ciphertext starts with 0x{first_payload_byte:02X} was \
+                     routed into the handshake path and would be dropped (N-1)"
+                );
+            }
+            if collisions >= 3 {
+                return;
+            }
+        }
+
+        panic!("no ciphertext/handshake-type collision produced in 4096 datagrams — the probe is broken, not the gate");
+    }
+
+    /// The gate must not cost the handshake anything: all three handshake frames are
+    /// emitted in long-header packets and must still be inspected.
+    #[test]
+    fn long_header_handshake_packets_are_still_inspected() {
+        let cid = ConnectionId(7);
+        let header = PacketHeader::new_long(1, cid, PacketNumber(0), 0, 64);
+        assert!(is_handshake_candidate(&header, 28, 128));
+
+        // A long header with no payload carries nothing to inspect.
+        assert!(!is_handshake_candidate(&header, 28, 28));
+    }
+
+    /// Saturates one connection's application channel while a second one stays healthy,
+    /// and hands back both endpoints so a test can inspect the routing map directly.
+    /// These two live inside the crate on purpose: asserting on eviction and on
+    /// `total_dropped_frames` needs private state, and neither is worth widening the
+    /// public API for.
+    #[cfg(test)]
+    async fn saturate_one_of_two_connections(
+        flood: usize,
+        reliable: bool,
+    ) -> (
+        GtpEndpoint,
+        GtpEndpoint,
+        GtpEndpoint,
+        AsyncGtpConnection,
+        AsyncGtpConnection,
+        AsyncGtpConnection,
+        AsyncGtpConnection,
+        ConnectionId,
+        ConnectionId,
+    ) {
+        let server_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+        let cid_a = ConnectionId(0xEEEE_0000_0000_0001);
+        let cid_b = ConnectionId(0xEEEE_0000_0000_0002);
+
+        let ep_a = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let cli_a = ep_a.connect(cid_a, server_addr, true).await.unwrap();
+        let srv_a = server_ep.accept().await.unwrap();
+
+        let ep_b = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let cli_b = ep_b.connect(cid_b, server_addr, true).await.unwrap();
+        let srv_b = server_ep.accept().await.unwrap();
+
+        for i in 0..flood {
+            let _ = if reliable {
+                cli_a
+                    .send_reliable_unordered(
+                        format!("r-{i}").into_bytes(),
+                        PriorityTier::P3ReliableGameplay,
+                    )
+                    .await
+            } else {
+                cli_a
+                    .send_unreliable(format!("u-{i}").into_bytes(), PriorityTier::P1Input)
+                    .await
+            };
+            if i % 400 == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        // `srv_b` is handed back deliberately: dropping it would close B's channel and
+        // the RX loop would retire B as a gone application, which is a different test.
+        (
+            server_ep, ep_a, ep_b, cli_a, cli_b, srv_a, srv_b, cid_a, cid_b,
+        )
+    }
+
+    /// N-2: an application that drops its handle leaves a `Closed` channel behind. The
+    /// routing entry must go, and so must the connection itself — `spawn_tx_loop` exits
+    /// only on `is_closed()`, so an evicted-but-Established connection keeps a task
+    /// alive, keeps the `GtpConnection` alive with it, and keeps PTO-retransmitting to a
+    /// peer whose replies no longer reach it. This asserts the whole lifecycle, not just
+    /// the map entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_the_application_handle_closes_the_connection_and_ends_the_tx_loop() {
+        let server_ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+        let cid = ConnectionId(0xEEEE_0000_0000_0009);
+
+        let ep = GtpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let cli = ep.connect(cid, server_addr, true).await.unwrap();
+        let srv = server_ep.accept().await.unwrap();
+
+        // Take our own reference BEFORE the handle goes, so the connection stays
+        // observable after it has been evicted from the routing map.
+        let conn_arc = {
+            let conns = server_ep.connections.read().await;
+            let (arc, _) = conns.get(&cid).expect("routable while the app holds it");
+            Arc::clone(arc)
+        };
+
+        // The application is gone; its Receiver goes with it.
+        drop(srv);
+
+        // 1. The routing entry is retired.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let _ = cli
+                .send_unreliable(b"still-here".to_vec(), PriorityTier::P1Input)
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !server_ep.connections.read().await.contains_key(&cid) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the routing entry survived the application dropping its handle"
+            );
+        }
+
+        // 2. The connection itself reaches Closed, which is what lets the TX loop stop.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !conn_arc.lock().await.hot.state.is_closed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the connection stayed open after eviction, so the TX loop never exits"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // 3. The TX task has actually ended: it held the only other strong reference
+        //    once the map entry was removed, so the count falling to ours proves it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Arc::strong_count(&conn_arc) > 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the TX task is still holding the connection: strong_count = {}",
+                Arc::strong_count(&conn_arc)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // 4. And it is not still transmitting to a peer that can no longer be heard.
+        let before = conn_arc.lock().await.cold.total_tx_packets;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let after = conn_arc.lock().await.cold.total_tx_packets;
+        assert_eq!(
+            before, after,
+            "the connection kept transmitting after it was closed and evicted"
+        );
+    }
+
+    /// N-2: drops must be counted, and counted for the whole tail a close discards —
+    /// otherwise a silent policy is also an unmeasurable one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overflow_drops_are_counted_and_the_other_connection_survives() {
+        let (server_ep, _ep_a, _ep_b, _cli_a, cli_b, _srv_a, _srv_b, cid_a, cid_b) =
+            saturate_one_of_two_connections(1600, false).await;
+
+        let dropped = {
+            let conns = server_ep.connections.read().await;
+            let (conn_arc, _) = conns.get(&cid_a).expect("A is still routable");
+            let guard = conn_arc.lock().await;
+            guard.cold.total_dropped_frames
+        };
+        assert!(
+            dropped > 0,
+            "a saturated unreliable stream must register drops, got {dropped}"
+        );
+
+        // B was never touched: still routable, and still delivering.
+        assert!(
+            server_ep.connections.read().await.contains_key(&cid_b),
+            "B must be unaffected by A's overflow"
+        );
+        for i in 0..10 {
+            let _ = cli_b
+                .send_unreliable(format!("b-{i}").into_bytes(), PriorityTier::P1Input)
+                .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let b_rx = {
+            let conns = server_ep.connections.read().await;
+            let (conn_arc, _) = conns.get(&cid_b).unwrap();
+            let guard = conn_arc.lock().await;
+            guard.cold.total_rx_packets
+        };
+        assert!(b_rx > 0, "B stopped receiving while A was saturated");
+    }
 
     #[tokio::test]
     async fn test_async_endpoint_tokio_e2e() {

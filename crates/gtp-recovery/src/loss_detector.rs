@@ -42,6 +42,11 @@ pub struct DeliveryRateSample {
 pub struct LossDetector {
     pub rtt_stats: RttStats,
     sent_packets: BTreeMap<u64, SentPacketRecord>,
+    /// FR-3 / PERF-2: running total of in-flight bytes, maintained incrementally so
+    /// `inflight_bytes()` is O(1) instead of an O(N) scan. This is the SINGLE source
+    /// of truth for in-flight accounting — the congestion controller no longer keeps
+    /// its own mirror counter, which is what let the two diverge (the R-1 regression).
+    inflight_bytes: u64,
     largest_acked_packet: Option<PacketNumber>,
     largest_sent_packet: u64,
     pub time_of_last_ack_eliciting_packet: MonotonicTime,
@@ -50,6 +55,16 @@ pub struct LossDetector {
     total_bytes_acked: u64,
     last_delivery_rate_time: MonotonicTime,
     last_delivery_rate_bytes: u64,
+    /// Lowest packet number whose acknowledgement may seed the RTT estimator (X-1).
+    ///
+    /// `reset_for_new_path` clears the estimator, but the packets that were already in
+    /// flight on the OLD path outlive it in `sent_packets`. Their acknowledgements
+    /// arrive after the reset, when `min_rtt` is back at its "no sample yet" sentinel,
+    /// so the first such stale ACK would set `min_rtt` unconditionally — from a
+    /// measurement that spans the migration and describes neither path. If it lands
+    /// below the new path's true floor, `rtt_inflation` is inflated for the rest of the
+    /// session and the backpressure symptom X-1 removed comes straight back.
+    rtt_sample_floor: u64,
 }
 
 impl Default for LossDetector {
@@ -57,6 +72,7 @@ impl Default for LossDetector {
         Self {
             rtt_stats: RttStats::new(),
             sent_packets: BTreeMap::new(),
+            inflight_bytes: 0,
             largest_acked_packet: None,
             largest_sent_packet: 0,
             time_of_last_ack_eliciting_packet: MonotonicTime::ZERO,
@@ -65,6 +81,7 @@ impl Default for LossDetector {
             total_bytes_acked: 0,
             last_delivery_rate_time: MonotonicTime::ZERO,
             last_delivery_rate_bytes: 0,
+            rtt_sample_floor: 0,
         }
     }
 }
@@ -74,22 +91,54 @@ impl LossDetector {
         Self::default()
     }
 
+    /// Handles a **validated** path migration (X-1): the RTT estimator is reset per
+    /// RFC 9000 §9.4, and every packet already in flight on the old path is barred from
+    /// re-seeding it. `first_pn_on_new_path` is the next packet number the connection
+    /// will use, so every record below it predates the migration.
+    pub fn on_path_migration(&mut self, first_pn_on_new_path: PacketNumber) {
+        self.rtt_stats.reset_for_new_path();
+        self.rtt_sample_floor = first_pn_on_new_path.as_u64();
+    }
+
     pub fn on_packet_sent(&mut self, record: SentPacketRecord) {
         if record.ack_eliciting {
             self.time_of_last_ack_eliciting_packet = record.send_time;
         }
         self.total_bytes_sent += record.bytes as u64;
         self.largest_sent_packet = self.largest_sent_packet.max(record.packet_number.as_u64());
+        if record.in_flight {
+            self.inflight_bytes = self.inflight_bytes.saturating_add(record.bytes as u64);
+        }
         self.sent_packets
             .insert(record.packet_number.as_u64(), record);
     }
 
+    /// In-flight bytes — the single source of truth for congestion accounting (FR-3),
+    /// maintained incrementally so this is O(1) (PERF-2). In debug builds it is checked
+    /// against a full scan of `sent_packets` so any missed update path fails loudly.
     pub fn inflight_bytes(&self) -> u64 {
-        self.sent_packets
-            .values()
-            .filter(|p| p.in_flight)
-            .map(|p| p.bytes as u64)
-            .sum()
+        debug_assert_eq!(
+            self.inflight_bytes,
+            self.sent_packets
+                .values()
+                .filter(|p| p.in_flight)
+                .map(|p| p.bytes as u64)
+                .sum::<u64>(),
+            "inflight_bytes counter drifted from the sent_packets scan"
+        );
+        self.inflight_bytes
+    }
+
+    /// True once at least one authenticated ACK from the peer has been processed.
+    ///
+    /// The client uses this as a handshake-establishment signal: an ACK can only
+    /// be produced by a peer that decrypted our traffic, which in turn means it
+    /// accepted and registered the connection. Until it flips true the peer may
+    /// never have completed acceptance (a lost HandshakeFinish leaves the session
+    /// half-open), so `connect()` retransmits the Finish rather than declaring the
+    /// connection established on faith.
+    pub fn has_received_ack(&self) -> bool {
+        self.largest_acked_packet.is_some()
     }
 
     /// PTO duration with RFC 9002 §6.2 exponential backoff, capped at `max_pto`.
@@ -190,8 +239,13 @@ impl LossDetector {
                 // ACK-only packets would otherwise leak phantom congestion debt.
                 if record.in_flight {
                     bytes_acked += record.bytes;
+                    self.inflight_bytes = self.inflight_bytes.saturating_sub(record.bytes as u64);
                 }
-                if pn == largest_pn {
+                // X-1: a packet sent before a path migration measures the old path (or
+                // worse, straddles the switch). It must never seed the estimator for the
+                // new one — least of all as the FIRST sample after a reset, which sets
+                // `min_rtt` unconditionally.
+                if pn == largest_pn && pn >= self.rtt_sample_floor {
                     let sample = now.duration_since(record.send_time);
                     self.rtt_stats.update(sample, ack_delay);
                     rtt_sample = Some(sample);
@@ -270,6 +324,10 @@ impl LossDetector {
         for pn in lost_pns {
             if let Some(record) = self.sent_packets.remove(&pn) {
                 bytes_lost += record.bytes;
+                // in_flight is always true here (filtered above), but guard anyway.
+                if record.in_flight {
+                    self.inflight_bytes = self.inflight_bytes.saturating_sub(record.bytes as u64);
+                }
                 for frame in record.retransmittable_frames.clone() {
                     retransmittable.push(frame);
                 }
@@ -297,6 +355,15 @@ impl LossDetector {
     /// retransmittable records — at most `MAX_PTO_RETRANSMIT_BURST` of them — and
     /// **remove** them from the outstanding set so each PTO fires a bounded burst
     /// instead of re-enqueueing the entire window every period.
+    ///
+    /// R-1: the drained records leave `sent_packets`, so they can never later be
+    /// acknowledged (`bytes_acked`) nor declared lost (`bytes_lost`). Their bytes
+    /// are therefore reported here as `bytes_lost` so the congestion controller can
+    /// settle the in-flight debt. `lost_packets` stays empty on purpose: a PTO is a
+    /// probe, not a loss declaration, and every controller gates
+    /// `on_congestion_event` on `!lost_packets.is_empty()`. Without this the
+    /// controller's `inflight` ratchets up permanently and `cwnd - inflight`
+    /// collapses to zero for the rest of the connection.
     pub fn on_timeout(&mut self, _now: MonotonicTime) -> LossEvent {
         self.pto_count = self.pto_count.saturating_add(1);
 
@@ -316,13 +383,24 @@ impl LossDetector {
             drained.push(pn);
         }
 
+        let mut bytes_drained = 0u64;
         for pn in drained {
-            self.sent_packets.remove(&pn);
+            if let Some(record) = self.sent_packets.remove(&pn) {
+                if record.in_flight {
+                    bytes_drained = bytes_drained.saturating_add(record.bytes as u64);
+                }
+            }
         }
+        // FR-3: the drained records leave the in-flight set, so the single counter must
+        // shed their bytes. (This is exactly the debt that used to strand the CC mirror
+        // counter in R-1; with one source of truth it can no longer diverge.)
+        self.inflight_bytes = self.inflight_bytes.saturating_sub(bytes_drained);
 
         LossEvent {
             lost_packets: Vec::new(),
-            bytes_lost: 0,
+            // R-1: report the drained bytes so the congestion controller settles the
+            // debt for records that will never be acked or swept again.
+            bytes_lost: bytes_drained as usize,
             retransmittable,
         }
     }
@@ -332,6 +410,76 @@ impl LossDetector {
 mod tests {
     use super::*;
     use gtp_types::{FragmentId, MessageId, TransmissionId};
+
+    /// X-1 follow-up: `reset_for_new_path` clears the estimator, but the packets that
+    /// were already in flight on the OLD path survive in `sent_packets`. Their late
+    /// acknowledgements arrive when `min_rtt` is back at its sentinel, so without a
+    /// sampling floor the first stale ACK sets `min_rtt` unconditionally — from a span
+    /// that describes neither path. If it lands below the new path's true floor the
+    /// backpressure inversion X-1 removed comes straight back.
+    #[test]
+    fn a_stale_ack_from_the_old_path_cannot_reseed_min_rtt_after_migration() {
+        let mut detector = LossDetector::new();
+        let t0 = MonotonicTime::from_micros(1_000_000);
+
+        // One packet in flight on the fast old path.
+        detector.on_packet_sent(SentPacketRecord {
+            packet_number: PacketNumber(1),
+            send_time: t0,
+            bytes: 100,
+            ack_eliciting: true,
+            in_flight: true,
+            retransmittable_frames: Vec::new(),
+        });
+
+        // Migrate: the next packet the connection will send is #5.
+        detector.on_path_migration(PacketNumber(5));
+        assert_eq!(
+            detector.rtt_stats.min_rtt,
+            RttStats::new().min_rtt,
+            "the estimator must be cleared by the migration"
+        );
+
+        // The old path's packet is acknowledged 10ms later — a fast sample that predates
+        // the migration. It must be ignored entirely.
+        let ranges = [AckRange { gap: 0, length: 0 }];
+        detector.on_ack_received(
+            PacketNumber(1),
+            0,
+            &ranges,
+            1,
+            t0 + Duration::from_millis(10),
+        );
+        assert_eq!(
+            detector.rtt_stats.min_rtt,
+            RttStats::new().min_rtt,
+            "a pre-migration packet re-seeded min_rtt: {:?}",
+            detector.rtt_stats.min_rtt
+        );
+
+        // A packet actually sent on the new path does seed it.
+        let t1 = t0 + Duration::from_millis(20);
+        detector.on_packet_sent(SentPacketRecord {
+            packet_number: PacketNumber(5),
+            send_time: t1,
+            bytes: 100,
+            ack_eliciting: true,
+            in_flight: true,
+            retransmittable_frames: Vec::new(),
+        });
+        detector.on_ack_received(
+            PacketNumber(5),
+            0,
+            &ranges,
+            1,
+            t1 + Duration::from_millis(60),
+        );
+        assert_eq!(
+            detector.rtt_stats.min_rtt,
+            Duration::from_millis(60),
+            "the new path's own sample must seed the estimator"
+        );
+    }
 
     fn record(pn: u64) -> SentPacketRecord {
         SentPacketRecord {
@@ -603,5 +751,69 @@ mod tests {
         assert!(detector.pto_count >= MAX_PTO_BACKOFF_EXPONENT);
         let capped = detector.pto_duration_with_backoff(Duration::from_millis(500));
         assert_eq!(capped, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn pto_drain_reports_bytes_for_congestion_settlement() {
+        // R-1: `on_timeout` removes the drained records from `sent_packets`, so no
+        // later ACK or loss sweep can ever repay their in-flight debt. The event must
+        // therefore carry those bytes, while leaving `lost_packets` empty so no extra
+        // congestion event fires on top of the timeout.
+        let mut detector = LossDetector::new();
+        let now = MonotonicTime::from_micros(1_000_000);
+
+        for pn in 1..=2u64 {
+            detector.on_packet_sent(SentPacketRecord {
+                packet_number: PacketNumber(pn),
+                send_time: now,
+                bytes: 100,
+                ack_eliciting: true,
+                in_flight: true,
+                retransmittable_frames: Vec::new(),
+            });
+        }
+        assert_eq!(detector.inflight_bytes(), 200);
+
+        let ev = detector.on_timeout(now);
+        assert_eq!(
+            ev.bytes_lost, 200,
+            "drained bytes must be reported to the controller"
+        );
+        assert!(
+            ev.lost_packets.is_empty(),
+            "a PTO is a probe, not a loss declaration"
+        );
+        assert_eq!(detector.inflight_bytes(), 0);
+    }
+
+    /// FR-3 / TEST-3: in-flight bytes are owned by a single incremental counter, and
+    /// every path that removes an outstanding record sheds its bytes from that counter.
+    /// A PTO drain is the case that stranded the old CC mirror counter (the R-1
+    /// regression); here the one source of truth reflects it immediately. Every
+    /// `inflight_bytes()` call also runs the debug-build drift check against the scan.
+    #[test]
+    fn inflight_is_a_single_source_and_pto_drain_sheds_it() {
+        let mut detector = LossDetector::new();
+        let now = MonotonicTime::from_micros(1_000_000);
+
+        // 5 in-flight ack-eliciting packets, 100 bytes each.
+        for pn in 1..=5 {
+            detector.on_packet_sent(record(pn));
+        }
+        assert_eq!(detector.inflight_bytes(), 500);
+
+        // A PTO sweep drains a bounded burst (MAX_PTO_RETRANSMIT_BURST = 2) and the
+        // single counter loses exactly those bytes — no debt is stranded.
+        detector.on_timeout(now);
+        assert_eq!(
+            detector.inflight_bytes(),
+            500 - (MAX_PTO_RETRANSMIT_BURST as u64) * 100,
+            "drained records must leave the single in-flight source"
+        );
+
+        // Acknowledging the rest settles in-flight to zero.
+        let ranges = [AckRange { gap: 0, length: 4 }];
+        let _ = detector.on_ack_received(PacketNumber(5), 0, &ranges, 1, now);
+        assert_eq!(detector.inflight_bytes(), 0);
     }
 }

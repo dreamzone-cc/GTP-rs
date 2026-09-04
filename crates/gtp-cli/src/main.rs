@@ -7,6 +7,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// N-5: renders an optional duration, marking "no sample yet" as `n/a`
+/// instead of the internal `u64::MAX` sentinel (18446744073709s).
+fn fmt_min_rtt(min_rtt: Option<gtp_types::Duration>) -> String {
+    match min_rtt {
+        Some(d) => format!("{:?}", d),
+        None => "n/a".to_string(),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "gtp-cli")]
 #[command(
@@ -22,7 +31,7 @@ struct Cli {
 enum Commands {
     /// Dissects raw hexadecimal packet bytes into structured GTP headers and TLV frames
     Dissect {
-        /// Hex-encoded packet string (e.g. 800001000118...)
+        /// Hex-encoded packet string (e.g. 80000100011C11223344556677880000000000000001000F4240000905DEADBEEFCAFEBABE)
         hex: String,
     },
     /// Runs a deterministic network simulation benchmark across multiple network profiles
@@ -219,7 +228,7 @@ async fn main() -> Result<()> {
             let metrics = conn.control().query_metrics(now);
             println!("{}", metrics.summary_line());
             println!("Smoothed RTT:   {:?}", metrics.smoothed_rtt);
-            println!("Min RTT:        {:?}", metrics.min_rtt);
+            println!("Min RTT:        {}", fmt_min_rtt(metrics.min_rtt));
             println!("CWND:           {} bytes", metrics.cwnd_bytes);
             println!("Pacing Rate:    {} bytes/sec", metrics.pacing_rate_bps);
             println!("Backpressure:   {:?}", metrics.backpressure);
@@ -313,7 +322,24 @@ async fn main() -> Result<()> {
             let local_addr = client_ep.local_addr()?;
             println!("Client local UDP socket bound to: {}\n", local_addr);
 
-            let cid = ConnectionId(0x1020_3040_5060_7080);
+            // Each client session MUST use a fresh Connection ID. The server keys all
+            // handshake and routing state on the client-chosen CID, so reusing one
+            // across sessions lets a prior session's server-side handshake state
+            // collide with a new handshake: the key-confirmation proof then mismatches
+            // and the server silently drops the session (observed as a ~20% half-open
+            // stall when this CID was hardcoded). Mixing the OS-assigned local UDP
+            // port, a high-resolution timestamp, and the PID yields a CID that is
+            // unique across both sequential and concurrent client processes without
+            // pulling in an RNG dependency.
+            let cid = {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64;
+                let port = local_addr.port() as u64;
+                let pid = std::process::id() as u64;
+                ConnectionId(nanos ^ (port << 48) ^ (pid << 32))
+            };
             let client_conn = client_ep.connect(cid, server_addr, true).await?;
 
             let start_time = Instant::now();
@@ -413,7 +439,7 @@ async fn main() -> Result<()> {
             println!("Client Socket:          {}", local_addr);
             println!("Elapsed Time:           {:.2?}", elapsed);
             println!("Smoothed RTT:           {:?}", metrics.smoothed_rtt);
-            println!("Min RTT:                {:?}", metrics.min_rtt);
+            println!("Min RTT:                {}", fmt_min_rtt(metrics.min_rtt));
             println!("RTT Variance:           {:?}", metrics.rttvar);
             println!(
                 "Congestion Window:      {} bytes ({} KB)",
@@ -433,6 +459,9 @@ async fn main() -> Result<()> {
             );
             println!("Total TX Packets:       {}", metrics.total_tx_packets);
             println!("Total TX Bytes:         {} bytes", metrics.total_tx_bytes);
+            println!("Total RX Packets:       {}", metrics.total_rx_packets);
+            println!("Total RX Bytes:         {} bytes", metrics.total_rx_bytes);
+            println!("PTO Count:              {}", metrics.pto_count);
             println!("Total Retransmissions:  {}", metrics.total_retransmissions);
             println!(
                 "Corrupted Packets:      {}",
@@ -522,7 +551,7 @@ async fn main() -> Result<()> {
                         throughput_kbps / 1024.0
                     );
                     println!("  ├─ Smoothed RTT:    {:?}", metrics.smoothed_rtt);
-                    println!("  ├─ Min RTT:         {:?}", metrics.min_rtt);
+                    println!("  ├─ Min RTT:         {}", fmt_min_rtt(metrics.min_rtt));
                     println!("  ├─ CWND:            {} bytes", metrics.cwnd_bytes);
                     println!(
                         "  ├─ Pacing Rate:     {} KB/sec",
@@ -618,7 +647,10 @@ async fn main() -> Result<()> {
                         "  ├─ Loss Ratio:                {:.2}%",
                         c_metrics.loss_ratio() * 100.0
                     );
-                    println!("  ├─ Corrupted / Failed Frames: 0 (Zero Malformed)");
+                    println!(
+                        "  ├─ Corrupted / Failed Frames: {}",
+                        s_metrics.total_corrupted_packets
+                    );
                     println!(
                         "  └─ Verdict:                   {}",
                         if server_delivered.len() == 20 {
@@ -686,7 +718,6 @@ async fn main() -> Result<()> {
                 println!("  ├─ Initial Memory RSS:      {:.2} MB", mem_initial);
                 println!("  ├─ Final Memory RSS:        {:.2} MB", mem_final);
                 println!("  ├─ Net Memory Delta:        {:+.2} MB", mem_delta);
-                println!("  ├─ Total Deadlocks / Panics:0");
                 println!(
                     "  └─ Memory Leak Verdict:     {}",
                     if mem_delta.abs() < 5.0 {
@@ -845,7 +876,16 @@ async fn main() -> Result<()> {
                     c_metrics.pacing_rate_bps / 1024
                 );
                 println!("  ├─ Engine Backpressure:     {:?}", c_metrics.backpressure);
-                println!("  └─ Game Loop Verdict:       ✅ 100% SMOOTH TICK CONCURRENCY (ZERO HEAD-OF-LINE BLOCKING)");
+                let engine_clean =
+                    s_metrics.total_rx_packets > 0 && s_metrics.total_corrupted_packets == 0;
+                println!(
+                    "  └─ Game Loop Verdict:       {}",
+                    if engine_clean {
+                        "✅ ALL TICK TRAFFIC RECEIVED UNCORRUPTED"
+                    } else {
+                        "⚠️ SERVER SAW NO TRAFFIC OR CORRUPTED FRAMES"
+                    }
+                );
             }
 
             // -------------------------------------------------------------
@@ -882,28 +922,36 @@ async fn main() -> Result<()> {
                             );
                         }
                     }
+                    accepted
                 });
 
                 let mut handles = Vec::new();
                 for i in 1..=num_concurrent {
                     handles.push(tokio::spawn(async move {
-                        let client_ep = GtpEndpoint::bind("0.0.0.0:0".parse().unwrap())
-                            .await
-                            .unwrap();
+                        let client_ep =
+                            GtpEndpoint::bind("0.0.0.0:0".parse().unwrap()).await.ok()?;
                         let cid = ConnectionId(0x2000_0000_0000_0000 + i as u64);
-                        let conn = client_ep.connect(cid, s_addr, true).await.unwrap();
+                        let conn = client_ep.connect(cid, s_addr, true).await.ok()?;
 
                         for p in 0..10 {
                             let payload = format!("concurrent_client_{}_pkt_{}", i, p).into_bytes();
                             let _ = conn.send_unreliable(payload, PriorityTier::P1Input).await;
                         }
+                        Some(())
                     }));
                 }
 
+                let mut sessions_ok = 0;
                 for h in handles {
-                    let _ = h.await;
+                    if h.await.ok().flatten().is_some() {
+                        sessions_ok += 1;
+                    }
                 }
-                server_task.abort();
+                let accepted =
+                    tokio::time::timeout(std::time::Duration::from_secs(60), server_task)
+                        .await
+                        .map(|r| r.unwrap_or(0))
+                        .unwrap_or(0);
 
                 let elapsed = start.elapsed();
                 let mem_after = get_process_memory_mb();
@@ -930,7 +978,22 @@ async fn main() -> Result<()> {
                     mem_after,
                     mem_after - mem_before
                 );
-                println!("  └─ Concurrency Verdict:     ✅ ZERO LOCK CONTENTION / LINEAR RESOURCE SCALING");
+                println!(
+                    "  ├─ Sessions Fully Driven:   {}/{} (connected + 10 packets each)",
+                    sessions_ok, num_concurrent
+                );
+                println!(
+                    "  ├─ Server Accepts:          {}/{}",
+                    accepted, num_concurrent
+                );
+                println!(
+                    "  └─ Concurrency Verdict:     {}",
+                    if sessions_ok == num_concurrent && accepted == num_concurrent {
+                        "✅ ALL SESSIONS ESTABLISHED AND DRIVEN CONCURRENTLY"
+                    } else {
+                        "⚠️ SOME SESSIONS FAILED — INVESTIGATE"
+                    }
+                );
             }
 
             // -------------------------------------------------------------
@@ -981,7 +1044,7 @@ async fn main() -> Result<()> {
                     .await;
 
                 // Real cryptographic path validation
-                let mut path_val = gtp_path::PathValidator::new(addr_1);
+                let mut path_val = gtp_path::PathValidator::new();
                 let nonce = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11];
                 let now = gtp::MonotonicTime::now();
                 path_val.start_challenge(addr_2, nonce, now);
