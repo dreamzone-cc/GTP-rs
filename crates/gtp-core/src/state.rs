@@ -96,6 +96,30 @@ pub const RX_PREV_KEY_GRACE_PACKETS: u32 = 256;
 /// correctness of an active one (the same trade-off as the `StateTable` bound).
 pub const MAX_ORDERED_GROUPS: usize = 256;
 
+/// New-12: the most `PathResponse` frames one INBOUND datagram may enqueue.
+///
+/// The value is not a tuning knob; it is what a conforming peer can produce. The
+/// outgoing path builds one `PathChallenge` per `trigger_path_challenge` call, and a
+/// directed control frame takes an entire datagram to itself (the drain stops at the
+/// first one), so a datagram carrying two challenges is not something this protocol's
+/// own send path emits. Answering only the first bounds the packet fan-out a single
+/// datagram can provoke, and costs a conforming peer nothing.
+pub const MAX_PATH_RESPONSES_PER_DATAGRAM: usize = 1;
+
+/// New-12: safety bound on `PathResponse` frames sitting in `control_queue` at once.
+///
+/// The answer policy replies only to the active path, so one queued response is the
+/// steady state; two leaves headroom for a response left over from a path promotion
+/// that has not drained yet. This is a backstop for challenges arriving faster than
+/// the queue drains, not the primary defence (that is the per-datagram cap).
+///
+/// Overflow drops the NEW response and keeps the queued ones: the older entry may be
+/// the legitimate exchange that arrived first, and a response is never retransmitted
+/// anyway — `retransmittable_frames` carries data frames only — so a dropped response
+/// is indistinguishable to the peer from ordinary wire loss, which the challenger
+/// already recovers from by issuing a fresh `PathChallenge`.
+pub const MAX_PENDING_PATH_RESPONSES: usize = 2;
+
 pub struct ConnectionHot {
     pub connection_id: ConnectionId,
     pub next_packet_number: PacketNumber,

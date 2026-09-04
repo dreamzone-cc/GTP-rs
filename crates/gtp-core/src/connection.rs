@@ -1,6 +1,9 @@
 use crate::api::{NetworkFeedback, ReceivedMessage};
 use crate::control::{ConnectionControl, ControlEvent, GtpConfig};
-use crate::state::{ConnectionCold, ConnectionHot, OutgoingControlFrame};
+use crate::state::{
+    ConnectionCold, ConnectionHot, OutgoingControlFrame, MAX_PATH_RESPONSES_PER_DATAGRAM,
+    MAX_PENDING_PATH_RESPONSES,
+};
 use gtp_cc::{calculate_backpressure, BackpressureLevel, CongestionController};
 use gtp_crypto::DirectionalKeys;
 use gtp_recovery::{RetransmissionRecord, SentPacketRecord};
@@ -375,6 +378,10 @@ impl GtpConnection {
         let mut delivered_messages: Vec<ReceivedMessage> = Vec::new();
         let mut is_ack_eliciting = false;
         let mut close_received: Option<u16> = None;
+        // New-12: how many PathResponse frames THIS datagram has already produced.
+        // Deliberately a local binding, not connection state: the cap is a property of
+        // one decode pass, so nothing about it needs to survive the call.
+        let mut path_responses_from_this_datagram: usize = 0;
 
         // 5. Frame Dispatch Loop
         for frame_res in FrameIterator::new(decrypted_slice) {
@@ -543,12 +550,55 @@ impl GtpConnection {
                 Frame::PathChallenge { data } => {
                     // Core-C1: the echo is queued as a REAL PathResponse frame,
                     // directed at the challenger's source address (PATH-5).
-                    self.hot
+                    //
+                    // New-12: but only for an address we have a reason to answer. The
+                    // echo is remotely triggered and remotely addressed — `src_addr` is
+                    // whatever the inbound datagram's header claimed — so answering
+                    // unconditionally turns this connection into a reflector: a peer
+                    // that holds the keys and can spoof a source address makes us send
+                    // to a victim that never proved reachability, and the send gate
+                    // cannot stop it because it consults the ACTIVE path's limiter,
+                    // which is validated.
+                    //
+                    // Exactly one address is worth answering: the ACTIVE PATH. That is
+                    // the address the migration exchange actually uses — the responder
+                    // sees the challenge arrive on the path already in use, which
+                    // `path_migration_via_protocol` demonstrates end to end.
+                    //
+                    // NOTE: this policy holds because migration here is always locally
+                    // initiated — `active_path` is assigned in exactly one place, after
+                    // our own challenge is answered. If peer-initiated migration is ever
+                    // added, a peer WILL legitimately challenge us from an address we
+                    // have not yet adopted, and this rule becomes wrong: that is the
+                    // point to revisit, and a per-destination budget (rejected here as
+                    // unbounded state) becomes the right shape instead.
+                    let answerable = src_addr == self.hot.active_path;
+
+                    let queued_responses = self
+                        .hot
                         .control_queue
-                        .push_back(OutgoingControlFrame::PathResponse {
-                            data,
-                            dest: src_addr,
-                        });
+                        .iter()
+                        .filter(|f| matches!(f, OutgoingControlFrame::PathResponse { .. }))
+                        .count();
+
+                    if answerable
+                        && path_responses_from_this_datagram < MAX_PATH_RESPONSES_PER_DATAGRAM
+                        && queued_responses < MAX_PENDING_PATH_RESPONSES
+                    {
+                        self.hot
+                            .control_queue
+                            .push_back(OutgoingControlFrame::PathResponse {
+                                data,
+                                dest: src_addr,
+                            });
+                        path_responses_from_this_datagram += 1;
+                    }
+                    // Otherwise the challenge is dropped with no response. That is
+                    // indistinguishable to the peer from wire loss, and a legitimate
+                    // challenger recovers the same way it already must: by issuing a
+                    // fresh PathChallenge. We never retransmit a PathResponse — control
+                    // frames are absent from `retransmittable_frames` — so nothing is
+                    // being taken away that the protocol otherwise guaranteed.
                 }
 
                 Frame::PathResponse { data } => {
@@ -2102,6 +2152,191 @@ mod tests {
         assert!(
             server.hot.ack_tracker.should_send_ack(now),
             "the ACK the genuine peer needs must stay pending, not commit to the probe"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // New-12: a PATH_CHALLENGE echo must not turn this connection into a
+    // reflector. The echo is remotely triggered and remotely addressed, so
+    // before the fix a peer holding the keys could pack many challenges into one
+    // spoofed-source datagram and have us emit one datagram per challenge to an
+    // address that never proved reachability.
+    // -----------------------------------------------------------------------
+
+    /// Count `PathResponse` frames sitting in a connection's control queue.
+    fn queued_path_responses(conn: &GtpConnection) -> usize {
+        conn.hot
+            .control_queue
+            .iter()
+            .filter(|f| matches!(f, OutgoingControlFrame::PathResponse { .. }))
+            .count()
+    }
+
+    /// Build one datagram from `from` carrying `n` PATH_CHALLENGE frames, and hand it
+    /// to `to` as if it arrived from `src`.
+    ///
+    /// The challenges are queued at `from`'s OWN active path so they are not "directed"
+    /// frames — a directed frame takes a datagram to itself, so this is the only way one
+    /// datagram carries several, which is exactly the shape the cap exists to bound.
+    fn deliver_challenges(
+        from: &mut GtpConnection,
+        to: &mut GtpConnection,
+        src: SocketAddr,
+        tokens: &[[u8; 8]],
+        now: MonotonicTime,
+    ) {
+        let self_addr = from.hot.active_path;
+        for t in tokens {
+            from.hot
+                .control_queue
+                .push_back(OutgoingControlFrame::PathChallenge {
+                    data: *t,
+                    dest: self_addr,
+                });
+        }
+        let mut buf = [0u8; 1500];
+        let (_, len) = from
+            .produce_outgoing_datagram(now, &mut buf)
+            .unwrap()
+            .expect("the queued challenges produce a datagram");
+        to.handle_incoming_datagram(src, &mut buf[..len], now)
+            .unwrap();
+    }
+
+    /// Case: many challenges in ONE datagram yield exactly one response.
+    /// This is the packet fan-out the reflector depended on.
+    #[test]
+    fn many_challenges_in_one_datagram_yield_one_response() {
+        let cid = ConnectionId(0x0E0C_0000_0000_0001);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(31_000_000);
+        let challenger = server.hot.active_path; // the server's active path
+
+        let tokens: Vec<[u8; 8]> = (0u8..40).map(|i| [i; 8]).collect();
+        deliver_challenges(&mut client, &mut server, challenger, &tokens, now);
+
+        assert_eq!(
+            queued_path_responses(&server),
+            1,
+            "40 challenges in one datagram must still yield a single response"
+        );
+    }
+
+    /// Case: a third-party source is never answered, however many it sends.
+    #[test]
+    fn challenge_from_a_third_party_address_is_never_answered() {
+        let cid = ConnectionId(0x0E0C_0000_0000_0002);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(32_000_000);
+        let victim: SocketAddr = "198.51.100.23:4444".parse().unwrap();
+
+        assert_ne!(victim, server.hot.active_path);
+
+        let tokens: Vec<[u8; 8]> = (0u8..10).map(|i| [i; 8]).collect();
+        deliver_challenges(&mut client, &mut server, victim, &tokens, now);
+
+        assert_eq!(
+            queued_path_responses(&server),
+            0,
+            "an address we neither use nor named must earn no response at all"
+        );
+    }
+
+    /// Case: the ordinary path — a challenge on the active path is answered once.
+    #[test]
+    fn challenge_from_the_active_path_is_answered_once() {
+        let cid = ConnectionId(0x0E0C_0000_0000_0003);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(33_000_000);
+        let active = server.hot.active_path;
+
+        deliver_challenges(&mut client, &mut server, active, &[[0xC1; 8]], now);
+
+        assert_eq!(queued_path_responses(&server), 1);
+        assert!(
+            matches!(
+                server.hot.control_queue.back(),
+                Some(OutgoingControlFrame::PathResponse { data, dest })
+                    if *data == [0xC1; 8] && *dest == active
+            ),
+            "the response must echo the token back to the challenger"
+        );
+    }
+
+    /// Case: even an address WE are validating is not answered — only the active path
+    /// is. This pins a deliberate narrowing rather than an accident.
+    ///
+    /// An earlier draft also answered the address under our own outstanding challenge.
+    /// That was dropped for two reasons. It has no demonstrated legitimate flow on this
+    /// codebase — migration is always locally initiated, so a peer never has cause to
+    /// challenge us from an address we have not adopted — and reading the pending
+    /// address would require a new accessor on `PathValidator`, widening both the answer
+    /// surface and this change's blast radius for no proven gain. Answering exactly one
+    /// address is the stronger position.
+    #[test]
+    fn challenge_from_the_address_under_our_own_challenge_is_not_answered() {
+        let cid = ConnectionId(0x0E0C_0000_0000_0004);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(34_000_000);
+        let probe: SocketAddr = "127.0.0.1:6100".parse().unwrap();
+
+        server
+            .control()
+            .trigger_path_challenge(probe, [0xE1; 8], now)
+            .unwrap();
+        assert_ne!(probe, server.hot.active_path);
+        assert_eq!(queued_path_responses(&server), 0);
+
+        deliver_challenges(&mut client, &mut server, probe, &[[0xC2; 8]], now);
+
+        assert_eq!(
+            queued_path_responses(&server),
+            0,
+            "only the active path is answerable; an address we merely named is not"
+        );
+    }
+
+    /// Case: with the queue at its cap, the NEW response is dropped and the queued
+    /// ones survive untouched — never replaced.
+    #[test]
+    fn a_full_queue_drops_the_new_response_and_preserves_the_old() {
+        let cid = ConnectionId(0x0E0C_0000_0000_0005);
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(35_000_000);
+        let active = server.hot.active_path;
+
+        // Pre-fill to the cap with recognisable tokens.
+        for t in [[0xA1; 8], [0xA2; 8]] {
+            server
+                .hot
+                .control_queue
+                .push_back(OutgoingControlFrame::PathResponse {
+                    data: t,
+                    dest: active,
+                });
+        }
+        assert_eq!(queued_path_responses(&server), MAX_PENDING_PATH_RESPONSES);
+
+        deliver_challenges(&mut client, &mut server, active, &[[0xFF; 8]], now);
+
+        assert_eq!(
+            queued_path_responses(&server),
+            MAX_PENDING_PATH_RESPONSES,
+            "the cap must hold"
+        );
+        let tokens: Vec<[u8; 8]> = server
+            .hot
+            .control_queue
+            .iter()
+            .filter_map(|f| match f {
+                OutgoingControlFrame::PathResponse { data, .. } => Some(*data),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![[0xA1; 8], [0xA2; 8]],
+            "the queued responses must be preserved, not replaced by the new one"
         );
     }
 
