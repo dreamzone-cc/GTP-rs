@@ -117,6 +117,7 @@ cargo run -p gtp-cli -- dissect 80000100011C11223344556677880000000000000001000F
   - [`GTP-rs-Comprehensive-Audit-and-Remediation-Plan.md`](GTP-rs-Comprehensive-Audit-and-Remediation-Plan.md): Adopted master re-verification & remediation plan of the 2026-09-04 round (bilingual EN/AR).
   - [`docs/reaudit/Re-Audit-Report-2026-09.md`](docs/reaudit/Re-Audit-Report-2026-09.md): Evidence-based re-verification of all ~100 tracked defects (as-found state).
   - [`docs/reaudit/Closure-Matrix-2026-09.md`](docs/reaudit/Closure-Matrix-2026-09.md): Final closure matrix with measured outcomes, deferred register, and reproducibility evidence.
+  - [`docs/reaudit/Live-WAN-Verification-Report-2026-09-04.md`](docs/reaudit/Live-WAN-Verification-Report-2026-09-04.md): Official live-WAN testing report — version parity audit, five stepped rounds over the public internet, stress suite, server telemetry, and the corrections applied to the follow-up reports.
   - [`GTP-rs-Cross-Audit-Reconciliation.md`](GTP-rs-Cross-Audit-Reconciliation.md): Independent cross-audit reconciliation with the unified critical list.
   - [`GTP-rs-Remediation-Execution-Plan-v1.0.md`](GTP-rs-Remediation-Execution-Plan-v1.0.md): Phased remediation execution plan derived from the audit.
   - [`GTP-rs-Remediation-Tracker.md`](GTP-rs-Remediation-Tracker.md): Live execution tracker with per-item regression-test evidence.

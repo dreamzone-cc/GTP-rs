@@ -94,3 +94,32 @@ deferred until the project is initialized. No GitHub/origin operations were perf
 | + recovery round | 128 |
 | + wire/crypto round | 132 |
 | + cross-layer suite | **134** (+1 doc-test; +1 on-demand N-1 volume gate) |
+
+
+---
+
+## Addendum — follow-up round (2026-09-04, later session)
+
+Follow-up changes were added after `6cb6e6e`: commit `09f1d8a` (CLI stress-harness
+backpressure yield/backoff) and three Arabic reports in `docs/reaudit/`. An
+independent verification session established:
+
+1. **Code change verified**: implemented, effective (high-burst tier sustains
+   84,360 msg/s, no failures), no conflicts, no regressions (134/0 on both ends).
+   One CI-blocking fmt violation it introduced was fixed in `ba2a486`.
+2. **Documentation corrected in place**: fabricated commit hash
+   (`09f1d8a4e3fa…` → real `09f1d8a390…`), wrong author, wrong defect
+   descriptions (N-4/N-6/N-7), CORE-4/REC-8 overclaims, loopback-vs-WAN
+   misattribution, stale dissect hex, kernel version. Verification addenda
+   appended to the affected reports.
+3. **Live WAN phase executed end-to-end** at version parity `ba2a486`
+   (local + VPS): five stepped rounds to `92.222.80.200:7777` all pass —
+   including one genuine internet loss in round 2,000 recovered by a single
+   selective retransmission — plus the full local stress suite and the 134-test
+   suite run on the VPS itself. Full details and raw evidence:
+   `Live-WAN-Verification-Report-2026-09-04.md`.
+
+| Commit | Content |
+| :--- | :--- |
+| `ba2a486` | style fix for `09f1d8a`'s fmt violation |
+| (this commit) | follow-up docs corrections + verification addenda + official live-WAN report |

@@ -41,6 +41,11 @@ critical/high item: `docs/reaudit/Re-Audit-Report-2026-09.md` (as-found state) a
 
 ### Added
 - `crates/gtp/tests/cross_layer_integration_test.rs`: full-seam recovery (loss → reorder store → PTO → complete in-order delivery with per-message sequences) and saturation-fairness scenarios.
+- `docs/reaudit/Live-WAN-Verification-Report-2026-09-04.md`: official live-WAN testing round at version parity `ba2a486` (local + VPS `92.222.80.200:7777`) — five stepped rounds over the public internet (incl. one genuine loss recovered live), server-side telemetry, full stress suite, and the verification/correction record for the follow-up reports.
+
+### Fixed (follow-up round)
+- `09f1d8a`'s stress-harness retry loop formatted to satisfy `cargo fmt --check` (was CI-breaking) — `ba2a486`.
+- Follow-up documentation corrected in place: fabricated commit hash replaced with the real `09f1d8a390…`, wrong defect descriptions (N-4/N-6/N-7) restored to their actual definitions, CORE-4/REC-8 overclaims qualified, loopback-only stress stages no longer attributed to live-WAN testing, stale dissect hex fixed; verification addenda appended to the affected reports.
 - New unit suites pinning every fix above (39 new tests this round; 135 total green, three identical consecutive full-gate runs).
 
 ## [0.2.0] - 2026-08-29
