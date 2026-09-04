@@ -3,6 +3,12 @@ use std::collections::BTreeMap;
 
 pub const DEFAULT_MAX_GROUP_BUFFER_BYTES: usize = 256 * 1024; // 256 KB per group
 
+/// N-7: cap on the number of buffered out-of-order items per group.
+///
+/// The byte cap alone cannot bound a flood of zero-payload items, so the
+/// reorder buffer also refuses past this many entries.
+pub const DEFAULT_MAX_GROUP_BUFFER_ITEMS: usize = 1024;
+
 /// Manages in-order reassembly for an independent ordered stream group.
 #[derive(Clone, Debug)]
 pub struct OrderedGroupReceiver {
@@ -11,6 +17,7 @@ pub struct OrderedGroupReceiver {
     reorder_buffer: BTreeMap<u32, Vec<u8>>,
     max_buffer_bytes: usize,
     current_buffer_bytes: usize,
+    max_buffer_items: usize,
 }
 
 impl OrderedGroupReceiver {
@@ -21,6 +28,7 @@ impl OrderedGroupReceiver {
             reorder_buffer: BTreeMap::new(),
             max_buffer_bytes: DEFAULT_MAX_GROUP_BUFFER_BYTES,
             current_buffer_bytes: 0,
+            max_buffer_items: DEFAULT_MAX_GROUP_BUFFER_ITEMS,
         }
     }
 
@@ -54,6 +62,12 @@ impl OrderedGroupReceiver {
             }
         } else {
             // Out of order: buffer it
+            // N-7: the item cap catches zero-payload floods that cost no bytes.
+            if self.reorder_buffer.len() + 1 > self.max_buffer_items {
+                return Err(TransportError::ResourceLimitExceeded(
+                    "Ordered group buffer item capacity exceeded",
+                ));
+            }
             if self.current_buffer_bytes + payload.len() > self.max_buffer_bytes {
                 return Err(TransportError::ResourceLimitExceeded(
                     "Ordered group buffer capacity exceeded",
@@ -129,5 +143,35 @@ mod tests {
 
         // A pre-wrap duplicate is now recognized as stale (not buffered forever)
         assert!(group.on_incoming(u32::MAX, b"dup").unwrap().is_empty());
+    }
+
+    /// N-7: zero-payload out-of-order items cost no bytes, so only the item
+    /// cap bounds a flood of them.
+    #[test]
+    fn zero_byte_flood_is_bounded_by_the_item_cap() {
+        let mut group = OrderedGroupReceiver::new(OrderedGroupId(4));
+        group.next_expected = 1;
+
+        // Hole at seq 1 keeps everything out of order and buffered.
+        // Seqs 2..=1025 fill the cap exactly; seq 1026 must be refused.
+        for seq in 2..=(DEFAULT_MAX_GROUP_BUFFER_ITEMS as u32 + 2) {
+            let res = group.on_incoming(seq, b"");
+            if seq <= DEFAULT_MAX_GROUP_BUFFER_ITEMS as u32 + 1 {
+                assert!(res.is_ok(), "item {} fits within the cap", seq);
+            } else {
+                assert!(
+                    matches!(res, Err(TransportError::ResourceLimitExceeded(_))),
+                    "item {} must be refused past the cap",
+                    seq
+                );
+                break;
+            }
+        }
+
+        // Filling the hole drains the buffer and frees item slots again.
+        assert!(!group.on_incoming(1, b"head").unwrap().is_empty());
+        assert!(group
+            .on_incoming(DEFAULT_MAX_GROUP_BUFFER_ITEMS as u32 + 3, b"")
+            .is_ok());
     }
 }
