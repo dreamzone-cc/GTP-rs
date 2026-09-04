@@ -68,6 +68,21 @@ impl<'a> ConnectionControl<'a> {
             .path_validator
             .start_challenge(new_addr, nonce, now);
 
+        // New-8: a challenge is the ONLY way an address acquires an amplification
+        // budget of its own, and starting one is a local decision — this method is
+        // the sole caller of `start_challenge`. The budget starts empty, so until
+        // `new_addr` sends us authenticated bytes we may not send it anything beyond
+        // the challenge itself. Re-challenging replaces any previous probe, keeping
+        // the slot bounded at one.
+        if new_addr == self.hot.active_path {
+            // A keep-alive probe of the path already in use borrows no new budget:
+            // that address is the validated active path.
+            self.hot.anti_amplification_probe = None;
+        } else {
+            self.hot.anti_amplification_probe =
+                Some((new_addr, gtp_path::AntiAmplificationLimiter::new()));
+        }
+
         self.hot
             .control_queue
             .push_back(OutgoingControlFrame::PathChallenge {
