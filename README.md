@@ -97,6 +97,8 @@ cargo run -p gtp-cli -- dissect 80000100011C11223344556677880000000000000001000F
 
 ## Documentation Index
 
+- **Primary Engineering Reference**:
+  - [`docs/ENGINEERING-REFERENCE.md`](docs/ENGINEERING-REFERENCE.md): consolidated remediation history (fix-by-fix with commits), current API surface changes, environment quirks, test-tier guide, quality-gate workflow, VPS runbook, deferred register, and the engineering principles established by the audit rounds. **Start here for development and onboarding.**
 - **Specifications**:
   - [`GTP_1_1_Comprehensive_Technical_Specification.md`](GTP_1_1_Comprehensive_Technical_Specification.md): Full technical specification (516 sections).
   - [`GTP-rs-Technical-Specification.md`](GTP-rs-Technical-Specification.md): Developer-team requirements & traceability spec (Arabic).
