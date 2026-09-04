@@ -529,7 +529,10 @@ async fn main() -> Result<()> {
                         let payload = format!("load_payload_id={:06}_time={:?}", i, Instant::now())
                             .into_bytes();
                         loop {
-                            match conn.send_unreliable(payload.clone(), PriorityTier::P1Input).await {
+                            match conn
+                                .send_unreliable(payload.clone(), PriorityTier::P1Input)
+                                .await
+                            {
                                 Ok(_) => break,
                                 Err(TransportError::ResourceLimitExceeded(_)) => {
                                     tokio::task::yield_now().await;
