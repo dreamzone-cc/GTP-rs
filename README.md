@@ -21,7 +21,7 @@
   - Loss detection via packet threshold ($k=3$), time threshold ($\frac{9}{8}$ factor), and Probe Timeout (PTO).
   - Adaptive ACK frequency and gap-compressed ACK ranges bounded to 32 intervals.
 - **Congestion Control & Pacing**:
-  - CUBIC congestion controller ($W_{cubic}(t) = C(t-K)^3 + W_{max}$, $\beta=0.7$).
+  - CUBIC congestion controller ($W_{cubic}(t) = C(t-K)^3 + W_{max}$, $\beta=0.75$ under the default `competitive_fps` preset; RFC 8312's recommended $0.7$ remains configurable).
   - High-precision Token-Bucket Pacing Engine to smooth bursty game packet streams.
   - 4-Tier Engine Backpressure feedback (`Low`, `Medium`, `High`, `Critical`) for dynamic Level-of-Detail (LOD).
 - **Security & DoS Defenses**:
@@ -29,7 +29,7 @@
   - 128-bit Sliding Replay Window to defeat duplicate/replayed packet attacks.
   - 3x Anti-Amplification limit for unvalidated peer addresses.
   - Stateless Cookie Tokens for stateless handshake and DoS mitigation.
-  - 3-Way Path Challenge/Response for seamless NAT rebinding and path migration.
+  - Two-way Path Challenge/Response for seamless NAT rebinding and path migration.
 - **Dedicated Runtime Control API & Async Tokio Integration**:
   - Ergonomic runtime control handle (`ConnectionControl`) for dynamic ACK frequency adjustments, PMTU discovery probing, path validation, and graceful draining.
   - Live diagnostic metrics snapshot (`DetailedMetrics`) and typed notification events (`ControlEvent`).
@@ -90,7 +90,7 @@ cargo run -p gtp-cli -- control-demo
 
 ### 6. Dissect Raw GTP Hex Packets
 ```bash
-cargo run -p gtp-cli -- dissect 80000100011811223344556677880000000000000001000F4240000E05DEADBEEFCAFEBABE
+cargo run -p gtp-cli -- dissect 80000100011C11223344556677880000000000000001000F4240000905DEADBEEFCAFEBABE
 ```
 
 ---

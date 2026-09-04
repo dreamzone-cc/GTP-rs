@@ -31,7 +31,7 @@ struct Cli {
 enum Commands {
     /// Dissects raw hexadecimal packet bytes into structured GTP headers and TLV frames
     Dissect {
-        /// Hex-encoded packet string (e.g. 800001000118...)
+        /// Hex-encoded packet string (e.g. 80000100011C11223344556677880000000000000001000F4240000905DEADBEEFCAFEBABE)
         hex: String,
     },
     /// Runs a deterministic network simulation benchmark across multiple network profiles
@@ -647,7 +647,10 @@ async fn main() -> Result<()> {
                         "  ├─ Loss Ratio:                {:.2}%",
                         c_metrics.loss_ratio() * 100.0
                     );
-                    println!("  ├─ Corrupted / Failed Frames: 0 (Zero Malformed)");
+                    println!(
+                        "  ├─ Corrupted / Failed Frames: {}",
+                        s_metrics.total_corrupted_packets
+                    );
                     println!(
                         "  └─ Verdict:                   {}",
                         if server_delivered.len() == 20 {
@@ -715,7 +718,6 @@ async fn main() -> Result<()> {
                 println!("  ├─ Initial Memory RSS:      {:.2} MB", mem_initial);
                 println!("  ├─ Final Memory RSS:        {:.2} MB", mem_final);
                 println!("  ├─ Net Memory Delta:        {:+.2} MB", mem_delta);
-                println!("  ├─ Total Deadlocks / Panics:0");
                 println!(
                     "  └─ Memory Leak Verdict:     {}",
                     if mem_delta.abs() < 5.0 {
@@ -874,7 +876,16 @@ async fn main() -> Result<()> {
                     c_metrics.pacing_rate_bps / 1024
                 );
                 println!("  ├─ Engine Backpressure:     {:?}", c_metrics.backpressure);
-                println!("  └─ Game Loop Verdict:       ✅ 100% SMOOTH TICK CONCURRENCY (ZERO HEAD-OF-LINE BLOCKING)");
+                let engine_clean =
+                    s_metrics.total_rx_packets > 0 && s_metrics.total_corrupted_packets == 0;
+                println!(
+                    "  └─ Game Loop Verdict:       {}",
+                    if engine_clean {
+                        "✅ ALL TICK TRAFFIC RECEIVED UNCORRUPTED"
+                    } else {
+                        "⚠️ SERVER SAW NO TRAFFIC OR CORRUPTED FRAMES"
+                    }
+                );
             }
 
             // -------------------------------------------------------------
@@ -911,28 +922,36 @@ async fn main() -> Result<()> {
                             );
                         }
                     }
+                    accepted
                 });
 
                 let mut handles = Vec::new();
                 for i in 1..=num_concurrent {
                     handles.push(tokio::spawn(async move {
-                        let client_ep = GtpEndpoint::bind("0.0.0.0:0".parse().unwrap())
-                            .await
-                            .unwrap();
+                        let client_ep =
+                            GtpEndpoint::bind("0.0.0.0:0".parse().unwrap()).await.ok()?;
                         let cid = ConnectionId(0x2000_0000_0000_0000 + i as u64);
-                        let conn = client_ep.connect(cid, s_addr, true).await.unwrap();
+                        let conn = client_ep.connect(cid, s_addr, true).await.ok()?;
 
                         for p in 0..10 {
                             let payload = format!("concurrent_client_{}_pkt_{}", i, p).into_bytes();
                             let _ = conn.send_unreliable(payload, PriorityTier::P1Input).await;
                         }
+                        Some(())
                     }));
                 }
 
+                let mut sessions_ok = 0;
                 for h in handles {
-                    let _ = h.await;
+                    if h.await.ok().flatten().is_some() {
+                        sessions_ok += 1;
+                    }
                 }
-                server_task.abort();
+                let accepted =
+                    tokio::time::timeout(std::time::Duration::from_secs(60), server_task)
+                        .await
+                        .map(|r| r.unwrap_or(0))
+                        .unwrap_or(0);
 
                 let elapsed = start.elapsed();
                 let mem_after = get_process_memory_mb();
@@ -959,7 +978,22 @@ async fn main() -> Result<()> {
                     mem_after,
                     mem_after - mem_before
                 );
-                println!("  └─ Concurrency Verdict:     ✅ ZERO LOCK CONTENTION / LINEAR RESOURCE SCALING");
+                println!(
+                    "  ├─ Sessions Fully Driven:   {}/{} (connected + 10 packets each)",
+                    sessions_ok, num_concurrent
+                );
+                println!(
+                    "  ├─ Server Accepts:          {}/{}",
+                    accepted, num_concurrent
+                );
+                println!(
+                    "  └─ Concurrency Verdict:     {}",
+                    if sessions_ok == num_concurrent && accepted == num_concurrent {
+                        "✅ ALL SESSIONS ESTABLISHED AND DRIVEN CONCURRENTLY"
+                    } else {
+                        "⚠️ SOME SESSIONS FAILED — INVESTIGATE"
+                    }
+                );
             }
 
             // -------------------------------------------------------------
