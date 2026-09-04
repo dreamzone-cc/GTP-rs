@@ -2967,7 +2967,10 @@ mod tests {
         let t0 = MonotonicTime::from_micros(24_000_000);
         let t1 = t0 + Duration::from_millis(20);
         let path_b: SocketAddr = "127.0.0.1:6100".parse().unwrap();
-        let client_active = client.hot.active_path;
+        // The peer's datagrams arrive from its real source address (5000), which is
+        // exactly the address the server has registered as its active path — that is
+        // what makes the challenge answerable under the New-12 reflection policy.
+        let client_source = server.hot.active_path;
 
         client
             .control()
@@ -2983,7 +2986,7 @@ mod tests {
             .unwrap();
         let mut challenge = out;
         server
-            .handle_incoming_datagram(client_active, &mut challenge[..len], t1)
+            .handle_incoming_datagram(client_source, &mut challenge[..len], t1)
             .unwrap();
         let (_, resp_len) = server
             .produce_outgoing_datagram(t1, &mut out)
@@ -3031,8 +3034,12 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut challenge = out;
+        // The challenge datagram arrives at the server from the peer's real source
+        // address — the server's registered active path (5000), not path_a (6000,
+        // which is a destination on the client's side). This is what makes the
+        // challenge answerable under the New-12 reflection policy.
         server
-            .handle_incoming_datagram(path_a, &mut challenge[..len], t1)
+            .handle_incoming_datagram(server.hot.active_path, &mut challenge[..len], t1)
             .unwrap();
         let (_, resp_len) = server
             .produce_outgoing_datagram(t1, &mut out)
