@@ -99,6 +99,7 @@ cargo run -p gtp-cli -- dissect 80000100011C11223344556677880000000000000001000F
 
 - **Specifications**:
   - [`GTP_1_1_Comprehensive_Technical_Specification.md`](GTP_1_1_Comprehensive_Technical_Specification.md): Full technical specification (516 sections).
+  - [`GTP-rs-Technical-Specification.md`](GTP-rs-Technical-Specification.md): Developer-team requirements & traceability spec (Arabic).
   - [`GTP_Architecture_Decision_Paper_v1.0.md`](GTP_Architecture_Decision_Paper_v1.0.md): Architecture decision record.
   - Sub-specifications: `docs/specs/GTP-ARCH-01.md` through `docs/specs/GTP-TEST-01.md`.
 - **Reports & Operational Verification**:
@@ -110,10 +111,20 @@ cargo run -p gtp-cli -- dissect 80000100011C11223344556677880000000000000001000F
   - [`docs/GTP_CONTROL_API_REFERENCE_MANUAL.md`](docs/GTP_CONTROL_API_REFERENCE_MANUAL.md): Complete function-by-function reference manual.
 - **Security & Remediation**:
   - [`GTP-rs-Architecture-Protocol-Audit-Paper-v1.0.md`](GTP-rs-Architecture-Protocol-Audit-Paper-v1.0.md): Comprehensive architecture/protocol audit (~70 findings with severity ratings and exact locations).
+  - [`GTP-rs-Comprehensive-Audit-and-Remediation-Plan.md`](GTP-rs-Comprehensive-Audit-and-Remediation-Plan.md): Adopted master re-verification & remediation plan of the 2026-09-04 round (bilingual EN/AR).
+  - [`docs/reaudit/Re-Audit-Report-2026-09.md`](docs/reaudit/Re-Audit-Report-2026-09.md): Evidence-based re-verification of all ~100 tracked defects (as-found state).
+  - [`docs/reaudit/Closure-Matrix-2026-09.md`](docs/reaudit/Closure-Matrix-2026-09.md): Final closure matrix with measured outcomes, deferred register, and reproducibility evidence.
   - [`GTP-rs-Cross-Audit-Reconciliation.md`](GTP-rs-Cross-Audit-Reconciliation.md): Independent cross-audit reconciliation with the unified critical list.
   - [`GTP-rs-Remediation-Execution-Plan-v1.0.md`](GTP-rs-Remediation-Execution-Plan-v1.0.md): Phased remediation execution plan derived from the audit.
   - [`GTP-rs-Remediation-Tracker.md`](GTP-rs-Remediation-Tracker.md): Live execution tracker with per-item regression-test evidence.
   - Verification gate: `bash scripts/verify_remediation.sh` (tests + clippy + procedural checks).
+- **Process**:
+  - [`GTP-rs_SESSION_CONTEXT_GUIDE.md`](GTP-rs_SESSION_CONTEXT_GUIDE.md): Permanent session-continuity and context-restoration guide.
+- **Roadmap & Integration (Adaptive Routing / Gaming VPN)**:
+  - [`GTPrs_Integrated_CrossLayer_Design_and_Audit__AR.md`](GTPrs_Integrated_CrossLayer_Design_and_Audit__AR.md): Cross-layer integration audit, system invariants, and the adaptive-routing engine specification (GTP-rs-ICD-01, Arabic).
+  - [`GTP++.md`](GTP++.md): Extended technical paper on server-side adaptive routing for a gaming VPN over GTP-rs (Arabic).
+  - [`GTP_Adaptive_Routing_Technical_Paper.md`](GTP_Adaptive_Routing_Technical_Paper.md): Companion copy of the adaptive-routing paper (Arabic).
+  - [`Technical_Paper_Gaming_VPN_Adaptive_Routing.md`](Technical_Paper_Gaming_VPN_Adaptive_Routing.md): Gaming VPN adaptive & server-side route selection (English/Arabic mixed).
 - **Roadmap & Integration**:
   - [`GTP-rs-technical-paper.md`](GTP-rs-technical-paper.md): Remaining work, enhancements, and additional testing.
   - [`GTP-rs-remediation-plan.md`](GTP-rs-remediation-plan.md): Phased fix-and-development plan across all crates.

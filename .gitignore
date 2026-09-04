@@ -14,9 +14,9 @@
 # OS files
 .DS_Store
 Thumbs.db
-# Machine-local Arabic documentation originals (kept out of the repository per docs policy)
+# Machine-local Arabic mirrors and remediation review artifacts, kept out of the
+# repository (root-level session documentation is tracked as-is — see README's
+# Documentation Index)
 arabic-local/
-
-# Machine-local remediation review artifacts (same docs policy as arabic-local/)
 fixes/
 files.zip
