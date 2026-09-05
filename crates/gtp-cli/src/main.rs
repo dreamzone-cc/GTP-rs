@@ -281,19 +281,61 @@ async fn main() -> Result<()> {
 
                         let counter = Arc::clone(&total_received_msgs);
                         tokio::spawn(async move {
-                            while let Some(msg) = client_conn.recv().await {
-                                let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                                let payload_str = String::from_utf8_lossy(&msg.payload);
-                                if count <= 20 || count % 100 == 0 {
-                                    println!(
-                                        "[Server RX #{:>5} | CID: 0x{:X}] Class: {:<20} | Payload: '{}' ({} bytes)",
-                                        count,
-                                        cid.as_u64(),
-                                        format!("{:?}", msg.class),
-                                        payload_str,
-                                        msg.payload.len()
-                                    );
+                            // RT-2: drain the bounded control-event queue on a
+                            // 1 s cadence so live connections never retain
+                            // events forever; routine OwdSample traffic is
+                            // summarized, interesting events are logged.
+                            let mut event_tick =
+                                tokio::time::interval(std::time::Duration::from_secs(1));
+                            let mut owd_seen: u64 = 0;
+                            loop {
+                                tokio::select! {
+                                    msg = client_conn.recv() => {
+                                        let Some(msg) = msg else { break };
+                                        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                        let payload_str = String::from_utf8_lossy(&msg.payload);
+                                        if count <= 20 || count % 100 == 0 {
+                                            println!(
+                                                "[Server RX #{:>5} | CID: 0x{:X}] Class: {:<20} | Payload: '{}' ({} bytes)",
+                                                count,
+                                                cid.as_u64(),
+                                                format!("{:?}", msg.class),
+                                                payload_str,
+                                                msg.payload.len()
+                                            );
+                                        }
+                                    }
+                                    _ = event_tick.tick() => {
+                                        for ev in client_conn.drain_events().await {
+                                            match ev {
+                                                ControlEvent::OwdSample { .. } => owd_seen += 1,
+                                                other => println!(
+                                                    "[Server EV | CID: 0x{:X}] {:?}",
+                                                    cid.as_u64(),
+                                                    other
+                                                ),
+                                            }
+                                        }
+                                        let dropped = client_conn
+                                            .query_metrics()
+                                            .await
+                                            .total_dropped_events;
+                                        if dropped > 0 {
+                                            println!(
+                                                "[Server EV | CID: 0x{:X}] WARNING: {} events dropped (queue bound)",
+                                                cid.as_u64(),
+                                                dropped
+                                            );
+                                        }
+                                    }
                                 }
+                            }
+                            if owd_seen > 0 {
+                                println!(
+                                    "[Server EV | CID: 0x{:X}] session end: {} OwdSample events drained",
+                                    cid.as_u64(),
+                                    owd_seen
+                                );
                             }
                         });
                     }

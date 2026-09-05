@@ -39,6 +39,8 @@ pub struct DetailedMetrics {
     pub total_rx_bytes: u64,
     pub total_retransmissions: u64,
     pub total_corrupted_packets: u64,
+    /// RT-2: control events shed by the bounded event queue.
+    pub total_dropped_events: u64,
     pub pto_count: u32,
 
     // --- ECN Signals ---

@@ -139,7 +139,7 @@ impl<'a> ConnectionControl<'a> {
 
         let old_state = self.hot.state;
         self.hot.state.transition_to(ConnectionState::Draining)?;
-        self.event_queue.push(ControlEvent::StateChanged {
+        self.push_event(ControlEvent::StateChanged {
             old_state,
             new_state: ConnectionState::Draining,
         });
@@ -150,7 +150,7 @@ impl<'a> ConnectionControl<'a> {
     pub fn force_close(&mut self, _error_code: u16) -> Result<()> {
         let old_state = self.hot.state;
         self.hot.state.transition_to(ConnectionState::Closed)?;
-        self.event_queue.push(ControlEvent::StateChanged {
+        self.push_event(ControlEvent::StateChanged {
             old_state,
             new_state: ConnectionState::Closed,
         });
@@ -201,12 +201,28 @@ impl<'a> ConnectionControl<'a> {
             total_rx_bytes: self.cold.total_rx_bytes,
             total_retransmissions: self.cold.total_retransmissions,
             total_corrupted_packets: self.cold.total_corrupted_packets,
+            total_dropped_events: self.cold.total_dropped_events,
             pto_count: self.hot.loss_detector.pto_count,
 
             ecn_ect0_count: 0,
             ecn_ect1_count: 0,
             ecn_ce_count: 0,
         }
+    }
+
+    /// RT-2: bounded enqueue on the control-handle path, mirroring
+    /// `GtpConnection::push_event` (drop-oldest + `total_dropped_events`).
+    pub fn push_event(&mut self, event: ControlEvent) {
+        let capacity = self.config.event_queue_capacity;
+        if capacity == 0 {
+            self.cold.total_dropped_events += 1;
+            return;
+        }
+        if self.event_queue.len() >= capacity {
+            self.event_queue.remove(0);
+            self.cold.total_dropped_events += 1;
+        }
+        self.event_queue.push(event);
     }
 
     /// Drain all queued control events emitted since last drain.

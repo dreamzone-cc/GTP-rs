@@ -137,6 +137,25 @@ impl GtpConnection {
     }
 
     /// Drain all queued protocol control events.
+    /// RT-2: bounded event enqueue. Overflow sheds the OLDEST event (newest
+    /// information survives) and counts it in `total_dropped_events`; a
+    /// capacity of 0 drops every event. Without this bound, a runtime that
+    /// never drains the queue (every current consumer except `control-demo`)
+    /// accumulates memory indefinitely from the bounded-rate OwdSample stream
+    /// alone (~1.5 MB/hour per active connection).
+    pub fn push_event(&mut self, event: ControlEvent) {
+        let capacity = self.config.event_queue_capacity;
+        if capacity == 0 {
+            self.cold.total_dropped_events += 1;
+            return;
+        }
+        if self.event_queue.len() >= capacity {
+            self.event_queue.remove(0);
+            self.cold.total_dropped_events += 1;
+        }
+        self.event_queue.push(event);
+    }
+
     pub fn drain_events(&mut self) -> Vec<ControlEvent> {
         std::mem::take(&mut self.event_queue)
     }
@@ -428,7 +447,7 @@ impl GtpConnection {
                 let owd_sample = self.hot.owd.on_packet(header.timestamp_micros, now);
                 if now - self.hot.last_owd_emit >= self.config.owd_sample_interval {
                     self.hot.last_owd_emit = now;
-                    self.event_queue.push(ControlEvent::OwdSample {
+                    self.push_event(ControlEvent::OwdSample {
                         owd_var_us: owd_sample.owd_var_us,
                         jitter_us: owd_sample.jitter_us,
                         epoch: owd_sample.epoch,
@@ -490,7 +509,7 @@ impl GtpConnection {
                     self.hot.cc.on_loss(&loss_ev, now);
 
                     if !loss_ev.lost_packets.is_empty() {
-                        self.event_queue.push(ControlEvent::PacketLossDetected {
+                        self.push_event(ControlEvent::PacketLossDetected {
                             lost_count: loss_ev.lost_packets.len(),
                             lost_bytes: loss_ev.bytes_lost,
                         });
@@ -722,7 +741,7 @@ impl GtpConnection {
                             // X-1 reset above, pre-positioning INV-13 (epoch
                             // separation, fully enforced in G3).
                             self.hot.owd.reset_for_new_path();
-                            self.event_queue.push(ControlEvent::PathMigrated {
+                            self.push_event(ControlEvent::PathMigrated {
                                 old_addr,
                                 new_addr: src_addr,
                             });
@@ -767,7 +786,7 @@ impl GtpConnection {
         // 7. Check Backpressure level changes
         let feedback = self.feedback(now);
         if feedback.backpressure != self.last_backpressure {
-            self.event_queue.push(ControlEvent::BackpressureChanged {
+            self.push_event(ControlEvent::BackpressureChanged {
                 old_level: self.last_backpressure,
                 new_level: feedback.backpressure,
                 effective_queue_bytes: feedback.effective_queue_bytes,
@@ -783,7 +802,7 @@ impl GtpConnection {
                 .hot
                 .state
                 .transition_to(gtp_path::ConnectionState::Closed);
-            self.event_queue.push(ControlEvent::StateChanged {
+            self.push_event(ControlEvent::StateChanged {
                 old_state,
                 new_state: gtp_path::ConnectionState::Closed,
             });
@@ -862,7 +881,7 @@ impl GtpConnection {
                     // Draining complete: the CLOSE frame went out, nothing left to send.
                     let old_state = self.hot.state;
                     let _ = self.hot.state.transition_to(ConnectionState::Closed);
-                    self.event_queue.push(ControlEvent::StateChanged {
+                    self.push_event(ControlEvent::StateChanged {
                         old_state,
                         new_state: ConnectionState::Closed,
                     });
@@ -902,7 +921,7 @@ impl GtpConnection {
                 // was a no-op by construction — a PTO event's `lost_packets`
                 // is intentionally empty.
 
-                self.event_queue.push(ControlEvent::PtoTriggered {
+                self.push_event(ControlEvent::PtoTriggered {
                     pto_count: self.hot.loss_detector.pto_count,
                     inflight_bytes: self.hot.loss_detector.inflight_bytes(),
                 });
@@ -3634,5 +3653,72 @@ mod tests {
         let fb = client.feedback(t1);
         assert!(fb.min_rtt.is_some(), "first ACK seeds min_rtt");
         assert!(client.control().query_metrics(t1).min_rtt.is_some());
+    }
+
+    /// RT-2: the control event queue is bounded; overflow sheds the OLDEST
+    /// event (newest information survives) and counts every shed event in
+    /// `total_dropped_events`, surfaced through `DetailedMetrics`.
+    #[test]
+    fn event_queue_is_bounded_and_drops_oldest_with_counter() {
+        let cid = ConnectionId(0x2A13_0000_0000_0001);
+        let config = GtpConfig {
+            event_queue_capacity: 4,
+            ..GtpConfig::default()
+        };
+        let mut conn = GtpConnection::new_with_role(
+            cid,
+            "127.0.0.1:6000".parse().unwrap(),
+            true,
+            true,
+            config,
+        );
+
+        for i in 0..10u64 {
+            conn.push_event(ControlEvent::PtoTriggered {
+                pto_count: i as u32,
+                inflight_bytes: i,
+            });
+        }
+        assert_eq!(conn.event_queue.len(), 4, "the bound must hold");
+        assert_eq!(conn.cold.total_dropped_events, 6, "every shed event counts");
+        // The NEWEST four survive (pto_count 6..=9).
+        let drained = conn.drain_events();
+        let counts: Vec<u32> = drained
+            .iter()
+            .map(|ev| match ev {
+                ControlEvent::PtoTriggered { pto_count, .. } => *pto_count,
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect();
+        assert_eq!(counts, vec![6, 7, 8, 9]);
+        assert!(conn.event_queue.is_empty());
+
+        // The counter surfaces on the public telemetry surface.
+        let now = MonotonicTime::from_micros(1_000_000);
+        assert_eq!(conn.control().query_metrics(now).total_dropped_events, 6);
+    }
+
+    /// RT-2: a capacity of zero drops every event but still counts them —
+    /// measurement storage is bounded even in the most aggressive profile.
+    #[test]
+    fn event_queue_capacity_zero_drops_every_event() {
+        let cid = ConnectionId(0x2A13_0000_0000_0002);
+        let config = GtpConfig {
+            event_queue_capacity: 0,
+            ..GtpConfig::default()
+        };
+        let mut conn = GtpConnection::new_with_role(
+            cid,
+            "127.0.0.1:6000".parse().unwrap(),
+            true,
+            true,
+            config,
+        );
+        conn.push_event(ControlEvent::PtoTriggered {
+            pto_count: 1,
+            inflight_bytes: 0,
+        });
+        assert!(conn.event_queue.is_empty());
+        assert_eq!(conn.cold.total_dropped_events, 1);
     }
 }

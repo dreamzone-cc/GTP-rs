@@ -42,6 +42,14 @@ pub struct GtpConfig {
     /// runs at 60–144 Hz, so per-packet events would flood it.
     pub owd_sample_interval: Duration,
 
+    // --- Telemetry hygiene (RT-2) ---
+    /// Maximum control events retained before the oldest is dropped.
+    /// A runtime that never drains the queue must not accumulate memory
+    /// forever; overflow sheds the OLDEST event (newest information
+    /// survives) and counts it in `total_dropped_events`. `0` drops all
+    /// events. INV-18-safe: this bounds storage, not measurement.
+    pub event_queue_capacity: usize,
+
     // --- Security & Anti-DoS ---
     pub anti_amplification_factor: u64,
     pub stateless_token_lifetime: Duration,
@@ -95,6 +103,7 @@ impl GtpConfig {
             keepalive_ping_interval: Duration::from_secs(1),
             pto_max_duration: Duration::from_millis(500),
             owd_sample_interval: Duration::from_millis(100),
+            event_queue_capacity: 1024,
 
             anti_amplification_factor: 3,
             stateless_token_lifetime: Duration::from_secs(10),
@@ -133,6 +142,7 @@ impl GtpConfig {
             keepalive_ping_interval: Duration::from_secs(3),
             pto_max_duration: Duration::from_secs(2),
             owd_sample_interval: Duration::from_millis(100),
+            event_queue_capacity: 1024,
 
             anti_amplification_factor: 3,
             stateless_token_lifetime: Duration::from_secs(10),
@@ -171,6 +181,7 @@ impl GtpConfig {
             keepalive_ping_interval: Duration::from_secs(2),
             pto_max_duration: Duration::from_secs(1),
             owd_sample_interval: Duration::from_millis(100),
+            event_queue_capacity: 1024,
 
             anti_amplification_factor: 3,
             stateless_token_lifetime: Duration::from_secs(15),
@@ -215,6 +226,7 @@ impl GtpConfig {
             keepalive_ping_interval: Duration::from_secs(5),
             pto_max_duration: Duration::from_millis(100),
             owd_sample_interval: Duration::from_millis(100),
+            event_queue_capacity: 1024,
 
             anti_amplification_factor: 10,
             stateless_token_lifetime: Duration::from_secs(30),
@@ -265,6 +277,12 @@ impl GtpConfigBuilder {
 
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.config.idle_timeout = timeout;
+        self
+    }
+
+    /// RT-2: bound the retained control events (drop-oldest on overflow).
+    pub fn event_queue_capacity(mut self, capacity: usize) -> Self {
+        self.config.event_queue_capacity = capacity;
         self
     }
 

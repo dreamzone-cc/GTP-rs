@@ -477,4 +477,6 @@ pub struct ConnectionCold {
     pub total_corrupted_packets: u64,
     pub total_dropped_frames: u64,
     pub total_duplicate_drops: u64,
+    /// RT-2: control events shed by the bounded event queue (drop-oldest).
+    pub total_dropped_events: u64,
 }
