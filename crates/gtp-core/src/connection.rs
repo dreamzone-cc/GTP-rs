@@ -1820,8 +1820,8 @@ mod tests {
                 .update(Duration::from_millis(10), zero);
         }
         assert_eq!(
-            client.hot.loss_detector.rtt_stats.min_rtt,
-            Duration::from_millis(10)
+            client.hot.loss_detector.rtt_stats.min_rtt_sample(),
+            Some(Duration::from_millis(10))
         );
         assert_eq!(
             client.feedback(t0).backpressure,
@@ -1931,8 +1931,8 @@ mod tests {
                 .update(Duration::from_millis(10), zero);
         }
         assert_eq!(
-            client.hot.loss_detector.rtt_stats.min_rtt,
-            Duration::from_millis(10)
+            client.hot.loss_detector.rtt_stats.min_rtt_sample(),
+            Some(Duration::from_millis(10))
         );
 
         // Probe the address already in use.
@@ -1969,12 +1969,12 @@ mod tests {
                 .any(|e| matches!(e, ControlEvent::PathMigrated { .. })),
             "a probe of the active path must not report a migration"
         );
-        // A reset would leave `min_rtt` at its sentinel: the only acknowledgement in
+        // A reset would leave `min_rtt` unsampled: the only acknowledgement in
         // flight covers the challenge packet, which predates the reset and is barred by
         // the sampling floor, so nothing would re-seed it.
         assert_eq!(
-            client.hot.loss_detector.rtt_stats.min_rtt,
-            Duration::from_millis(10),
+            client.hot.loss_detector.rtt_stats.min_rtt_sample(),
+            Some(Duration::from_millis(10)),
             "the RTT estimator was cleared by a probe of the active path"
         );
         assert_ne!(
@@ -2045,11 +2045,9 @@ mod tests {
             1,
             t2 + Duration::from_millis(5),
         );
-        assert_eq!(
-            client.hot.loss_detector.rtt_stats.min_rtt,
-            gtp_recovery::RttStats::new().min_rtt,
-            "a packet sent before the migration re-seeded min_rtt with {:?}",
-            client.hot.loss_detector.rtt_stats.min_rtt
+        assert!(
+            client.hot.loss_detector.rtt_stats.min_rtt_sample().is_none(),
+            "a packet sent before the migration re-seeded min_rtt after the reset"
         );
     }
 

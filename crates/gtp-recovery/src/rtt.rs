@@ -9,7 +9,10 @@ pub struct RttStats {
     pub latest_rtt: Duration,
     pub smoothed_rtt: Duration,
     pub rttvar: Duration,
-    pub min_rtt: Duration,
+    /// E-2: crate-private — the field holds the `u64::MAX` sentinel until the
+    /// first `update`. External consumers must use `min_rtt_sample()` so the
+    /// sentinel can never leak (N-5).
+    pub(crate) min_rtt: Duration,
     pub max_ack_delay: Duration,
     first_sample: bool,
 }
