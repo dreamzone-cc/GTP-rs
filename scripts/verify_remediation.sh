@@ -74,6 +74,13 @@ check_present "was_contributory" "crates/gtp-crypto/src" "X25519 contributory ch
 check_present "checked_add" "crates/gtp-crypto/src" "overflow-safe length checks (SEC-10)"
 check_present "in_flight" "crates/gtp-recovery/src/loss_detector.rs" "loss filtering on in_flight (P1-3)"
 check_present "ConnectionReset" "crates/gtp-runtime-tokio/src" "RX resilience against connection reset (P2-1)"
+# INV-18 (G1): every header field carried on the wire has a real consumer
+# outside its defining crate — no dead wire surface. The timestamp check is
+# the G1 regression guard: it failed before 5ed2430 (the field was written
+# at TX and never read at RX) and must never regress.
+check_present "timestamp_micros" "crates/gtp-core/src/connection.rs" "wire timestamp consumed in the core RX path (INV-18, RE-1)"
+check_present "owd.on_packet" "crates/gtp-core/src/connection.rs" "OwdEstimator wired into RX (INV-18, A-1)"
+check_present "owd_var" "crates/gtp-core/src/control/metrics.rs" "one-way delay surfaced in telemetry (INV-18, A-2)"
 
 printf '\n'
 if [ "$FAILED" -eq 0 ]; then
