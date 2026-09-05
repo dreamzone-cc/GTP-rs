@@ -180,6 +180,9 @@ impl<'a> ConnectionControl<'a> {
             // N-5: `None` until the first RTT sample — never the u64::MAX sentinel.
             min_rtt: rtt.min_rtt_sample(),
             pto_duration: rtt.pto_duration(),
+            // RE-1 (G1): one-way delay telemetry from the wire timestamp.
+            owd_var: self.hot.owd.owd_var(),
+            jitter: self.hot.owd.jitter(),
 
             cwnd_bytes: gtp_cc::CongestionController::cwnd(&self.hot.cc),
             // FR-3: single source of truth for in-flight bytes is the loss detector.

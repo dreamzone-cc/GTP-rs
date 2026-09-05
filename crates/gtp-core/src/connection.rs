@@ -418,6 +418,22 @@ impl GtpConnection {
                 }
                 // R-6: age the post-ratchet grace window on the receive path too.
                 self.hot.tick_rx_key_grace();
+                // RE-1 (G1): consume the authenticated header timestamp. The
+                // field has been on the wire, inside the AAD, since 0.1.0 with
+                // no reader on RX until now (X-4 / INV-18). Runs only here —
+                // after the replay commit and the AEAD open — so a forged
+                // timestamp can never move measurement state (INV-3). Event
+                // emission is rate-bounded by `owd_sample_interval`: the event
+                // queue is unbounded and game traffic runs at 60–144 Hz.
+                let owd_sample = self.hot.owd.on_packet(header.timestamp_micros, now);
+                if now - self.hot.last_owd_emit >= self.config.owd_sample_interval {
+                    self.hot.last_owd_emit = now;
+                    self.event_queue.push(ControlEvent::OwdSample {
+                        owd_var_us: owd_sample.owd_var_us,
+                        jitter_us: owd_sample.jitter_us,
+                        epoch: owd_sample.epoch,
+                    });
+                }
                 len
             }
             Err(e) => {
@@ -701,6 +717,11 @@ impl GtpConnection {
                             self.hot
                                 .loss_detector
                                 .on_path_migration(first_pn_on_new_path);
+                            // RE-1: one-way-delay samples from the old path
+                            // describe the old path — same discipline as the
+                            // X-1 reset above, pre-positioning INV-13 (epoch
+                            // separation, fully enforced in G3).
+                            self.hot.owd.reset_for_new_path();
                             self.event_queue.push(ControlEvent::PathMigrated {
                                 old_addr,
                                 new_addr: src_addr,
@@ -2033,6 +2054,150 @@ mod tests {
         assert_eq!(probe.factor(), 10);
     }
 
+    /// RE-1 / A-1 integration: authenticated traffic at 60 FPS with an
+    /// alternating one-way delay (20 ms / 35 ms — the receiver's virtual
+    /// receive time controls the injected delay) must produce bounded-rate
+    /// `OwdSample` events carrying a real jitter estimate, and the metrics
+    /// surface must expose both values. G1 gate: jitter from 60 Hz traffic
+    /// is non-zero and stable.
+    #[test]
+    fn owd_samples_emitted_at_bounded_rate_with_real_jitter() {
+        use crate::control::ControlEvent;
+        let cid = ConnectionId(0x1A7B_0000_0000_00F1);
+        let (mut client, mut server) = loopback_pair(cid);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let t0 = MonotonicTime::from_micros(20_000_000);
+        let tick_us: u64 = 16_667; // 60 FPS
+        let mut buf = [0u8; 1500];
+
+        let mut owd_events = 0usize;
+        let mut last_jitter_us = 0u32;
+        for i in 0..200u64 {
+            // 200 ticks ≈ 3.33 s of virtual time
+            let now = MonotonicTime::from_micros(t0.as_micros() + i * tick_us);
+            client
+                .send_unreliable(vec![0x51u8; 64], PriorityTier::P1Input, None, now)
+                .unwrap();
+            while let Some((_, len)) = client.produce_outgoing_datagram(now, &mut buf).unwrap() {
+                let mut rx = [0u8; 1500];
+                rx[..len].copy_from_slice(&buf[..len]);
+                // Injected one-way delay: alternating 20 ms / 35 ms.
+                let delay_us = if i % 2 == 0 { 20_000 } else { 35_000 };
+                let recv_time = now + Duration::from_micros(delay_us);
+                server
+                    .handle_incoming_datagram(client_addr, &mut rx[..len], recv_time)
+                    .unwrap();
+            }
+            // Drain server-side events continuously, as an app would.
+            for ev in server.drain_events() {
+                if let ControlEvent::OwdSample {
+                    owd_var_us,
+                    jitter_us,
+                    epoch,
+                } = ev
+                {
+                    owd_events += 1;
+                    last_jitter_us = jitter_us;
+                    // The alternating pattern keeps owd_var in [0, 15 ms].
+                    assert!(owd_var_us <= 15_000, "owd_var out of pattern: {owd_var_us}");
+                    assert_eq!(epoch, 0, "epoch stays 0 until RE-3 (G3)");
+                }
+            }
+        }
+
+        // Bounded-rate emission: default interval is 100 ms over ~3.33 s of
+        // virtual time — allow the boundary tick, forbid per-packet floods
+        // (200 packets would give 200 events at 60 Hz without the bound).
+        assert!(
+            (10..=40).contains(&owd_events),
+            "expected ~33 bounded-rate OwdSample events, got {owd_events}"
+        );
+        // Real jitter from the alternating pattern: converges toward half the
+        // 15 ms swing (RFC 3550 gain 1/16); anything above 1 ms is a healthy
+        // non-zero reading for this gate.
+        assert!(
+            last_jitter_us >= 1_000,
+            "jitter must be non-zero under real 60 Hz variation, got {last_jitter_us} µs"
+        );
+
+        // The metrics surface carries both values (None never leaks).
+        let now_end = MonotonicTime::from_micros(t0.as_micros() + 200 * tick_us);
+        let metrics = server.control().query_metrics(now_end);
+        let jitter = metrics.jitter.expect("jitter sampled after traffic");
+        let owd_var = metrics.owd_var.expect("owd_var sampled after traffic");
+        assert!(jitter.as_micros() >= 1_000);
+        assert!(owd_var.as_micros() <= 15_000);
+    }
+
+    /// INV-3 negative: a tampered datagram must fail authentication, count as
+    /// corrupted, and move **no** measurement state — no OwdSample event and
+    /// the estimator stays unseeded.
+    #[test]
+    fn tampered_datagram_produces_no_owd_sample() {
+        use crate::control::ControlEvent;
+        let cid = ConnectionId(0x1A7B_0000_0000_00F2);
+        let (mut client, mut server) = loopback_pair(cid);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let t0 = MonotonicTime::from_micros(21_000_000);
+        let mut buf = [0u8; 1500];
+
+        client
+            .send_unreliable(vec![0x61u8; 64], PriorityTier::P1Input, None, t0)
+            .unwrap();
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut buf)
+            .unwrap()
+            .unwrap();
+
+        let mut tampered = buf;
+        // Flip a byte in the AEAD-protected region: the tag can no longer verify.
+        tampered[len - 1] ^= 0xFF;
+
+        let corrupted_before = server.cold.total_corrupted_packets;
+        assert!(
+            server
+                .handle_incoming_datagram(client_addr, &mut tampered[..len], t0)
+                .is_err(),
+            "a tampered datagram must fail authentication"
+        );
+        assert_eq!(server.cold.total_corrupted_packets, corrupted_before + 1);
+        assert!(
+            !server.hot.owd.is_ready(),
+            "a forged timestamp must never seed measurement state (INV-3)"
+        );
+        assert!(
+            !server
+                .drain_events()
+                .iter()
+                .any(|e| matches!(e, ControlEvent::OwdSample { .. })),
+            "no OwdSample may be emitted for unauthenticated input"
+        );
+
+        // Control: the pristine datagram still authenticates and seeds the
+        // estimator — proving the negative above is about authentication,
+        // not about the test harness.
+        let mut pristine = buf;
+        server
+            .handle_incoming_datagram(client_addr, &mut pristine[..len], t0)
+            .unwrap();
+        assert!(server.hot.owd.is_ready());
+        assert!(server.control().query_metrics(t0).owd_var.is_some());
+    }
+
+    /// RE-1 telemetry contract: `owd_var`/`jitter` are `None` before the
+    /// first authenticated packet (the N-5 no-sentinel discipline) and become
+    /// `Some` afterwards.
+    #[test]
+    fn owd_metrics_are_none_until_first_authenticated_packet() {
+        let cid = ConnectionId(0x1A7B_0000_0000_00F3);
+        let (_client, mut server) = loopback_pair(cid);
+        let t0 = MonotonicTime::from_micros(22_000_000);
+
+        let metrics = server.control().query_metrics(t0);
+        assert!(metrics.owd_var.is_none());
+        assert!(metrics.jitter.is_none());
+    }
+
     #[test]
     fn migration_bars_pre_migration_packets_from_reseeding_min_rtt() {
         use crate::control::ControlEvent;
@@ -2095,7 +2260,12 @@ mod tests {
             t2 + Duration::from_millis(5),
         );
         assert!(
-            client.hot.loss_detector.rtt_stats.min_rtt_sample().is_none(),
+            client
+                .hot
+                .loss_detector
+                .rtt_stats
+                .min_rtt_sample()
+                .is_none(),
             "a packet sent before the migration re-seeded min_rtt after the reset"
         );
     }

@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// N-5: renders an optional duration, marking "no sample yet" as `n/a`
-/// instead of the internal `u64::MAX` sentinel (18446744073709s).
+/// N-5 / RE-1: renders an optional duration, marking "no sample yet" as `n/a`
+/// instead of an internal sentinel (the min-RTT `u64::MAX` formats as
+/// 18446744073709s).
 fn fmt_min_rtt(min_rtt: Option<gtp_types::Duration>) -> String {
     match min_rtt {
         Some(d) => format!("{:?}", d),
@@ -441,6 +442,10 @@ async fn main() -> Result<()> {
             println!("Smoothed RTT:           {:?}", metrics.smoothed_rtt);
             println!("Min RTT:                {}", fmt_min_rtt(metrics.min_rtt));
             println!("RTT Variance:           {:?}", metrics.rttvar);
+            // RE-1 (G1): one-way delay telemetry from the wire timestamp —
+            // directional jitter that round-trip RTT cannot see.
+            println!("OWD Variance:           {}", fmt_min_rtt(metrics.owd_var));
+            println!("OWD Jitter (RFC 3550):  {}", fmt_min_rtt(metrics.jitter));
             println!(
                 "Congestion Window:      {} bytes ({} KB)",
                 metrics.cwnd_bytes,

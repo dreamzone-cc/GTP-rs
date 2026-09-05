@@ -126,6 +126,20 @@ impl OwdEstimator {
         self.has_sample
     }
 
+    /// OWD variance as `Option<Duration>` — `None` before the first
+    /// authenticated packet (the N-5 no-sentinel discipline for telemetry).
+    pub fn owd_var(&self) -> Option<Duration> {
+        self.has_sample
+            .then(|| Duration::from_micros(self.prev_owd_var as u64))
+    }
+
+    /// RFC 3550 jitter as `Option<Duration>` — `None` before the first
+    /// authenticated packet.
+    pub fn jitter(&self) -> Option<Duration> {
+        self.has_sample
+            .then(|| Duration::from_micros(self.jitter as u64))
+    }
+
     /// Re-seed on a **validated** path migration: samples from the old path
     /// describe the old path (the X-1 discipline applied to one-way delay;
     /// pre-positions the epoch rule, INV-13).
@@ -259,7 +273,10 @@ mod tests {
         assert!(est.sample().owd_var_us > 0);
 
         est.reset_for_new_path();
-        assert!(!est.is_ready(), "after a migration reset no sample survives");
+        assert!(
+            !est.is_ready(),
+            "after a migration reset no sample survives"
+        );
         // The first packet on the new path re-seeds the floor: a 60 ms delay
         // reads zero variance, not 40 ms above the old path's floor.
         let s = feed(&mut est, 20_000_000, 60_000);

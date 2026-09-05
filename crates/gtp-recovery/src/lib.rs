@@ -1,6 +1,6 @@
 pub mod ack_tracker;
-pub mod owd;
 pub mod loss_detector;
+pub mod owd;
 pub mod rtt;
 pub mod sent_packet;
 

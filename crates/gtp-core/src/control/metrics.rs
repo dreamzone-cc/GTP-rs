@@ -12,6 +12,13 @@ pub struct DetailedMetrics {
     /// `u64::MAX` sentinel never leaks into public telemetry.
     pub min_rtt: Option<Duration>,
     pub pto_duration: Duration,
+    /// RE-1 (G1): one-way-delay variance above the sliding floor, from the
+    /// authenticated header timestamp. `None` until the first authenticated
+    /// packet — same no-sentinel discipline as `min_rtt`.
+    pub owd_var: Option<Duration>,
+    /// RE-1 (G1): RFC 3550 §6.4.1 inter-arrival jitter, µs resolution.
+    /// `None` until the first authenticated packet.
+    pub jitter: Option<Duration>,
 
     // --- Congestion Control & Pacing ---
     pub cwnd_bytes: u64,

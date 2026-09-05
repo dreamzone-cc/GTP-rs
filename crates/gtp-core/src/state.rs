@@ -4,7 +4,7 @@ use gtp_crypto::{
     PlaintextProtector, Protector, ReplayWindow,
 };
 use gtp_path::{AntiAmplificationLimiter, ConnectionState, PathValidator};
-use gtp_recovery::{AckTracker, LossDetector};
+use gtp_recovery::{AckTracker, LossDetector, OwdEstimator};
 use gtp_scheduler::{GameScheduler, OrderedGroupReceiver, StateTable};
 use gtp_types::{ConnectionId, MonotonicTime, OrderedGroupId, PacketNumber};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -175,6 +175,14 @@ pub struct ConnectionHot {
     /// `path_validator.pending_addr()`, so probe state cannot outlive its challenge.
     pub anti_amplification_probe: Option<(SocketAddr, AntiAmplificationLimiter)>,
     pub path_validator: PathValidator,
+    /// RE-1 (G1): one-way-delay variance + RFC 3550 jitter derived from the
+    /// authenticated `timestamp_micros` of every received packet. `Copy`,
+    /// integer-only — zero allocation on the RX path.
+    pub owd: OwdEstimator,
+    /// Time of the last `ControlEvent::OwdSample` emission. Bounded-rate
+    /// emission (G1 design note D6): `event_queue` is an unbounded Vec, so
+    /// per-packet events at 60–144 Hz would flood it. `ZERO` = never emitted.
+    pub last_owd_emit: MonotonicTime,
     pub next_message_id: u64,
     pub next_order_seqs: FxHashMap<u16, u32>,
     pub packets_since_ratchet: u64,
@@ -316,8 +324,7 @@ impl ConnectionHot {
         pre_validated: bool,
         config: &crate::control::config::GtpConfig,
     ) -> Self {
-        let mut anti_amp =
-            AntiAmplificationLimiter::with_factor(config.anti_amplification_factor);
+        let mut anti_amp = AntiAmplificationLimiter::with_factor(config.anti_amplification_factor);
         if pre_validated {
             anti_amp.mark_validated();
         }
@@ -372,6 +379,8 @@ impl ConnectionHot {
             anti_amplification: anti_amp,
             anti_amplification_probe: None,
             path_validator: PathValidator::new(),
+            owd: OwdEstimator::new(),
+            last_owd_emit: MonotonicTime::ZERO,
             next_message_id: 1,
             next_order_seqs: FxHashMap::default(),
             packets_since_ratchet: 0,

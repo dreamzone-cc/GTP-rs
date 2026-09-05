@@ -36,6 +36,12 @@ pub struct GtpConfig {
     pub keepalive_ping_interval: Duration,
     pub pto_max_duration: Duration,
 
+    // --- Measurement (RE-1, G1) ---
+    /// Minimum interval between `ControlEvent::OwdSample` emissions.
+    /// Bounded-rate emission: the event queue is unbounded and game traffic
+    /// runs at 60–144 Hz, so per-packet events would flood it.
+    pub owd_sample_interval: Duration,
+
     // --- Security & Anti-DoS ---
     pub anti_amplification_factor: u64,
     pub stateless_token_lifetime: Duration,
@@ -88,6 +94,7 @@ impl GtpConfig {
             idle_timeout: Duration::from_secs(15),
             keepalive_ping_interval: Duration::from_secs(1),
             pto_max_duration: Duration::from_millis(500),
+            owd_sample_interval: Duration::from_millis(100),
 
             anti_amplification_factor: 3,
             stateless_token_lifetime: Duration::from_secs(10),
@@ -125,6 +132,7 @@ impl GtpConfig {
             idle_timeout: Duration::from_secs(30),
             keepalive_ping_interval: Duration::from_secs(3),
             pto_max_duration: Duration::from_secs(2),
+            owd_sample_interval: Duration::from_millis(100),
 
             anti_amplification_factor: 3,
             stateless_token_lifetime: Duration::from_secs(10),
@@ -162,6 +170,7 @@ impl GtpConfig {
             idle_timeout: Duration::from_secs(20),
             keepalive_ping_interval: Duration::from_secs(2),
             pto_max_duration: Duration::from_secs(1),
+            owd_sample_interval: Duration::from_millis(100),
 
             anti_amplification_factor: 3,
             stateless_token_lifetime: Duration::from_secs(15),
@@ -205,6 +214,7 @@ impl GtpConfig {
             idle_timeout: Duration::from_secs(60),
             keepalive_ping_interval: Duration::from_secs(5),
             pto_max_duration: Duration::from_millis(100),
+            owd_sample_interval: Duration::from_millis(100),
 
             anti_amplification_factor: 10,
             stateless_token_lifetime: Duration::from_secs(30),
