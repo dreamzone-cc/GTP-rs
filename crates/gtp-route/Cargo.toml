@@ -1,0 +1,14 @@
+[package]
+name = "gtp-route"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pure, deterministic route scoring and selection for the GTP adaptive-routing engine (ARDP B-1 prelude)"
+
+[dependencies]
+
+[dev-dependencies]
+gtp-core = { path = "../gtp-core" }
+gtp-sim = { path = "../gtp-sim" }
+gtp-types = { path = "../gtp-types" }

@@ -447,6 +447,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gtp-route"
+version = "0.2.0"
+dependencies = [
+ "gtp-core",
+ "gtp-sim",
+ "gtp-types",
+]
+
+[[package]]
 name = "gtp-runtime-tokio"
 version = "0.2.0"
 dependencies = [

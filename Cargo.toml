@@ -6,6 +6,7 @@ members = [
     "crates/gtp-cc",
     "crates/gtp-scheduler",
     "crates/gtp-path",
+    "crates/gtp-route",
     "crates/gtp-crypto",
     "crates/gtp-core",
     "crates/gtp-io",
@@ -29,6 +30,7 @@ gtp-recovery = { path = "crates/gtp-recovery" }
 gtp-cc = { path = "crates/gtp-cc" }
 gtp-scheduler = { path = "crates/gtp-scheduler" }
 gtp-path = { path = "crates/gtp-path" }
+gtp-route = { path = "crates/gtp-route" }
 gtp-crypto = { path = "crates/gtp-crypto" }
 gtp-core = { path = "crates/gtp-core" }
 gtp-io = { path = "crates/gtp-io" }
