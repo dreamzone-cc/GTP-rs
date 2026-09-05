@@ -1086,19 +1086,13 @@ impl GtpConnection {
         // that budget can ever grow: migration could never begin. The probe slot is
         // therefore a RECEIVE-side accumulator and gates nothing outbound.
         //
-        // Do NOT read that as "the directed frames are bounded anyway". They are not,
-        // and New-8's correctness must not be taken to depend on any such bound:
-        //   - `PathValidator` bounds the outgoing side only — at most one OUTSTANDING
-        //     CHALLENGE, because it holds a single `pending_challenge`.
-        //   - A PATH_RESPONSE is a different thing entirely: it is queued by the
-        //     handler for every INBOUND PATH_CHALLENGE (see `Frame::PathChallenge`),
-        //     addressed to whatever source the inbound datagram claimed, and nothing
-        //     bounds how many of them a peer can provoke. `control_queue` has no
-        //     length cap.
-        // That an unvalidated destination can therefore be sent to without passing a
-        // 3x limiter is a SEPARATE, PRE-EXISTING defect — the gate and the echo are
-        // byte-identical to their form before this commit. It is tracked as New-12 and
-        // is deliberately not addressed here; New-8 fixes the receive-side leak only.
+        // The reflection side that once made directed sends unbounded is CLOSED
+        // (New-12, `Frame::PathChallenge` handler): responses are emitted only for
+        // the active path, at most one per inbound datagram
+        // (`MAX_PATH_RESPONSES_PER_DATAGRAM`) and at most two queued at any time
+        // (`MAX_PENDING_PATH_RESPONSES`). What remains true — and intended — is
+        // that the single outstanding PATH_CHALLENGE to an unvalidated probe
+        // address is not itself charged to a 3x budget (see New-8 above).
         if !self.hot.anti_amplification.can_send(total_datagram_len) {
             Self::requeue_controls(&mut self.hot.control_queue, drained_controls);
             Self::requeue_popped(&mut self.hot.scheduler, popped, now, &mut self.cold);
