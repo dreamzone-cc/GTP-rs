@@ -127,6 +127,7 @@ cargo run -p gtp-cli -- dissect 80000100011C11223344556677880000000000000001000F
 - **Process**:
   - [`GTP-rs_SESSION_CONTEXT_GUIDE.md`](GTP-rs_SESSION_CONTEXT_GUIDE.md): Permanent session-continuity and context-restoration guide.
 - **Roadmap & Integration (Adaptive Routing / Gaming VPN)**:
+  - [`docs/ADAPTIVE-ROUTING-DEVELOPMENT-PLAN.md`](docs/ADAPTIVE-ROUTING-DEVELOPMENT-PLAN.md): **Plan of record for the adaptive-routing work** — reconciles the technical paper against the code as built, records the corrections the paper needs, and schedules every capability into tracks A–E with gates G1–G7. **Start here before writing routing-engine code.**
   - [`GTPrs_Integrated_CrossLayer_Design_and_Audit__AR.md`](GTPrs_Integrated_CrossLayer_Design_and_Audit__AR.md): Cross-layer integration audit, system invariants, and the adaptive-routing engine specification (GTP-rs-ICD-01, Arabic).
   - [`GTP++.md`](GTP++.md): Extended technical paper on server-side adaptive routing for a gaming VPN over GTP-rs (Arabic).
   - [`GTP_Adaptive_Routing_Technical_Paper.md`](GTP_Adaptive_Routing_Technical_Paper.md): Companion copy of the adaptive-routing paper (Arabic).
