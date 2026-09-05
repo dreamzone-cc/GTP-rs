@@ -79,8 +79,12 @@ impl<'a> ConnectionControl<'a> {
             // that address is the validated active path.
             self.hot.anti_amplification_probe = None;
         } else {
-            self.hot.anti_amplification_probe =
-                Some((new_addr, gtp_path::AntiAmplificationLimiter::new()));
+            self.hot.anti_amplification_probe = Some((
+                new_addr,
+                gtp_path::AntiAmplificationLimiter::with_factor(
+                    self.config.anti_amplification_factor,
+                ),
+            ));
         }
 
         self.hot

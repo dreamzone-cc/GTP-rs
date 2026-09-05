@@ -71,6 +71,10 @@ impl GtpConnection {
         hot.ack_tracker
             .set_policy(config.ack_frequency_packets, config.max_ack_delay);
         hot.anti_amplification.mark_validated();
+        // A-6: the legacy hot constructor builds with the default config; the
+        // connection-level config is authoritative.
+        hot.anti_amplification
+            .set_factor(config.anti_amplification_factor);
         Self {
             hot,
             cold: ConnectionCold::default(),
@@ -89,14 +93,20 @@ impl GtpConnection {
         pre_validated: bool,
         config: GtpConfig,
     ) -> Self {
+        let mut hot = ConnectionHot::new_with_directional_keys(
+            cid,
+            peer_addr,
+            keys,
+            as_client,
+            pre_validated,
+        );
+        // A-6: the handshake-driven hot constructor has no config parameter;
+        // re-seed the amplification factor from the connection-level config so
+        // the production path honors `anti_amplification_factor` too.
+        hot.anti_amplification
+            .set_factor(config.anti_amplification_factor);
         Self {
-            hot: ConnectionHot::new_with_directional_keys(
-                cid,
-                peer_addr,
-                keys,
-                as_client,
-                pre_validated,
-            ),
+            hot,
             cold: ConnectionCold::default(),
             config,
             event_queue: Vec::with_capacity(32),
@@ -673,7 +683,9 @@ impl GtpConnection {
                             // design deliberately avoids.
                             let mut promoted = match self.hot.anti_amplification_probe.take() {
                                 Some((probe_addr, probe)) if probe_addr == src_addr => probe,
-                                _ => gtp_path::AntiAmplificationLimiter::new(),
+                                _ => gtp_path::AntiAmplificationLimiter::with_factor(
+                                    self.config.anti_amplification_factor,
+                                ),
                             };
                             promoted.mark_validated();
                             self.hot.anti_amplification = promoted;
@@ -1982,6 +1994,43 @@ mod tests {
             gtp_recovery::RttStats::new().smoothed_rtt,
             "smoothed_rtt fell back to the initial constant, so a reset happened"
         );
+    }
+
+    /// A-6 wiring: `GtpConfig::anti_amplification_factor` must reach every limiter
+    /// the connection creates — the active-path budget at build time and the probe
+    /// budget opened by `trigger_path_challenge`. Before A-6 the field was set by
+    /// four profiles and read by nothing; the limiter hardcoded 3.
+    #[test]
+    fn anti_amplification_factor_flows_from_config_to_limiters() {
+        let cid = ConnectionId(0x1A7B_0000_0000_00E4);
+        let peer: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        let mut client = GtpConnection::new_with_config(
+            cid,
+            peer,
+            true,
+            GtpConfig::lan_cluster(), // anti_amplification_factor: 10
+        );
+        assert_eq!(
+            client.hot.anti_amplification.factor(),
+            10,
+            "the build-time limiter must carry the configured factor"
+        );
+
+        // A challenge to a NEW address opens a probe budget; it must carry the
+        // same configured factor (not the hardcoded default 3).
+        let t0 = MonotonicTime::from_micros(14_000_000);
+        let new_addr: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        client
+            .control()
+            .trigger_path_challenge(new_addr, [0xE4; 8], t0)
+            .unwrap();
+        let (probe_addr, probe) = client
+            .hot
+            .anti_amplification_probe
+            .as_ref()
+            .expect("a challenge to a new address opens a probe budget");
+        assert_eq!(*probe_addr, new_addr);
+        assert_eq!(probe.factor(), 10);
     }
 
     #[test]

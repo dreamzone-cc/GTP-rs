@@ -316,7 +316,8 @@ impl ConnectionHot {
         pre_validated: bool,
         config: &crate::control::config::GtpConfig,
     ) -> Self {
-        let mut anti_amp = AntiAmplificationLimiter::new();
+        let mut anti_amp =
+            AntiAmplificationLimiter::with_factor(config.anti_amplification_factor);
         if pre_validated {
             anti_amp.mark_validated();
         }
