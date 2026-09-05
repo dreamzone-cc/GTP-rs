@@ -18,5 +18,6 @@ gtp-io = { workspace = true }
 gtp-path = { workspace = true }
 gtp-runtime-tokio = { workspace = true }
 gtp = { workspace = true }
+gtp-route = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }

@@ -24,13 +24,17 @@
 //!   caller decides what executing a selection means; today the answer is
 //!   "print it" (INV-15 — nothing here actuates anything).
 //! - [`health`] — a single-path verdict for probe tooling.
+//! - [`report`] — the compact `ReliableOrdered` measurement exchange between
+//!   the two endpoints (app-layer, no wire change, ARDP §2.3).
 //!
 //! INV-11 discipline: a [`PathStats`] describes exactly one measured path in
 //! one epoch; comparing stats from different scopes is the caller's bug.
 
+pub mod report;
 pub mod score;
 pub mod select;
 
+pub use report::{MeasurementReport, REPORT_GROUP_ID, REPORT_PREFIX};
 pub use score::{confidence, score};
 pub use select::{health, select, HealthVerdict, Selection, SelectionReason};
 

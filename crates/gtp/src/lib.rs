@@ -52,6 +52,7 @@ pub use gtp_crypto as crypto;
 pub use gtp_io as io;
 pub use gtp_path as path;
 pub use gtp_recovery as recovery;
+pub use gtp_route as route;
 pub use gtp_scheduler as scheduler;
 pub use gtp_types as types;
 pub use gtp_wire as wire;

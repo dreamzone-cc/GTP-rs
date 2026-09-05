@@ -58,6 +58,16 @@ enum Commands {
         #[arg(short, long, default_value_t = 100)]
         count: usize,
     },
+    /// Bidirectional route measurement probe: measures device→node and node→device,
+    /// prints the combined table and the shadow route verdict (no switching).
+    RouteProbe {
+        /// Remote GTP server address (default: the verification VPS)
+        #[arg(short, long, default_value = "92.222.80.200:7777")]
+        server: String,
+        /// Probe duration in seconds (default: 10)
+        #[arg(short, long, default_value_t = 10)]
+        duration: u64,
+    },
     /// Executes the comprehensive stress, endurance, impairment, and stability test suite
     StressSuite {
         /// Test mode: 'all', 'load', 'impairment', 'endurance', 'game' (default: all)
@@ -327,6 +337,39 @@ async fn main() -> Result<()> {
                                                 dropped
                                             );
                                         }
+
+                                        // Bidirectional route measurement
+                                        // (design note §1): tell the peer what
+                                        // THIS receiver measured — the
+                                        // client→server direction — as a
+                                        // ReliableOrdered app message (ARDP
+                                        // §2.3: no wire change).
+                                        let m = client_conn.query_metrics().await;
+                                        let report = gtp_route::MeasurementReport {
+                                            owd_var_us: m
+                                                .owd_var
+                                                .map(|d| d.as_micros() as u32),
+                                            jitter_us: m
+                                                .jitter
+                                                .map(|d| d.as_micros() as u32),
+                                            srtt_us: Some(
+                                                m.smoothed_rtt.as_micros() as u32
+                                            ),
+                                            // Per-packet basis: the estimator
+                                            // is fed by every authenticated
+                                            // packet (not the rate-limited
+                                            // OwdSample event stream).
+                                            samples: m.total_rx_packets.min(u32::MAX as u64) as u32,
+                                        };
+                                        let _ = client_conn
+                                            .send_reliable_ordered(
+                                                gtp_types::OrderedGroupId(
+                                                    gtp_route::REPORT_GROUP_ID,
+                                                ),
+                                                report.encode().into_bytes(),
+                                                gtp_types::PriorityTier::P1Input,
+                                            )
+                                            .await;
                                     }
                                 }
                             }
@@ -516,6 +559,162 @@ async fn main() -> Result<()> {
             );
             println!("============================================================\n");
             println!("✅ Live GTP-rs network benchmark executed successfully!");
+        }
+
+        Commands::RouteProbe { server, duration } => {
+            let server_addr: SocketAddr = server
+                .parse()
+                .map_err(|e| TransportError::Io(format!("Invalid server address: {}", e)))?;
+            println!("============================================================");
+            println!("🧭 GTP/1.1 Bidirectional Route Probe (shadow — no switching)");
+            println!("Connecting to Remote Server:  {}", server_addr);
+            println!("Probe Duration:               {} s @ 60 FPS", duration);
+            println!("Encryption:                   ChaCha20-Poly1305 + HKDF Keys");
+            println!("============================================================\n");
+
+            let client_ep = GtpEndpoint::bind("0.0.0.0:0".parse().unwrap()).await?;
+            let local_addr = client_ep.local_addr()?;
+            // Fresh CID per session (handshake-collision discipline, as net-client).
+            let cid = {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64;
+                ConnectionId(
+                    nanos
+                        ^ ((local_addr.port() as u64) << 48)
+                        ^ ((std::process::id() as u64) << 32),
+                )
+            };
+            let mut client_conn = client_ep.connect(cid, server_addr, true).await?;
+            println!("Connected. Local socket: {}\n", local_addr);
+
+            let start = Instant::now();
+            let mut frame_tick = tokio::time::interval(std::time::Duration::from_millis(16));
+            frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut frame_idx: u32 = 0;
+            let mut latest_report: Option<gtp_route::MeasurementReport> = None;
+            let mut reports_received: u32 = 0;
+
+            loop {
+                if start.elapsed().as_secs() >= duration {
+                    break;
+                }
+                tokio::select! {
+                    _ = frame_tick.tick() => {
+                        let payload = format!("route_probe_frame_{frame_idx}");
+                        frame_idx += 1;
+                        client_conn
+                            .send_unreliable(payload.into_bytes(), PriorityTier::P1Input)
+                            .await?;
+                    }
+                    msg = client_conn.recv() => {
+                        let Some(msg) = msg else { break };
+                        // Only the report group matters here; traffic echoes
+                        // are ignored (INV-15: the probe consumes, never acts).
+                        if let gtp_types::MessageClass::ReliableOrdered { group_id, .. } =
+                            msg.class
+                        {
+                            if group_id.as_u16() == gtp_route::REPORT_GROUP_ID {
+                                if let Some(r) =
+                                    gtp_route::MeasurementReport::parse(&String::from_utf8_lossy(&msg.payload))
+                                {
+                                    latest_report = Some(r);
+                                    reports_received += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Local side: the node→device direction, measured by THIS
+            // receiver from the server's ACK/report traffic.
+            let local_metrics = client_conn.query_metrics().await;
+            let local_owd_seen = client_conn
+                .drain_events()
+                .await
+                .into_iter()
+                .filter(|ev| matches!(ev, ControlEvent::OwdSample { .. }))
+                .count() as u32;
+            let local = gtp_route::PathStats {
+                path_id: 0,
+                rev_owd_var_us: local_metrics.owd_var.map(|d| d.as_micros() as u32),
+                rev_jitter_us: local_metrics.jitter.map(|d| d.as_micros() as u32),
+                rtt_us: Some(local_metrics.smoothed_rtt.as_micros() as u32),
+                sample_count: local_owd_seen.max(frame_idx),
+                ..Default::default()
+            };
+
+            println!("--- Combined Bidirectional Measurement ---");
+            println!(
+                "  Device → Node (measured AT the node):  {}",
+                match &latest_report {
+                    Some(r) => format!(
+                        "owd_var {} µs | jitter {} µs | node-srtt {} µs (basis {})",
+                        r.owd_var_us
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "n/a".into()),
+                        r.jitter_us
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "n/a".into()),
+                        r.srtt_us
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "n/a".into()),
+                        r.samples
+                    ),
+                    None => "no report received".to_string(),
+                }
+            );
+            println!(
+                "  Node → Device (measured AT this device): owd_var {} µs | jitter {} µs",
+                local_metrics
+                    .owd_var
+                    .map(|v| format!("{}", v.as_micros()))
+                    .unwrap_or_else(|| "n/a".into()),
+                local_metrics
+                    .jitter
+                    .map(|v| format!("{}", v.as_micros()))
+                    .unwrap_or_else(|| "n/a".into()),
+            );
+            println!(
+                "  Round trip: {} ms | Frames sent: {} | Reports received: {}",
+                local_metrics.smoothed_rtt.as_micros() as f64 / 1000.0,
+                frame_idx,
+                reports_received
+            );
+
+            // Shadow verdict (INV-15): compute and record — execute nothing.
+            let stats = match latest_report {
+                Some(r) => r.into_path_stats(0, &local),
+                None => local,
+            };
+            let selection = gtp_route::select(&[stats]);
+            let health = gtp_route::health(&stats);
+            println!("\n--- Shadow Route Verdict (no switching) ---");
+            println!("  Selection: {}", selection.summary());
+            println!("  Health:    {:?}", health);
+            for scored in &selection.scored {
+                println!(
+                    "  Path {} score={} confidence={:.2} effective={}",
+                    scored.path_id,
+                    scored
+                        .score
+                        .map(|v| format!("{:.3}", v))
+                        .unwrap_or_else(|| "n/a".into()),
+                    scored.confidence,
+                    scored
+                        .effective
+                        .map(|v| format!("{:.3}", v))
+                        .unwrap_or_else(|| "n/a".into()),
+                );
+            }
+            println!("============================================================");
+            if reports_received == 0 {
+                println!("⚠️ No measurement reports received — is the server running this build?");
+            } else {
+                println!("✅ Bidirectional route probe completed.");
+            }
         }
 
         Commands::StressSuite {

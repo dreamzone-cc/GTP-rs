@@ -17,6 +17,7 @@ gtp-scheduler = { workspace = true }
 gtp-path = { workspace = true }
 gtp-crypto = { workspace = true }
 gtp-core = { workspace = true }
+gtp-route = { workspace = true }
 gtp-io = { workspace = true }
 gtp-runtime-tokio = { workspace = true, optional = true }
 gtp-sim = { workspace = true, optional = true }
