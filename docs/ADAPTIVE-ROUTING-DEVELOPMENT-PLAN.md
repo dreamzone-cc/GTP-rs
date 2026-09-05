@@ -54,6 +54,15 @@ open critical or high protocol defects.**
 prerequisite work is done and the engine can begin. What follows is what G1
 onward actually requires, expanded to cover everything the paper asks for.
 
+> **v1.1 update (2026-09-05, later the same day): gate G1 is complete.**
+> A-1, A-2, A-6, E-1, E-2 landed; D-1 delivered ahead of G2; E-6 design
+> opened (ADR-006 decisions enumerated); INV-18 checks added to the gate.
+> 134 → 149 tests green (three consecutive full-gate runs); deployed to both
+> ends at parity `00eb110`; live WAN round shows non-zero RFC 3550 one-way
+> jitter (267 µs) from real 60 FPS traffic. Evidence:
+> `docs/routing/G1-closure-report.md`. **The project is now at the start of
+> G2.**
+
 ### v1.1 corrections to this plan
 
 A second verification pass against the same tree (`main` @ `a47bb0e`) corrected
@@ -393,7 +402,7 @@ material. Principle P5 exists for exactly this.
 | :-- | :-- | :-- | :-- |
 | 2.2.1 | Smart entry point | C-3 | not started |
 | 2.2.2 | Adaptive routing engine | B-1…B-4 | not started |
-| 2.2.3 | Advanced telemetry | A-1, A-2, A-4 | not started |
+| 2.2.3 | Advanced telemetry | A-1, A-2, A-4 | ✅ A-1/A-2 done (G1); A-4 at G3 |
 | 3.1.1 | Delivery semantics | — | ✅ already built |
 | 3.1.2 | CUBIC integration | — | ✅ built; §3.5 corrects the example API |
 | 3.2.1 | Security feature table | A-8 | ❌ two entries incorrect — §3.1 |
@@ -401,7 +410,7 @@ material. Principle P5 exists for exactly this.
 | 3.3 | DRR scheduling | — | ✅ built; §3.3 corrects the priority mapping |
 | 4.1 | Route scoring | B-3 | scorer redesigned — §3.2 |
 | 4.2 | Anti-flapping | B-4 | parameters adopted as-is |
-| 4.3 | Asymmetric routing | A-1, B-5 | needs OWD first |
+| 4.3 | Asymmetric routing | A-1, B-5 | A-1 done (G1) — OWD live; B-5 at G5 |
 | 5.1.1 | BGP monitoring | C-1 | parallel track |
 | 5.1.2 | ML prediction | C-2 | blocked on G3 dataset |
 | 5.2 | MTU optimization | B-7 | overhead model corrected — §3.6 |

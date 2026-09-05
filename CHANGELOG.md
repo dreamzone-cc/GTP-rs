@@ -5,6 +5,28 @@ All notable changes to the Game Transport Protocol (GTP-rs) project will be docu
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 2026-09-05 gate G1: measurement layer activation
+
+Adaptive-routing gate G1 per `docs/ADAPTIVE-ROUTING-DEVELOPMENT-PLAN.md` (v1.1);
+design and closure under `docs/routing/`. **134 → 149 tests green** (three
+consecutive full-gate runs), deployed to both ends at parity `00eb110`.
+
+### Added
+- **RE-1 / A-1**: the wire timestamp (`timestamp_micros`, on the wire inside the AAD since 0.1.0 with zero RX consumers — X-4) is now consumed on every authenticated packet: sliding-floor one-way-delay variance + RFC 3550 §6.4.1 jitter (`gtp-recovery::OwdEstimator`, `Copy`/integer-only — zero RX allocation). Floor re-anchors within a 30 s window, bounding 50 ppm crystal-drift error at ≤ 1.5 ms; `u32` wrap-safe by signed interpretation.
+- **A-2**: `ControlEvent::OwdSample` (bounded-rate emission via new `GtpConfig::owd_sample_interval`, 100 ms default — the event queue is unbounded and game traffic runs 60–144 Hz) and `PathEventDetected` (+ `PathEventKind`/`PathDirection`, emission from G5); `DetailedMetrics::owd_var`/`jitter` as `Option<Duration>`; `gtp-cli net-client` prints OWD Variance and OWD Jitter lines.
+- **D-1** (G2 groundwork): `gtp-sim::SimulatedFabric` — per-direction link profiles, time-scripted impairment deltas (clamped, cursor-idempotent), splitmix64 per-link-per-direction RNG streams, and a determinism event log; same seed ⟹ identical event sequence.
+- INV-18 procedural checks in `scripts/verify_remediation.sh` (wire-field consumer regression guards).
+- `docs/routing/`: G1 design note, defect registry (opens with RT-1: `loss_ratio()` mixed-unit proxy), E-6 server-authentication design options (PSK vs operator-signed Ed25519 — recommendation recorded, ADR-006 decisions enumerated), G1 closure report.
+
+### Fixed
+- **A-6 / New-11**: `GtpConfig::anti_amplification_factor` is live — was set by four profiles (3/3/3/10) and read by nothing while the limiter hardcoded ×3. Wired at all five construction sites; a real wiring gap found and closed: the handshake-driven `new_with_directional_keys` (the production endpoint path) never saw the config. Factor floored at 1; default 3× unchanged.
+- **E-1**: stale comment above the TX amplification gate still described the closed New-12 reflection defect as open — corrected to the closed state.
+- **E-2**: `RttStats.min_rtt` field crate-privatized (the `u64::MAX` sentinel is no longer readable outside gtp-recovery; consumers use `min_rtt_sample()`).
+- Validated path migration now also resets the OWD estimator beside the X-1 RTT reset (pre-positions INV-13).
+
+### Verified live
+- 2,000-frame WAN round on the production VPS: OWD Variance **1.541 ms**, OWD Jitter **267 µs** (non-zero, real 60 FPS internet traffic — the gate criterion), 0 loss/retransmissions/PTO/corrupted; server RSS 892 K (peak 1.7 M).
+
 ## [Unreleased] — 2026-09-04 comprehensive re-audit & remediation round
 
 Full evidence-based re-verification of all ~100 tracked defects and closure of every
