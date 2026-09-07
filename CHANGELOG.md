@@ -5,6 +5,44 @@ All notable changes to the Game Transport Protocol (GTP-rs) project will be docu
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 2026-09-05 gate G2 + route-selection prototype round
+
+Gate G2 completed and the routing mechanism's measurement→selection spine landed
+per `docs/routing/G2-and-route-proto-design.md` / `G2-and-route-proto-closure.md`.
+**149 → 168 tests green**; parity `07cbc47` on both ends; three live device↔VPS
+probes measured real forward≠reverse separation with a mid-probe loss burst
+recovered live.
+
+### Fixed
+- **RT-2**: the control event queue was unbounded with no runtime consumer
+  (~1.5 MB/hour per active connection from the OwdSample stream alone). Now
+  bounded by `GtpConfig::event_queue_capacity` (default 1024; 0 drops all but
+  still counts) with drop-oldest on overflow, a `total_dropped_events` counter
+  surfaced in `DetailedMetrics`, all internal push sites rewired, and
+  `net-server` draining on a 1 s cadence.
+
+### Added
+- **D-2 / gate G2**: `gtp-sim::FabricRunner` — a full connection pair driven
+  through the multi-link fabric; pinned by connection-driven byte-identical
+  determinism (same seed ⟹ identical event log AND delivered payloads) and
+  directional independence (forward-only impairment visible at the server,
+  invisible at the client, and mirrored).
+- **`gtp-route` crate (pure)**: `PathStats` per-direction model, continuous
+  monotone scoring with documented saturations (B-3 discipline; weights are
+  G3 calibration outputs), sample-count confidence with the never-fast-pick
+  floor (B-9), deterministic explainable selection with reason codes +
+  per-candidate scored records (B-10 slice), single-path health verdict. Loss
+  axis deliberately absent until a real loss metric replaces RT-1's
+  mixed-unit proxy.
+- **Bidirectional measurement exchange**: `gtp-route::MeasurementReport`
+  (`GTPRP1|var|jitter|srtt|samples`, strict parse) rides `ReliableOrdered`
+  app messages (no wire change, ARDP §2.3); `net-server` reports what its
+  receiver measured every second; new `gtp-cli route-probe` runs 60 FPS
+  traffic, prints the combined device↔node table and the **shadow verdict**
+  (computes and records, actuates nothing — INV-15).
+- `gtp::route` facade re-export; runnable `route_selection` example; live
+  e2e `route_probe_e2e` over an in-process endpoint pair.
+
 ## [Unreleased] — 2026-09-05 gate G1: measurement layer activation
 
 Adaptive-routing gate G1 per `docs/ADAPTIVE-ROUTING-DEVELOPMENT-PLAN.md` (v1.1);
