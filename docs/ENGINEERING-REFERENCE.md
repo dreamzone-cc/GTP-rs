@@ -279,6 +279,7 @@ multi-commit change.
 | :--- | :--- |
 | `docs/ENGINEERING-REFERENCE.md` | **this document** — process history + dev guide |
 | `docs/routing/MEASUREMENT-AND-SELECTION-REFERENCE.md` | **primary reference for measurement mechanisms** (estimator math, telemetry surfaces, bidirectional report format, scoring/confidence/selection semantics) + the extension recipe for new measurement patterns + the accomplishment record — the first stop for any telemetry/routing work |
+| `GTP_Protocol_G2_Gap_Analysis_and_Validation_Plan.md` | post-G2 gap analysis & validation plan for the pre-switching safety envelope (Arabic; verified in its Appendix C — baseline claims all confirmed, gaps mapped to ARDP items; adopted as a validation supplement, not a competing gate taxonomy) |
 | `docs/reaudit/Re-Audit-Report-2026-09.md` | as-found re-verification matrix of ~100 tracked defects (all families), evidence per item |
 | `docs/reaudit/Closure-Matrix-2026-09.md` | post-remediation outcomes, master-plan closure table, deferred register, commit record, test-count progression (+ follow-up addendum) |
 | `docs/reaudit/Live-WAN-Verification-Report-2026-09-04.md` | official live-WAN phase report: parity audit, 5 stepped rounds, stress suite, server telemetry, doc-corrections record |
