@@ -71,8 +71,22 @@ Three consecutive identical full-gate runs proved reproducibility.
 | 12 | `ba2a486` | fmt fix for `09f1d8a` (its match arm broke `cargo fmt --check` / CI) |
 | 13 | `83e5e09` | official live-WAN verification report; corrections to the follow-up reports (fabricated commit hash, wrong defect descriptions, loopback-vs-WAN misattribution); closure-matrix addendum; CHANGELOG |
 
-**Current HEAD: `83e5e09` — identical on the local machine and the verification
-VPS** (`92.222.80.200`, synced via git bundles over SSH; no GitHub pushes).
+**Later rounds (2026-09-05):** the adaptive-routing program began executing
+against `docs/ADAPTIVE-ROUTING-DEVELOPMENT-PLAN.md` — gate G1 (measurement
+layer: `timestamp_micros` → `OwdEstimator` → OWD/jitter telemetry, A-6 factor
+wiring, E-1/E-2 hygiene) at `a19bbff`, then a development round closing gate
+G2: RT-2 (bounded event queue + net-server drain), `gtp-sim::FabricRunner`
+(connection-driven determinism + directional independence), the pure
+`gtp-route` crate (scorer/confidence/explainable selection), the
+`MeasurementReport` bidirectional exchange and the `route-probe` CLI shadow
+verdict — **168 tests green, parity `07cbc47`**, with three live device↔VPS
+probes confirming real forward≠reverse separation. First actual switching
+remains gated at G4. Details: `docs/routing/G1-closure-report.md` and
+`docs/routing/G2-and-route-proto-closure.md`.
+
+**Earlier reference point: `83e5e09`** — identical on the local machine and the
+verification VPS (`92.222.80.200`, synced via git bundles over SSH; no GitHub
+pushes) at the time the WAN phase closed.
 
 ## 3. What changed technically (fix-by-fix, with entry points)
 

@@ -60,8 +60,20 @@ onward actually requires, expanded to cover everything the paper asks for.
 > 134 → 149 tests green (three consecutive full-gate runs); deployed to both
 > ends at parity `00eb110`; live WAN round shows non-zero RFC 3550 one-way
 > jitter (267 µs) from real 60 FPS traffic. Evidence:
-> `docs/routing/G1-closure-report.md`. **The project is now at the start of
-> G2.**
+> `docs/routing/G1-closure-report.md`.
+
+> **G2-round update (2026-09-05): gate G2 is complete; route-prototype slices landed.**
+> D-2 closed via `FabricRunner` (connection-driven byte-identical determinism +
+> directional independence, both pinned); RT-2 (unbounded event queue) found
+> and fixed; new pure crate `gtp-route` (B-1 prelude + B-3/B-9/B-10 slices:
+> continuous scorer, confidence, explainable selection, health) plus the
+> bidirectional `MeasurementReport` exchange (ReliableOrdered app messages,
+> §2.3 — no wire change) and the `route-probe` CLI shadow verdict. 149 → 168
+> tests green; parity `07cbc47` on both ends; three live WAN probes measured
+> real forward≠reverse separation (e.g. 1486 vs 892 µs) and a mid-probe loss
+> burst was recovered live. Evidence:
+> `docs/routing/G2-and-route-proto-closure.md`. **The project is at the start
+> of G3.**
 
 ### v1.1 corrections to this plan
 
@@ -401,7 +413,7 @@ material. Principle P5 exists for exactly this.
 | Paper § | Subject | Plan item | State |
 | :-- | :-- | :-- | :-- |
 | 2.2.1 | Smart entry point | C-3 | not started |
-| 2.2.2 | Adaptive routing engine | B-1…B-4 | not started |
+| 2.2.2 | Adaptive routing engine | B-1…B-4 | 🔶 slices: pure scorer/select/confidence/reason-codes landed (G2 round); B-2 shadow engine at G3; B-4 FSM at G4/G5 |
 | 2.2.3 | Advanced telemetry | A-1, A-2, A-4 | ✅ A-1/A-2 done (G1); A-4 at G3 |
 | 3.1.1 | Delivery semantics | — | ✅ already built |
 | 3.1.2 | CUBIC integration | — | ✅ built; §3.5 corrects the example API |
@@ -416,7 +428,7 @@ material. Principle P5 exists for exactly this.
 | 5.2 | MTU optimization | B-7 | overhead model corrected — §3.6 |
 | 5.3.1 | Gaming-tuned CUBIC | — | partly present (`competitive_fps` profile); revisit after G6 |
 | 5.3.2 | Multipath CC | — | ❌ **out of scope** — §3.4 |
-| 6.1–6.3 | Test strategy | D-1…D-3 | §3.5 corrects the test API |
+| 6.1–6.3 | Test strategy | D-1…D-3 | ✅ D-1 done (G1); D-2 done (G2 round — FabricRunner, connection-driven determinism + directional independence pinned); D-3 baseline rounds ongoing; §3.5 corrects the test API |
 | 7.2 | Cost and ROI | — | business track, out of engineering scope |
 | 9.1 | Roadmap | §6 | superseded by the gate model |
 | Paper 2 §15 | Confidence scoring | B-9 | adopted (v1.1) |
