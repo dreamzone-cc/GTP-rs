@@ -62,6 +62,18 @@ onward actually requires, expanded to cover everything the paper asks for.
 > jitter (267 µs) from real 60 FPS traffic. Evidence:
 > `docs/routing/G1-closure-report.md`.
 
+> **G3-prelude update (2026-09-07): the gap paper's first P0 slice landed.**
+> Per the verified gap paper (`GTP_Protocol_G2_Gap_Analysis_and_Validation_Plan.md`,
+> Appendix C) and its round design note: RT-3 freshness closed (GTPRP2
+> evidence age + `since_last_rx` + `STALE_EVIDENCE_HOLD` — B-9's recency
+> factor is now enforced), the structured decision log (§17/B-10 record +
+> B-13 observability KPIs, `GTPDL1` replayable lines) and the adversarial
+> suite S01–S12 landed (S07 gated on the loss axis). 168 → 187 tests green
+> (×3); live route-probe now shows the freshness line on the real WAN.
+> Evidence: `docs/routing/G3-prelude-closure.md`. Remaining G3 core: B-2
+> shadow engine + measurement-connection plane, full B-9/B-10 wiring into
+> the 1 Hz poll loop, A-4, A-7, and the 24-hour dataset.
+
 > **G2-round update (2026-09-05): gate G2 is complete; route-prototype slices landed.**
 > D-2 closed via `FabricRunner` (connection-driven byte-identical determinism +
 > directional independence, both pinned); RT-2 (unbounded event queue) found
@@ -431,8 +443,8 @@ material. Principle P5 exists for exactly this.
 | 6.1–6.3 | Test strategy | D-1…D-3 | ✅ D-1 done (G1); D-2 done (G2 round — FabricRunner, connection-driven determinism + directional independence pinned); D-3 baseline rounds ongoing; §3.5 corrects the test API |
 | 7.2 | Cost and ROI | — | business track, out of engineering scope |
 | 9.1 | Roadmap | §6 | superseded by the gate model |
-| Paper 2 §15 | Confidence scoring | B-9 | adopted (v1.1) |
-| Paper 2 §16, §41 | Explainable decision log | B-10 | adopted (v1.1) |
+| Paper 2 §15 | Confidence scoring | B-9 | 🔶 count factor + RT-3 recency factor live (G3 prelude); full wiring into the poll loop at G3 |
+| Paper 2 §16, §41 | Explainable decision log | B-10 | 🔶 record + tracker live (`GTPDL1`, S05/S11 pinned); engine-loop emission at G3 |
 | Paper 2 §9.2, §77 | Path lifecycle / recovery window | B-11 | adopted (v1.1) |
 | Paper 2 §65 | Per-feature kill switches | B-12 | adopted (v1.1) |
 | Paper 2 §52 | Switch-quality KPIs | B-13 | adopted (v1.1) |

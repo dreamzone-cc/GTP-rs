@@ -5,6 +5,20 @@ All notable changes to the Game Transport Protocol (GTP-rs) project will be docu
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 2026-09-07 G3 prelude: report freshness, structured decision log, adversarial suite
+
+First executable slice of the post-G2 gap paper (its P0 items, per
+`docs/routing/G3-prelude-freshness-design.md` / `G3-prelude-closure.md`).
+**168 → 187 tests green** (three consecutive full-gate runs).
+
+### Fixed
+- **RT-3**: cross-endpoint reports carried no evidence age — stale reports were undetectable, so a path nobody had heard from could win on old numbers. Now: `ConnectionHot::last_rx_time` (post-auth only, INV-3) surfaces as `DetailedMetrics::since_last_rx`; `MeasurementReport` v2 (`GTPRP2|var|jitter|srtt|samples|since_last_rx`, v1 still parses with unknown age) carries the forward evidence age; `PathStats` carries both directions' ages with the staler one governing; `freshness()` (1 s grace → 0 at 5 s, unknown = neutral) multiplies into the selection key; a best candidate below the freshness floor holds with the new reason code `STALE_EVIDENCE_HOLD`.
+
+### Added
+- **Structured decision logging (§17 / B-10 / B-13 observability)**: `DecisionRecord`/`DecisionTracker` — every decision including shadow holds becomes a strict-parse `GTPDL1|…` line with the full §17 field set, per-candidate scored entries, previous/selected paths, policy class; bounded ring with a dropped-records counter; switch/revert/dwell KPIs (revert = a switch straight back to the prior-prior path).
+- **Adversarial suite S01–S12** (gap paper §27): `gtp-route/tests/adversarial_suite.rs` — pure-selector properties (S01–S06, S11: stable winner, near-tie determinism with the G4 HOLD mapping recorded, confidence floor, stale rejection, exact flap record accounting, directional axis flagging, delayed/duplicate-report inertness) plus measurement-level `SimulationRunner` scenarios (S08 transient spike — RFC 3550 EWMA tail decays to the clean neighbourhood; S09 sustained degradation detectable within 0.5 s; S10 recovery); S07 (burst loss) is the standing loss-axis placeholder (RT-1/E-5); S12 cross-checks the RT-2 bound across capacities.
+- `route-probe` prints the per-direction evidence freshness and a freshness column in the verdict; e2e asserts continuous traffic keeps the basis < 1 s.
+
 ## [Unreleased] — 2026-09-05 gate G2 + route-selection prototype round
 
 Gate G2 completed and the routing mechanism's measurement→selection spine landed

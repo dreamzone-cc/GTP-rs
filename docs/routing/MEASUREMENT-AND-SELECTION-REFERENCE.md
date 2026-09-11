@@ -126,9 +126,12 @@ Properties (each pinned by a named test in `owd.rs`):
 `gtp-route/src/report.rs`. ARDP §2.3: genuinely-missing coordination rides as
 `ReliableOrdered` application messages — **zero wire change**.
 
-- Wire form (ASCII, one line): `GTPRP1|var|jitter|srtt|samples` where `-` =
-  not-yet-measured. Prefix-strict parse; malformed numbers reject the whole
-  line (`malformed_reports_are_rejected_whole`).
+- Wire form (ASCII, one line): **v2** `GTPRP2|var|jitter|srtt|samples|since_last_rx`
+  (RT-3: the reporter's µs since its last authenticated receive — the evidence
+  age in its own clock); legacy **v1** `GTPRP1|var|jitter|srtt|samples` still
+  parses with the age reading `None` (unknown — never zero, never invented).
+  `-` = not-yet-measured. Prefix-strict parse; malformed numbers reject the
+  whole line (`malformed_reports_are_rejected_whole`).
 - Group id: `REPORT_GROUP_ID = 0x5250` (chosen to not collide with app
   groups; pick a fresh one for any future message family).
 - Sender = whichever endpoint is reporting **its receiver's** aggregates (the
@@ -176,17 +179,27 @@ Pinning: `normalization_is_exact_at_boundaries`,
 
 ## 4. Confidence, selection, health
 
-### 4.1 Confidence (B-9)
+### 4.1 Confidence & freshness (B-9)
 `confidence(sample_count) = min(samples / CONFIDENCE_FULL_SAMPLES, 1.0)`,
-`CONFIDENCE_FULL_SAMPLES = 30`. Applied **multiplicatively**: the selection
-key is `effective = score × confidence`. Floor: `CONFIDENCE_FLOOR = 0.5` — a
-best candidate below the floor is **confirmable but never fast-picked**
-(`ConfidenceFloorHold`, no winner declared).
+`CONFIDENCE_FULL_SAMPLES = 30`. Floor: `CONFIDENCE_FLOOR = 0.5` — a best
+candidate below the floor is **confirmable but never fast-picked**
+(`CONFIDENCE_FLOOR_HOLD`, no winner declared).
+
+**RT-3 freshness:** `freshness(age)` — 1.0 within `FRESHNESS_GRACE_US =
+1 s` (one report-interval of carry-over is free), linear decay to 0 at
+`FRESHNESS_SATURATION_US = 5 s`. The comparison key is
+`effective = score × confidence × freshness`. The path's evidence age is
+the **staler** of the two directions (`PathStats::path_age()`). Unknown age
+(legacy v1 report) is **neutral 1.0 and surfaced as unknown** — freshness is
+enforced on carried ages, never invented. A best candidate whose freshness
+falls below the floor holds with `STALE_EVIDENCE_HOLD` (no winner): stale
+excellence never beats live honesty (S04).
 
 ### 4.2 Selection (B-10 slice) — `select(&[PathStats]) -> Selection`
 Rules in order: empty → `NO_CANDIDATES`; best has no data →
-`INSUFFICIENT_DATA`; best below confidence floor → `CONFIDENCE_FLOOR_HOLD`
-(no winner); single usable → `SINGLE_CANDIDATE`; margin
+`INSUFFICIENT_DATA`; best below confidence floor → `CONFIDENCE_FLOOR_HOLD`;
+best's CARRIED age below the freshness floor → `STALE_EVIDENCE_HOLD` (all
+three: no winner); single usable → `SINGLE_CANDIDATE`; margin
 `(best_eff − runner_eff)/best_eff ≥ CLEAR_WINNER_MARGIN = 0.05` →
 `CLEAR_WINNER`; else deterministic `TIE_BREAK_LOWER_ID`. Output carries the
 chosen id, runner-up, and a per-candidate scored record (score, confidence,
