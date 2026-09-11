@@ -40,6 +40,8 @@ async fn bidirectional_report_exchange_produces_a_shadow_verdict() {
                         srtt_us: Some(m.smoothed_rtt.as_micros() as u32),
                         // Per-packet basis, matching the CLI contract.
                         samples: m.total_rx_packets.min(u32::MAX as u64) as u32,
+                        // RT-3: forward evidence age (GTPRP2).
+                        since_last_rx_us: m.since_last_rx.map(|d| d.as_micros()),
                     };
                     let _ = conn
                         .send_reliable_ordered(
@@ -105,6 +107,17 @@ async fn bidirectional_report_exchange_produces_a_shadow_verdict() {
     let report = latest.expect("at least one parsed report");
     // Loopback: the server measured a real (tiny) forward direction.
     assert!(report.srtt_us.is_some(), "server RTT present");
+    // RT-3: the v2 report carries the forward evidence age — under
+    // continuous 60 FPS traffic it must be small and present.
+    assert!(
+        report.since_last_rx_us.is_some(),
+        "GTPRP2 reports must carry the evidence age"
+    );
+    assert!(
+        report.since_last_rx_us.unwrap() < 1_000_000,
+        "continuous traffic keeps the basis fresh (< 1 s), got {:?}",
+        report.since_last_rx_us
+    );
 
     // Merge into the bidirectional picture and produce the shadow verdict.
     let m = conn.query_metrics().await;
@@ -114,9 +127,12 @@ async fn bidirectional_report_exchange_produces_a_shadow_verdict() {
         rev_jitter_us: m.jitter.map(|d| d.as_micros() as u32),
         rtt_us: Some(m.smoothed_rtt.as_micros() as u32),
         sample_count: frames.max(1),
+        rev_age_us: m.since_last_rx.map(|d| d.as_micros()),
         ..Default::default()
     };
     let stats = report.into_path_stats(0, &local_stats);
+    // The merged picture now carries BOTH evidence ages.
+    assert!(stats.fwd_age_us.is_some() && stats.rev_age_us.is_some());
     let selection = gtp::route::select(&[stats]);
     let health = gtp::route::health(&stats);
 

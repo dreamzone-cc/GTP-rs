@@ -62,6 +62,9 @@ fn main() {
         rev_jitter_us: client_metrics.jitter.map(|d| d.as_micros() as u32),
         rtt_us: Some(client_metrics.smoothed_rtt.as_micros() as u32),
         sample_count: samples,
+        // Freshness: the loop just ran — both bases are as fresh as can be.
+        fwd_age_us: server_metrics.since_last_rx.map(|d| d.as_micros()),
+        rev_age_us: client_metrics.since_last_rx.map(|d| d.as_micros()),
     };
 
     let selection = select(&[stats]);

@@ -183,6 +183,7 @@ impl<'a> ConnectionControl<'a> {
             // RE-1 (G1): one-way delay telemetry from the wire timestamp.
             owd_var: self.hot.owd.owd_var(),
             jitter: self.hot.owd.jitter(),
+            since_last_rx: self.hot.last_rx_time.map(|t| now - t),
 
             cwnd_bytes: gtp_cc::CongestionController::cwnd(&self.hot.cc),
             // FR-3: single source of truth for in-flight bytes is the loss detector.

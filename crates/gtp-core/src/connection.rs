@@ -437,6 +437,9 @@ impl GtpConnection {
                 }
                 // R-6: age the post-ratchet grace window on the receive path too.
                 self.hot.tick_rx_key_grace();
+                // RT-3: the measurement basis ages with the last authenticated
+                // receive — INV-3: post-auth only, never moved by junk traffic.
+                self.hot.last_rx_time = Some(now);
                 // RE-1 (G1): consume the authenticated header timestamp. The
                 // field has been on the wire, inside the AAD, since 0.1.0 with
                 // no reader on RX until now (X-4 / INV-18). Runs only here —
@@ -3720,5 +3723,57 @@ mod tests {
         });
         assert!(conn.event_queue.is_empty());
         assert_eq!(conn.cold.total_dropped_events, 1);
+    }
+
+    /// RT-3: `since_last_rx` is the measurement-basis age in this endpoint's
+    /// own clock — moved ONLY by authenticated traffic (INV-3), and unknown
+    /// (None, never zero) before the first authenticated packet.
+    #[test]
+    fn since_last_rx_tracks_only_authenticated_traffic() {
+        let cid = ConnectionId(0x2A13_0000_0000_0003);
+        let (mut client, mut server) = loopback_pair(cid);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let t0 = MonotonicTime::from_micros(30_000_000);
+        let mut buf = [0u8; 1500];
+
+        // No traffic yet: the basis age is unknown, not zero.
+        assert!(server.control().query_metrics(t0).since_last_rx.is_none());
+
+        client
+            .send_unreliable(vec![0x62u8; 32], PriorityTier::P1Input, None, t0)
+            .unwrap();
+        let (_, len) = client
+            .produce_outgoing_datagram(t0, &mut buf)
+            .unwrap()
+            .unwrap();
+
+        // Tampered datagram: must NOT move the basis clock (INV-3).
+        let mut tampered = buf;
+        tampered[len - 1] ^= 0xFF;
+        assert!(server
+            .handle_incoming_datagram(client_addr, &mut tampered[..len], t0)
+            .is_err());
+        assert!(
+            server.control().query_metrics(t0).since_last_rx.is_none(),
+            "unauthenticated traffic must never reset the basis age (INV-3)"
+        );
+
+        // Pristine datagram authenticates at t1: the basis age reads zero.
+        let t1 = t0 + Duration::from_millis(5);
+        let mut pristine = buf;
+        server
+            .handle_incoming_datagram(client_addr, &mut pristine[..len], t1)
+            .unwrap();
+        assert_eq!(
+            server.control().query_metrics(t1).since_last_rx,
+            Some(Duration::from_micros(0))
+        );
+
+        // Time passes with no traffic: the basis ages in the local clock.
+        let t2 = t1 + Duration::from_millis(2_000);
+        assert_eq!(
+            server.control().query_metrics(t2).since_last_rx,
+            Some(Duration::from_millis(2_000))
+        );
     }
 }

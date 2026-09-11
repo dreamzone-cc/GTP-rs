@@ -29,6 +29,15 @@ pub const CONFIDENCE_FULL_SAMPLES: f64 = 30.0;
 /// (B-9).
 pub const CONFIDENCE_FLOOR: f64 = 0.5;
 
+/// RT-3 / B-9 recency: evidence at most this old is fully fresh. One report
+/// interval of carry-over is normal (the CLI reports at 1 s), so the grace
+/// covers it without penalty.
+pub const FRESHNESS_GRACE_US: u64 = 1_000_000;
+/// RT-3 / B-9 recency: evidence at or beyond this age contributes nothing
+/// (`freshness() == 0.0`) — a path nobody has heard from for 5 s must not be
+/// trusted over a measured live one.
+pub const FRESHNESS_SATURATION_US: u64 = 5_000_000;
+
 /// Linear lower-is-better normalization onto `[0, 1]` with the documented
 /// saturation point. Monotone non-increasing; exact at the boundaries.
 pub fn normalize_lower_better(value: u32, saturation: u32) -> f64 {
@@ -92,6 +101,23 @@ pub fn confidence(sample_count: u32) -> f64 {
     (sample_count as f64 / CONFIDENCE_FULL_SAMPLES).min(1.0)
 }
 
+/// RT-3 / B-9 recency factor in `[0, 1]`. Within the grace window evidence
+/// is fully fresh; beyond it the factor decays linearly to zero at the
+/// saturation age. `None` (unknown age — e.g. a legacy GTPRP1 report) is
+/// **neutral 1.0, surfaced as unknown in the decision record**: freshness
+/// enforcement is applied to the ages the endpoints carry, never invented.
+pub fn freshness(age_us: Option<u64>) -> f64 {
+    let Some(age) = age_us else {
+        return 1.0;
+    };
+    if age <= FRESHNESS_GRACE_US {
+        1.0
+    } else {
+        let span = (FRESHNESS_SATURATION_US - FRESHNESS_GRACE_US) as f64;
+        ((FRESHNESS_SATURATION_US as f64 - age as f64) / span).max(0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,7 +168,7 @@ mod tests {
 
     #[test]
     fn score_is_monotone_in_every_axis() {
-        let base = PathStats::full(0, 10_000, 2_000, 10_000, 2_000, 40_000, 30);
+        let base = PathStats::full(0, 10_000, 2_000, 10_000, 2_000, 40_000, 30, 0, 0);
         let s0 = score(&base).unwrap();
         for worse in [
             PathStats {
@@ -180,5 +206,30 @@ mod tests {
         assert_eq!(confidence(15), 0.5);
         assert_eq!(confidence(30), 1.0);
         assert_eq!(confidence(30_000), 1.0);
+    }
+
+    #[test]
+    fn freshness_grace_then_linear_decay_to_zero() {
+        assert_eq!(freshness(None), 1.0, "unknown age is neutral, not punished");
+        assert_eq!(freshness(Some(0)), 1.0);
+        assert_eq!(
+            freshness(Some(FRESHNESS_GRACE_US)),
+            1.0,
+            "grace window is free"
+        );
+        // Midway between grace (1 s) and saturation (5 s): factor 0.5.
+        let mid = (FRESHNESS_GRACE_US + FRESHNESS_SATURATION_US) / 2; // 3 s
+        assert_eq!(freshness(Some(mid)), 0.5);
+        assert_eq!(freshness(Some(FRESHNESS_SATURATION_US)), 0.0);
+        assert_eq!(freshness(Some(60_000_000)), 0.0, "clamped at zero");
+        // Monotone non-increasing across the whole domain.
+        let mut prev = 1.0;
+        for age in [
+            0u64, 500_000, 1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000, 9_000_000,
+        ] {
+            let f = freshness(Some(age));
+            assert!(f <= prev, "freshness must be non-increasing (age {age})");
+            prev = f;
+        }
     }
 }

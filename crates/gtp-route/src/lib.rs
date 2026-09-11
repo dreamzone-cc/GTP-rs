@@ -30,12 +30,14 @@
 //! INV-11 discipline: a [`PathStats`] describes exactly one measured path in
 //! one epoch; comparing stats from different scopes is the caller's bug.
 
+pub mod decision_log;
 pub mod report;
 pub mod score;
 pub mod select;
 
+pub use decision_log::{DecisionRecord, DecisionTracker, PolicyClass, DECISION_LOG_PREFIX};
 pub use report::{MeasurementReport, REPORT_GROUP_ID, REPORT_PREFIX};
-pub use score::{confidence, score};
+pub use score::{confidence, freshness, score};
 pub use select::{health, select, HealthVerdict, Selection, SelectionReason};
 
 /// One candidate path's measurements, both directions, one epoch.
@@ -67,10 +69,19 @@ pub struct PathStats {
     /// Measurement basis size (received samples behind these aggregates).
     /// Feeds [`confidence`]; 0 reads as "no basis" (B-9).
     pub sample_count: u32,
+    /// RT-3: age of the FORWARD evidence — µs since the far endpoint last
+    /// received authenticated traffic (its own clock, from GTPRP2). `None`
+    /// = not carried (e.g. a legacy GTPRP1 report): unknown, not fresh.
+    pub fwd_age_us: Option<u64>,
+    /// RT-3: age of the REVERSE evidence — µs since this endpoint last
+    /// received authenticated traffic. `None` = unknown.
+    pub rev_age_us: Option<u64>,
 }
 
 impl PathStats {
-    /// A stats record with every axis present — test/tooling convenience.
+    /// A stats record with every axis present, both ages explicit —
+    /// test/tooling convenience.
+    #[allow(clippy::too_many_arguments)] // fixture helper: every axis, explicit
     pub fn full(
         path_id: u32,
         fwd_owd_var_us: u32,
@@ -79,6 +90,8 @@ impl PathStats {
         rev_jitter_us: u32,
         rtt_us: u32,
         sample_count: u32,
+        fwd_age_us: u64,
+        rev_age_us: u64,
     ) -> Self {
         Self {
             path_id,
@@ -88,6 +101,19 @@ impl PathStats {
             rev_jitter_us: Some(rev_jitter_us),
             rtt_us: Some(rtt_us),
             sample_count,
+            fwd_age_us: Some(fwd_age_us),
+            rev_age_us: Some(rev_age_us),
+        }
+    }
+
+    /// RT-3: the path's evidence age — the STALER direction governs (either
+    /// side's old evidence ages the whole bidirectional picture). `None`
+    /// only when neither direction carries an age (unknown freshness).
+    pub fn path_age(&self) -> Option<u64> {
+        match (self.fwd_age_us, self.rev_age_us) {
+            (Some(f), Some(r)) => Some(f.max(r)),
+            (Some(f), None) | (None, Some(f)) => Some(f),
+            (None, None) => None,
         }
     }
 }

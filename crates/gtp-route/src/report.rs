@@ -7,8 +7,12 @@
 
 use crate::PathStats;
 
-/// Line prefix identifying the report format (version 1).
-pub const REPORT_PREFIX: &str = "GTPRP1";
+/// Line prefix identifying the current report format (version 2 — adds the
+/// measurement-basis age, RT-3).
+pub const REPORT_PREFIX: &str = "GTPRP2";
+/// Legacy v1 prefix (no age field) — still parsed for compatibility; its
+/// age reads as unknown (`None`).
+pub const REPORT_PREFIX_V1: &str = "GTPRP1";
 
 /// The wire group id used by the CLI exchange for reports.
 pub const REPORT_GROUP_ID: u16 = 0x5250;
@@ -27,6 +31,10 @@ pub struct MeasurementReport {
     /// sample count (the rate-limited OwdSample event stream is telemetry,
     /// not the basis).
     pub samples: u32,
+    /// RT-3: µs since the reporter's last authenticated receive (its own
+    /// clock — `DetailedMetrics::since_last_rx`). `None` on v1 reports:
+    /// unknown freshness, never zero.
+    pub since_last_rx_us: Option<u64>,
 }
 
 fn field(v: Option<u32>) -> String {
@@ -36,23 +44,46 @@ fn field(v: Option<u32>) -> String {
     }
 }
 
+fn field_u64(v: Option<u64>) -> String {
+    match v {
+        Some(v) => v.to_string(),
+        None => "-".to_string(),
+    }
+}
+
 impl MeasurementReport {
-    /// Encode as `GTPRP1|var|jitter|srtt|samples` (`-` = not yet measured).
+    /// Encode as `GTPRP2|var|jitter|srtt|samples|since_last_rx`
+    /// (`-` = not yet measured / not carried).
     pub fn encode(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             REPORT_PREFIX,
             field(self.owd_var_us),
             field(self.jitter_us),
             field(self.srtt_us),
-            self.samples
+            self.samples,
+            field_u64(self.since_last_rx_us)
         )
     }
 
-    /// Strict parse: wrong prefix, wrong arity, or a malformed number yields
-    /// `None` — a report that cannot be trusted is not half-accepted.
+    /// Strict parse of both versions: wrong prefix, wrong arity, or a
+    /// malformed number yields `None` — a report that cannot be trusted is
+    /// not half-accepted. v1 lines parse with `since_last_rx_us: None`
+    /// (unknown freshness, per the RT-3 semantics).
     pub fn parse(line: &str) -> Option<Self> {
-        let rest = line.strip_prefix(REPORT_PREFIX)?.strip_prefix('|')?;
+        let (version, rest) = if let Some(r) = line
+            .strip_prefix(REPORT_PREFIX)
+            .and_then(|r| r.strip_prefix('|'))
+        {
+            (2, r)
+        } else if let Some(r) = line
+            .strip_prefix(REPORT_PREFIX_V1)
+            .and_then(|r| r.strip_prefix('|'))
+        {
+            (1, r)
+        } else {
+            return None;
+        };
         let mut parts = rest.split('|');
         let next = |parts: &mut std::str::Split<'_, char>| -> Option<Option<u32>> {
             match parts.next()? {
@@ -66,6 +97,17 @@ impl MeasurementReport {
         let jitter_us = next(&mut parts)?;
         let srtt_us = next(&mut parts)?;
         let samples = parts.next()?.parse::<u32>().ok()?;
+        let since_last_rx_us = match version {
+            2 => {
+                let raw = parts.next()?;
+                if raw == "-" {
+                    None
+                } else {
+                    Some(raw.parse::<u64>().ok()?)
+                }
+            }
+            _ => None, // v1: no age field carried
+        };
         if parts.next().is_some() {
             return None; // trailing fields: not our format
         }
@@ -74,6 +116,7 @@ impl MeasurementReport {
             jitter_us,
             srtt_us,
             samples,
+            since_last_rx_us,
         })
     }
 
@@ -82,7 +125,9 @@ impl MeasurementReport {
     /// one [`PathStats`] — the bidirectional picture neither side holds
     /// alone. `path_id` is assigned by the caller. The merged basis is the
     /// smaller of the two per-packet counts (both sides are per-packet
-    /// units; never mix in the rate-limited event stream).
+    /// units; never mix in the rate-limited event stream). RT-3: the report
+    /// carries the FORWARD evidence age (its `since_last_rx`); the local
+    /// side supplies the REVERSE age.
     pub fn into_path_stats(self, path_id: u32, rev: &PathStats) -> PathStats {
         PathStats {
             path_id,
@@ -93,6 +138,8 @@ impl MeasurementReport {
             // RTT from either end is the same quantity; prefer the local one.
             rtt_us: rev.rtt_us.or(self.srtt_us),
             sample_count: self.samples.min(rev.sample_count.max(1)),
+            fwd_age_us: self.since_last_rx_us,
+            rev_age_us: rev.rev_age_us,
         }
     }
 }
@@ -108,14 +155,28 @@ mod tests {
             jitter_us: Some(537),
             srtt_us: Some(51_379),
             samples: 812,
+            since_last_rx_us: Some(1_240),
         };
-        assert_eq!(r.encode(), "GTPRP1|4032|537|51379|812");
+        assert_eq!(r.encode(), "GTPRP2|4032|537|51379|812|1240");
         assert_eq!(MeasurementReport::parse(&r.encode()), Some(r));
 
-        // Pre-measurement report: every axis absent, basis zero.
+        // Pre-measurement report: every axis absent, basis zero, age absent.
         let empty = MeasurementReport::default();
-        assert_eq!(empty.encode(), "GTPRP1|-|-|-|0");
+        assert_eq!(empty.encode(), "GTPRP2|-|-|-|0|-");
         assert_eq!(MeasurementReport::parse(&empty.encode()), Some(empty));
+    }
+
+    #[test]
+    fn v1_reports_parse_with_unknown_age() {
+        // Legacy format: four payload fields, no age — parses, age reads
+        // unknown (None), never zero and never invented.
+        let parsed = MeasurementReport::parse("GTPRP1|100|50|50000|64").unwrap();
+        assert_eq!(parsed.owd_var_us, Some(100));
+        assert_eq!(parsed.samples, 64);
+        assert_eq!(parsed.since_last_rx_us, None, "v1 carries no age");
+
+        // And v1 arity is still strict: a five-field v1 line is rejected.
+        assert_eq!(MeasurementReport::parse("GTPRP1|1|2|3|4|5"), None);
     }
 
     #[test]
@@ -156,6 +217,7 @@ mod tests {
             jitter_us: Some(400),
             srtt_us: Some(50_000),
             samples: 100,
+            since_last_rx_us: Some(700),
         };
         let local = PathStats {
             rev_owd_var_us: Some(1_500),
@@ -169,5 +231,21 @@ mod tests {
         assert_eq!(stats.rev_jitter_us, Some(300));
         assert_eq!(stats.rtt_us, Some(49_000), "local RTT wins when present");
         assert_eq!(stats.sample_count, 90, "conservative basis: smaller side");
+        assert_eq!(
+            stats.fwd_age_us,
+            Some(700),
+            "report carries the forward age"
+        );
+        assert_eq!(
+            stats.path_age(),
+            Some(700),
+            "known age governs over unknown"
+        );
+        let both = PathStats {
+            fwd_age_us: Some(700),
+            rev_age_us: Some(3_000),
+            ..stats
+        };
+        assert_eq!(both.path_age(), Some(3_000), "the staler direction governs");
     }
 }

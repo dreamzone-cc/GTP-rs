@@ -5,7 +5,7 @@
 //! anything — executing a choice is the (future) adapter's job; today the
 //! honest execution is "print it" (shadow discipline, INV-15).
 
-use crate::score::{confidence, score, CONFIDENCE_FLOOR};
+use crate::score::{confidence, freshness, score, CONFIDENCE_FLOOR};
 use crate::PathStats;
 
 /// Relative effective-score margin below which the top two are treated as a
@@ -22,6 +22,10 @@ pub enum SelectionReason {
     /// Every candidate sits below [`CONFIDENCE_FLOOR`] (B-9): confirmable,
     /// never fast-pickable. No winner is declared.
     ConfidenceFloorHold,
+    /// RT-3 / S04: the best candidate's EVIDENCE is stale — its freshness
+    /// factor fell below [`CONFIDENCE_FLOOR`]. No winner is declared: a
+    /// path nobody has heard from must never win on old numbers.
+    StaleEvidenceHold,
     /// Exactly one candidate with usable data — trivially selected.
     SingleCandidate,
     /// The winner cleared [`CLEAR_WINNER_MARGIN`] over the runner-up.
@@ -37,22 +41,42 @@ impl SelectionReason {
             SelectionReason::NoCandidates => "NO_CANDIDATES",
             SelectionReason::InsufficientData => "INSUFFICIENT_DATA",
             SelectionReason::ConfidenceFloorHold => "CONFIDENCE_FLOOR_HOLD",
+            SelectionReason::StaleEvidenceHold => "STALE_EVIDENCE_HOLD",
             SelectionReason::SingleCandidate => "SINGLE_CANDIDATE",
             SelectionReason::ClearWinner => "CLEAR_WINNER",
             SelectionReason::TieBreakLowerId => "TIE_BREAK_LOWER_ID",
         }
     }
+
+    /// Inverse of [`SelectionReason::code`] for decision-log parsing.
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "NO_CANDIDATES" => Some(SelectionReason::NoCandidates),
+            "INSUFFICIENT_DATA" => Some(SelectionReason::InsufficientData),
+            "CONFIDENCE_FLOOR_HOLD" => Some(SelectionReason::ConfidenceFloorHold),
+            "STALE_EVIDENCE_HOLD" => Some(SelectionReason::StaleEvidenceHold),
+            "SINGLE_CANDIDATE" => Some(SelectionReason::SingleCandidate),
+            "CLEAR_WINNER" => Some(SelectionReason::ClearWinner),
+            "TIE_BREAK_LOWER_ID" => Some(SelectionReason::TieBreakLowerId),
+            _ => None,
+        }
+    }
 }
 
 /// One candidate's scored record — the structured per-decision entry (B-10).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScoredCandidate {
     pub path_id: u32,
     /// Raw continuous score, `None` when no axis was measured.
     pub score: Option<f64>,
-    /// B-9 confidence in `[0, 1]`.
+    /// B-9 sample-count confidence in `[0, 1]`.
     pub confidence: f64,
-    /// `score * confidence`, the comparison key.
+    /// RT-3 evidence freshness in `[0, 1]`; 1.0 also when the age is
+    /// unknown (a legacy report is neutral, surfaced as unknown).
+    pub freshness: f64,
+    /// `None` when the evidence age was not carried (unknown freshness).
+    pub age_us: Option<u64>,
+    /// `score * confidence * freshness`, the comparison key.
     pub effective: Option<f64>,
 }
 
@@ -87,11 +111,15 @@ fn rank(candidates: &[PathStats]) -> Vec<ScoredCandidate> {
         .map(|c| {
             let s = score(c);
             let conf = confidence(c.sample_count);
+            let age = c.path_age();
+            let fresh = freshness(age);
             ScoredCandidate {
                 path_id: c.path_id,
                 score: s,
                 confidence: conf,
-                effective: s.map(|v| v * conf),
+                freshness: fresh,
+                age_us: age,
+                effective: s.map(|v| v * conf * fresh),
             }
         })
         .collect();
@@ -138,6 +166,12 @@ pub fn select(candidates: &[PathStats]) -> Selection {
         selection.reason = SelectionReason::ConfidenceFloorHold;
         return selection;
     }
+    // RT-3 / S04: enforce staleness BEFORE declaring any winner — but only
+    // when an age was actually carried (unknown age stays neutral).
+    if best.age_us.is_some() && best.freshness < CONFIDENCE_FLOOR {
+        selection.reason = SelectionReason::StaleEvidenceHold;
+        return selection;
+    }
 
     let usable: Vec<&ScoredCandidate> = selection
         .scored
@@ -169,6 +203,27 @@ pub fn select(candidates: &[PathStats]) -> Selection {
         selection.reason = SelectionReason::TieBreakLowerId;
     }
     selection
+}
+
+impl Selection {
+    /// Build the structured [`crate::DecisionRecord`] for this decision —
+    /// the §17 log entry, pure and side-effect-free (the caller owns
+    /// storing it, e.g. via [`crate::DecisionTracker`]).
+    pub fn record(
+        &self,
+        decision_id: u64,
+        connection_id: u64,
+        policy_class: crate::decision_log::PolicyClass,
+        window_us: Option<u64>,
+    ) -> crate::decision_log::DecisionRecord {
+        crate::decision_log::DecisionRecord::from_selection(
+            decision_id,
+            connection_id,
+            policy_class,
+            window_us,
+            self,
+        )
+    }
 }
 
 /// Single-path health verdict for probe tooling (no comparison involved).
@@ -236,7 +291,7 @@ mod tests {
     use super::*;
 
     fn clean(id: u32) -> PathStats {
-        PathStats::full(id, 1_000, 300, 1_000, 300, 30_000, 60)
+        PathStats::full(id, 1_000, 300, 1_000, 300, 30_000, 60, 0, 0)
     }
 
     #[test]
@@ -255,7 +310,7 @@ mod tests {
     fn confidence_floor_holds_without_a_winner() {
         // Excellent numbers but only 5 samples, and no confident competitor:
         // B-9 forbids declaring the fast pick even for the sole candidate.
-        let thin = PathStats::full(1, 100, 100, 100, 100, 10_000, 5);
+        let thin = PathStats::full(1, 100, 100, 100, 100, 10_000, 5, 0, 0);
         let s = select(&[thin]);
         assert_eq!(s.reason, SelectionReason::ConfidenceFloorHold);
         assert_eq!(
@@ -287,7 +342,7 @@ mod tests {
 
     #[test]
     fn clear_winner_beats_a_degraded_candidate() {
-        let degraded = PathStats::full(2, 45_000, 18_000, 40_000, 16_000, 250_000, 60);
+        let degraded = PathStats::full(2, 45_000, 18_000, 40_000, 16_000, 250_000, 60, 0, 0);
         // Higher id on the good path: winning must be by score, not order/id.
         let s = select(&[degraded, clean(7)]);
         assert_eq!(s.chosen, Some(7));
@@ -303,6 +358,42 @@ mod tests {
         assert_eq!(s.reason, SelectionReason::TieBreakLowerId);
         assert_eq!(s.chosen, Some(4), "deterministic lower-id tie-break");
         assert_eq!(s.runner_up, Some(9));
+    }
+
+    /// RT-3 / S04: stale evidence must never win. A path with excellent
+    /// numbers but an old basis (4 s age ⇒ freshness 0.25) holds with
+    /// STALE_EVIDENCE_HOLD; a live competitor with worse numbers wins.
+    #[test]
+    fn stale_evidence_holds_and_a_live_competitor_wins() {
+        let stale = PathStats::full(1, 100, 100, 100, 100, 10_000, 60, 4_000_000, 0);
+        // Sanity: the stale path's raw numbers are excellent.
+        assert!(score(&stale).unwrap() > 0.9);
+
+        // Alone: excellent but stale ⇒ HOLD, no winner.
+        let s = select(&[stale]);
+        assert_eq!(s.reason, SelectionReason::StaleEvidenceHold);
+        assert_eq!(s.chosen, None);
+        assert_eq!(s.summary(), "HOLD (STALE_EVIDENCE_HOLD)");
+
+        // Against a live competitor with strictly WORSE numbers: the live
+        // one wins — freshness ordering reflects evidence trustworthiness.
+        let live = PathStats::full(2, 8_000, 3_000, 8_000, 3_000, 80_000, 60, 0, 0);
+        let s = select(&[stale, live]);
+        assert_eq!(s.chosen, Some(2), "live evidence beats stale excellence");
+
+        // Unknown age (a legacy GTPRP1 report) stays neutral: no hold.
+        let legacy = PathStats {
+            fwd_age_us: None,
+            rev_age_us: None,
+            ..PathStats::full(3, 100, 100, 100, 100, 10_000, 60, 0, 0)
+        };
+        let s = select(&[legacy]);
+        assert_eq!(
+            s.chosen,
+            Some(3),
+            "unknown freshness is neutral, not punished"
+        );
+        assert_eq!(s.reason, SelectionReason::SingleCandidate);
     }
 
     #[test]

@@ -19,6 +19,10 @@ pub struct DetailedMetrics {
     /// RE-1 (G1): RFC 3550 §6.4.1 inter-arrival jitter, µs resolution.
     /// `None` until the first authenticated packet.
     pub jitter: Option<Duration>,
+    /// RT-3 (G3 prelude): time since the last authenticated receive — the
+    /// measurement-basis age in this endpoint's own clock. `None` before
+    /// the first authenticated packet (no-sentinel discipline).
+    pub since_last_rx: Option<Duration>,
 
     // --- Congestion Control & Pacing ---
     pub cwnd_bytes: u64,

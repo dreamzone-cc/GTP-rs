@@ -360,6 +360,11 @@ async fn main() -> Result<()> {
                                             // packet (not the rate-limited
                                             // OwdSample event stream).
                                             samples: m.total_rx_packets.min(u32::MAX as u64) as u32,
+                                            // RT-3: the forward evidence age in
+                                            // this endpoint's clock — GTPRP2.
+                                            since_last_rx_us: m
+                                                .since_last_rx
+                                                .map(|d| d.as_micros()),
                                         };
                                         let _ = client_conn
                                             .send_reliable_ordered(
@@ -643,6 +648,9 @@ async fn main() -> Result<()> {
                 rev_jitter_us: local_metrics.jitter.map(|d| d.as_micros() as u32),
                 rtt_us: Some(local_metrics.smoothed_rtt.as_micros() as u32),
                 sample_count: local_owd_seen.max(frame_idx),
+                // RT-3: this endpoint's own evidence age — fresh traffic
+                // was flowing the whole probe, so it should read tiny.
+                rev_age_us: local_metrics.since_last_rx.map(|d| d.as_micros()),
                 ..Default::default()
             };
 
@@ -678,6 +686,20 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| "n/a".into()),
             );
             println!(
+                "  Evidence freshness: fwd {} | rev {}",
+                match &latest_report {
+                    Some(r) => r
+                        .since_last_rx_us
+                        .map(|v| format!("{v} µs ago"))
+                        .unwrap_or_else(|| "unknown (v1 report)".into()),
+                    None => "no report".into(),
+                },
+                local_metrics
+                    .since_last_rx
+                    .map(|v| format!("{} µs ago", v.as_micros()))
+                    .unwrap_or_else(|| "unknown".into()),
+            );
+            println!(
                 "  Round trip: {} ms | Frames sent: {} | Reports received: {}",
                 local_metrics.smoothed_rtt.as_micros() as f64 / 1000.0,
                 frame_idx,
@@ -696,13 +718,17 @@ async fn main() -> Result<()> {
             println!("  Health:    {:?}", health);
             for scored in &selection.scored {
                 println!(
-                    "  Path {} score={} confidence={:.2} effective={}",
+                    "  Path {} score={} confidence={:.2} freshness={} effective={}",
                     scored.path_id,
                     scored
                         .score
                         .map(|v| format!("{:.3}", v))
                         .unwrap_or_else(|| "n/a".into()),
                     scored.confidence,
+                    match scored.age_us {
+                        Some(_) => format!("{:.2}", scored.freshness),
+                        None => "n/a".into(),
+                    },
                     scored
                         .effective
                         .map(|v| format!("{:.3}", v))

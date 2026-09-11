@@ -54,6 +54,10 @@ fn measure_pair(seed: u64, profile: NetworkProfile, path_id: u32) -> gtp_route::
         rev_jitter_us: client.jitter.map(|d| d.as_micros() as u32),
         rtt_us: Some(client.smoothed_rtt.as_micros() as u32),
         sample_count: frames,
+        // The measurement loop just ran on the shared virtual clock —
+        // both directions' evidence is fresh (age 0).
+        fwd_age_us: Some(0),
+        rev_age_us: Some(0),
     }
 }
 

@@ -183,6 +183,10 @@ pub struct ConnectionHot {
     /// emission (G1 design note D6): `event_queue` is an unbounded Vec, so
     /// per-packet events at 60–144 Hz would flood it. `ZERO` = never emitted.
     pub last_owd_emit: MonotonicTime,
+    /// RT-3 (G3 prelude): local receive time of the last AUTHENTICATED
+    /// datagram. Measurement-basis age in this endpoint's own clock —
+    /// set post-auth only (INV-3), beside the OWD feed.
+    pub last_rx_time: Option<MonotonicTime>,
     pub next_message_id: u64,
     pub next_order_seqs: FxHashMap<u16, u32>,
     pub packets_since_ratchet: u64,
@@ -381,6 +385,7 @@ impl ConnectionHot {
             path_validator: PathValidator::new(),
             owd: OwdEstimator::new(),
             last_owd_emit: MonotonicTime::ZERO,
+            last_rx_time: None,
             next_message_id: 1,
             next_order_seqs: FxHashMap::default(),
             packets_since_ratchet: 0,
