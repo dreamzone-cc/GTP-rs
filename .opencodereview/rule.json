@@ -1,0 +1,65 @@
+{
+  "rules": [
+    {
+      "path": "crates/gtp-core/**",
+      "rule": "You are auditing the GTP protocol CORE (handshake, sessions, state machines). Treat this file as protocol-critical infrastructure, not application code. Enforce:\n\n#### Protocol State Machine\n- Every state transition must be triggered by a defined event (message received, timer fired, error); flag transitions reachable by undefined events or unreachable states.\n- Flag states that can be exited by multiple paths with inconsistent cleanup (session state torn down on one path but leaked on another).\n- Flag missing handling for out-of-order, duplicated, or stale messages in ANY state (a message valid in state A arriving during state B must be rejected or ignored by explicit design, never fall through).\n- Enum-based states must make illegal states unrepresentable; flag bool-flag combinations that encode hidden states.\n\n#### Handshake and Session Lifecycle\n- Verify handshake completes atomically: no path where a session is considered established while peer identity/crypto parameters are unverified.\n- Flag session IDs, nonces, or tokens generated without proper randomness or reused across sessions.\n- Every session creation path must have a matching teardown on ALL error paths (early returns, timeouts, cancelled futures).\n- Flag session state not bounded — unauthenticated peers must not be able to create unbounded session entries (DoS).\n\n#### Data Flow Correctness\n- Trace sender/receiver agreement: every message constructed here must be consumed symmetrically by the peer logic; flag write-side fields the read-side never validates.\n- Flag ordering assumptions not enforced (in-flight window, sequence handling, queue bounds).",
+      "merge_system_rule": true
+    },
+    {
+      "path": "crates/gtp-wire/**",
+      "rule": "You are auditing the GTP WIRE FORMAT layer (packet encoding/decoding). This is a network-facing parser: assume every input is hostile. Enforce:\n\n#### Packet Parsing Robustness\n- Every length field, offset, or count read from a packet MUST be bounds-checked against the remaining buffer BEFORE use; flag any slice indexing, sub-slice, or read relying on a packet-supplied length.\n- Flag integer parsing with truncating casts (u64->u32, i32->usize) or arithmetic that can overflow/wrap on attacker-controlled values.\n- Unknown versions, unknown message types, reserved flags, and malformed variants must be rejected with typed errors, never guessed or skipped silently.\n- Flag parse functions that partially mutate output state before failing (parser must fail atomically).\n\n#### Encode/Decode Symmetry\n- Every encode must round-trip through decode; flag asymmetries (fields serialized but never parsed, defaults assumed on decode that encode never writes).\n- Flag endianness assumptions not explicit (big/little) on multi-byte fields.\n\n#### Specification Compliance\n- Field orders, sizes, alignment, and padding must match the GTP specification (see GTP_1_1_Comprehensive_Technical_Specification.md); flag any deviation from documented frame layouts, even if tests pass.\n- Maximum packet/message sizes must be enforced on both encode and decode paths.",
+      "merge_system_rule": true
+    },
+    {
+      "path": "crates/gtp-recovery/**",
+      "rule": "You are auditing the GTP FAILURE RECOVERY layer (timeouts, retries, reconnection, loss recovery). Enforce:\n\n#### Timeout and Retry Semantics\n- Every network operation must have an explicit timeout; flag unbounded waits on channels, sockets, or futures.\n- Retry loops MUST have: bounded attempts OR exponential backoff with jitter, cancellation propagation, and terminal failure distinction (retryable vs permanent error); flag infinite hot retry loops.\n- Flag timeout values without justification relative to RTT assumptions documented in the spec.\n\n#### Reconnection Correctness\n- Reconnection must re-validate peer identity and re-key (flag paths resuming a stale session as trusted).\n- Flag connection state shared between old and new connections where a delayed packet from the old connection corrupts the new one.\n- In-flight work at disconnect must be either cancelled with cleanup or explicitly re-queued; flag silently dropped work.\n\n#### Recovery State Integrity\n- Recovery procedures must not assume the failure model they are recovering from (e.g., recovery code itself doing unreliably-ordered operations); flag recovery paths that can themselves fail without recourse.",
+      "merge_system_rule": true
+    },
+    {
+      "path": "crates/gtp-path/**",
+      "rule": "You are auditing the GTP PATH MANAGEMENT layer (multi-path, path migration, path health). Enforce:\n\n#### Path Migration\n- Migration must be atomic from the session's perspective: no window where a session is bound to zero paths or double-bound to old and new paths simultaneously.\n- In-flight data at migration must have defined ownership (follow old path, redirect, or drop+retransmit); flag data loss or duplication windows.\n- Old-path resources (sockets, buffers, timers) must be released on every migration branch, including failed migrations.\n- Path identity/health metrics used for migration decisions must not be racy or stale enough to cause flapping; flag migrations triggered by unverified single samples.\n\n#### Multi-Path Invariants\n- Send scheduling across paths must respect ordering constraints the protocol guarantees; flag reordering introduced by path switching.\n- Path failure detection and failover must be bounded in time (explicit heartbeats/timeouts, not passive detection only).",
+      "merge_system_rule": true
+    },
+    {
+      "path": "crates/gtp-runtime-tokio/**",
+      "rule": "You are auditing the GTP ASYNC RUNTIME layer (tokio integration). This is the concurrency substrate of the protocol. Enforce:\n\n#### Races and Deadlocks\n- Flag check-then-act sequences on shared session/connection state not protected by a single lock or atomic ordering.\n- Flag lock hierarchy violations: acquiring two locks in different orders on different paths (deadlock); flag any lock held across .await.\n- Flag select!/race! branches where losing branches' side effects or spawned work leak (cancellation safety of every branch).\n- Shared mutation via Arc<Mutex>/Rc<RefCell> must have a single clear owner pattern; flag scattered mutation points.\n\n#### Task Lifecycle\n- Every spawned task must have defined shutdown (JoinHandle observed, cancellation channel, or detached-by-design documented); flag fire-and-forget tasks owning resources.\n- Flag blocking calls (std::fs, std::net, thread::sleep, CPU-heavy loops) inside async contexts.\n- Channel senders/receivers must handle peer-closed errors; flag sends that ignore a dead receiver losing data.",
+      "merge_system_rule": true
+    },
+    {
+      "path": "crates/gtp-scheduler/**",
+      "rule": "You are auditing the GTP SCHEDULER (packet scheduling across paths/timers). Enforce:\n\n- Scheduling decisions must be deterministic given the same inputs, or explicitly documented as timing-dependent; flag decisions reading unsynchronized time/clock state.\n- Timer wheels/intervals must handle: missed ticks, delayed firing, and cancellation without leaking entries.\n- Priority/fairness logic must be bounded — flag starvation scenarios where one flow/path class can starve others indefinitely.\n- Queue bounds must be enforced with defined overflow policy (drop-oldest, reject, backpressure); flag unbounded queues on network input.",
+      "merge_system_rule": true
+    },
+    {
+      "path": "crates/gtp-cc/**",
+      "rule": "You are auditing the GTP CONGESTION CONTROL implementation. Enforce:\n\n- Every signal used (RTT samples, loss signals, ECN, ACK counts) must be validated for staleness and plausibility before driving cwnd changes; flag division by zero on smoothed RTT/interval and integer underflow on window shrink.\n- Mode transitions (slow start -> congestion avoidance -> recovery) must be complete: no state where multiple modes are simultaneously active or where recovery exit forgets inflated state.\n- Flag window arithmetic that can overflow, go negative via unsigned wrap, or exceed documented limits.\n- Pacing/bursting must be enforced as designed; flag bursts exceeding the spec's defined burst tolerance.",
+      "merge_system_rule": true
+    },
+    {
+      "path": "crates/gtp-crypto/**",
+      "rule": "You are auditing the GTP CRYPTO layer. Enforce with zero tolerance:\n\n- Flag ANY hand-rolled cryptographic primitive, mode, or padding (use audited crates: ring/rustcrypto per project deps).\n- Nonces/IVs must be unique per key with a defined uniqueness strategy; flag random nonces with birthday-risk counters not enforced, or counter nonces without wrap handling.\n- Flag decryption/authentication order errors (decrypt-before-verify), missing AEAD tag checks, or MAC comparison not constant-time.\n- Key material: no logging, no Debug/Display on keys, zeroization on drop where the project's spec requires it, no keys derived from low-entropy inputs.\n- Handshake crypto: replay protection (challenge/transcript binding), downgrade prevention, and forward-secrecy requirements per the spec must be verifiable in code.",
+      "merge_system_rule": true
+    },
+    {
+      "path": "crates/gtp-io/**",
+      "rule": "You are auditing the GTP I/O layer (sockets, buffers, epoll integration). Enforce:\n\n- Buffer management: every read/write path must handle partial reads/writes and WouldBlock explicitly; flag assume-full-read patterns.\n- Flag per-packet allocations in the hot path where a pool/reuse strategy is the documented design.\n- Resource cleanup: every socket/timer registration must be deregistered on all exit paths including panics and cancellation.\n- FD limits: flag unbounded socket/connection creation without backpressure or limits.",
+      "merge_system_rule": true
+    },
+    {
+      "path": "crates/gtp-route/**",
+      "rule": "You are auditing the GTP ADAPTIVE ROUTING engine. Enforce:\n\n- Routing decisions must be based on validated, fresh metrics; flag decisions on stale/missing measurements silently defaulting to unsafe paths.\n- Route changes must propagate atomically to forwarding state; flag windows with inconsistent route/forwarding views.\n- Flag routing oscillation risks: hysteresis/threshold logic must prevent flip-flopping between routes on metric noise.\n- Fallback route must exist and be tested for every primary-route failure mode.",
+      "merge_system_rule": true
+    },
+    {
+      "path": "crates/{gtp-types,gtp,gtp-cli,gtp-sim}/**",
+      "rule": "You are auditing GTP supporting crates (types, facade, CLI, simulator). Enforce:\n\n- gtp-types: protocol constants/limits must match the specification exactly (frame sizes, header lengths, version numbers); flag magic numbers duplicated instead of using these types.\n- gtp-sim: simulation MUST faithfully model the failure modes the protocol claims to handle (reordering, duplication, loss, partition); flag simulators that cannot produce these conditions — they give false confidence.\n- Tests: every protocol behavior changed or touched in this diff must have a test covering it, INCLUDING at minimum: malformed input, boundary values (empty/max), duplicate/out-of-order delivery, and cancellation mid-operation. Flag happy-path-only tests for protocol logic.",
+      "merge_system_rule": true
+    },
+    {
+      "path": "**/*.rs",
+      "rule": "PROTOCOL AUDIT MODE — this codebase implements GTP, a networking protocol (gaming VPN with adaptive routing). Review it as a protocol engineering audit, not generic code review:\n\n- Verify changes against the protocol's documented contracts (specs live in repo root: GTP_1_1_Comprehensive_Technical_Specification.md and GTP-rs-Technical-Specification.md — read them via search tools when the diff touches protocol-visible behavior).\n- Every change to message handling, session logic, or timing alters externally-visible protocol behavior: flag changes that deviate from spec-defined behavior even when internally consistent.\n- Error handling: network input errors must be typed and distinguish malformed (peer bug/attack) from transient (retryable) from fatal.\n- Resources (memory, FDs, timers, tasks) must be bounded and released on all paths — a protocol server must survive adversarial peers.\n- Tests must cover edge cases: empty payloads, maximum sizes, zero-length fields, malformed truncations, and concurrent session operations.",
+      "merge_system_rule": true
+    }
+  ],
+  "exclude": ["**/*.zip", "target/**", "docs/**", "fixes/**", "GTP_All_Markdown_Files/**"]
+}
