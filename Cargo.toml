@@ -23,7 +23,7 @@ edition = "2021"
 authors = ["GTP Engineering Team"]
 license = "AGPL-3.0"
 description = "GTP: a gaming-VPN transport protocol with adaptive multi-path routing (Rust workspace)"
-repository = "https://example.invalid/gtp/gtp-rs" # TODO: set the real repository URL before publishing
+repository = "https://github.com/dreamzone-cc/GTP-rs"
 rust-version = "1.85"
 
 [workspace.dependencies]
