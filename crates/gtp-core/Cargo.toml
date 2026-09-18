@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+zeroize = { workspace = true }
 gtp-types = { workspace = true }
 gtp-wire = { workspace = true }
 gtp-recovery = { workspace = true }
@@ -26,3 +27,10 @@ std = [
     "gtp-path/std",
     "gtp-crypto/std",
 ]
+# Passthrough: enables the null-cipher protector for simulation builds only.
+insecure-plaintext = ["gtp-crypto/insecure-plaintext"]
+
+[dev-dependencies]
+# Tests exercise the plaintext protector paths; the feature is NEVER enabled for
+# the production lib target (see state.rs gating).
+gtp-crypto = { workspace = true, features = ["insecure-plaintext"] }

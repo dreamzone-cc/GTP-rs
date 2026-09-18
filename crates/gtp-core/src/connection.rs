@@ -36,37 +36,27 @@ pub struct GtpConnection {
 }
 
 impl GtpConnection {
-    pub fn new(cid: ConnectionId, peer_addr: SocketAddr, secure: bool) -> Self {
-        Self::new_with_role(cid, peer_addr, secure, true, GtpConfig::default())
-    }
-
-    #[allow(deprecated)]
-    pub fn new_with_config(
-        cid: ConnectionId,
-        peer_addr: SocketAddr,
-        secure: bool,
-        config: GtpConfig,
-    ) -> Self {
-        Self::new_with_role(cid, peer_addr, secure, true, config)
-    }
-
-    /// Legacy master-secret constructor with an explicit endpoint role (SEC-1: the
-    /// role selects which derived direction this endpoint seals with).
-    #[allow(deprecated)]
+    /// Legacy static-secret constructor with an explicit endpoint role (SEC-1:
+    /// the role selects which derived direction this endpoint seals with).
+    ///
+    /// The master secret must be supplied EXPLICITLY — there is no embedded
+    /// default. For offline simulation/examples/tests pass
+    /// [`crate::state::OFFLINE_SIM_MASTER_SECRET`]; production code must use
+    /// the handshake-driven [`GtpConnection::new_with_directional_keys`].
+    #[deprecated(
+        note = "Static shared secret; use the handshake-driven GtpEndpoint::connect (new_with_directional_keys) for real per-session X25519 keys. Only safe for offline simulation and tests."
+    )]
     pub fn new_with_role(
         cid: ConnectionId,
         peer_addr: SocketAddr,
         secure: bool,
         as_client: bool,
+        master_secret: &[u8],
         config: GtpConfig,
     ) -> Self {
-        let mut hot = ConnectionHot::new_with_master_secret(
-            cid,
-            peer_addr,
-            secure,
-            b"gtp_default_session_master_secret_2026",
-            as_client,
-        );
+        #[allow(deprecated)]
+        let mut hot =
+            ConnectionHot::new_with_master_secret(cid, peer_addr, secure, master_secret, as_client);
         // Re-apply the configured tuning on the legacy path (P1-2).
         hot.ack_tracker
             .set_policy(config.ack_frequency_packets, config.max_ack_delay);
@@ -1345,17 +1335,30 @@ impl GtpConnection {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)] // these tests exercise the legacy static-secret path by design
     use super::*;
-    use crate::state::MAX_ORDERED_GROUPS;
+    use crate::state::{MAX_ORDERED_GROUPS, OFFLINE_SIM_MASTER_SECRET};
     use gtp_types::Duration;
 
     fn loopback_pair(cid: ConnectionId) -> (GtpConnection, GtpConnection) {
         let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let server_addr: SocketAddr = "127.0.0.1:6000".parse().unwrap();
-        let client =
-            GtpConnection::new_with_role(cid, server_addr, true, true, GtpConfig::default());
-        let server =
-            GtpConnection::new_with_role(cid, client_addr, true, false, GtpConfig::default());
+        let client = GtpConnection::new_with_role(
+            cid,
+            server_addr,
+            true,
+            true,
+            OFFLINE_SIM_MASTER_SECRET,
+            GtpConfig::default(),
+        );
+        let server = GtpConnection::new_with_role(
+            cid,
+            client_addr,
+            true,
+            false,
+            OFFLINE_SIM_MASTER_SECRET,
+            GtpConfig::default(),
+        );
         (client, server)
     }
 
@@ -1475,14 +1478,10 @@ mod tests {
         assert!(delivered_total > 0);
         // ...but the live-group map never exceeds the cap despite far more group ids.
         assert!(
-            server.hot.ordered_groups.len() <= MAX_ORDERED_GROUPS,
+            server.hot.ordered_group_count() <= MAX_ORDERED_GROUPS,
             "ordered_groups grew to {} (cap {})",
-            server.hot.ordered_groups.len(),
+            server.hot.ordered_group_count(),
             MAX_ORDERED_GROUPS
-        );
-        assert_eq!(
-            server.hot.ordered_groups.len(),
-            server.hot.ordered_group_order.len()
         );
     }
 
@@ -1693,9 +1692,9 @@ mod tests {
         let unsealed = builder.finish().unwrap();
         let tag_len = 16usize;
         late_buf[22..24].copy_from_slice(&((unsealed - 24 + tag_len) as u16).to_be_bytes());
-        let tx_iv = client.hot.tx_iv;
+        let tx_iv = *client.hot.tx_iv;
         let aad = late_buf[..24].to_vec();
-        let seal = gtp_crypto::GtpAeadProtector::new(client.hot.tx_key, tx_iv);
+        let seal = gtp_crypto::GtpAeadProtector::new(*client.hot.tx_key, tx_iv);
         let sealed_len = gtp_crypto::PacketProtector::seal(
             &seal,
             pn,
@@ -1731,6 +1730,7 @@ mod tests {
             "127.0.0.1:7000".parse().unwrap(),
             false,
             true,
+            OFFLINE_SIM_MASTER_SECRET,
             GtpConfig::default(),
         );
         // Simulate a pre-establishment state to prove Initial -> Closed is legal
@@ -2047,10 +2047,12 @@ mod tests {
     fn anti_amplification_factor_flows_from_config_to_limiters() {
         let cid = ConnectionId(0x1A7B_0000_0000_00E4);
         let peer: SocketAddr = "127.0.0.1:6000".parse().unwrap();
-        let mut client = GtpConnection::new_with_config(
+        let mut client = GtpConnection::new_with_role(
             cid,
             peer,
             true,
+            true,
+            OFFLINE_SIM_MASTER_SECRET,
             GtpConfig::lan_cluster(), // anti_amplification_factor: 10
         );
         assert_eq!(
@@ -2549,8 +2551,8 @@ mod tests {
         // Keys in force BEFORE the rotation — the material an attacker would leak.
         let leaked = CraftedSeal {
             cid,
-            key: client.hot.tx_key,
-            iv: client.hot.tx_iv,
+            key: *client.hot.tx_key,
+            iv: *client.hot.tx_iv,
             key_phase: client.hot.key_phase,
         };
 
@@ -2677,7 +2679,7 @@ mod tests {
             "the challenge must target the probed address"
         );
 
-        let kinds = opened_frame_kinds(&mut out[..out_len], server.hot.tx_key, server.hot.tx_iv);
+        let kinds = opened_frame_kinds(&mut out[..out_len], *server.hot.tx_key, *server.hot.tx_iv);
         assert!(
             kinds.contains(&"PathChallenge"),
             "the directed datagram must carry the challenge, got {kinds:?}"
@@ -2697,7 +2699,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(dest2, client_addr);
-        let kinds2 = opened_frame_kinds(&mut out[..len2], server.hot.tx_key, server.hot.tx_iv);
+        let kinds2 = opened_frame_kinds(&mut out[..len2], *server.hot.tx_key, *server.hot.tx_iv);
         assert!(
             kinds2.contains(&"Ack"),
             "the deferred ACK must reach the genuine peer, got {kinds2:?}"
@@ -2754,7 +2756,7 @@ mod tests {
             .unwrap();
         assert_eq!(dest, probe_addr, "the directed challenge owns the datagram");
 
-        let kinds = opened_frame_kinds(&mut out[..out_len], server.hot.tx_key, server.hot.tx_iv);
+        let kinds = opened_frame_kinds(&mut out[..out_len], *server.hot.tx_key, *server.hot.tx_iv);
         assert!(
             kinds.contains(&"PathChallenge"),
             "the directed datagram must still carry the challenge, got {kinds:?}"
@@ -3049,8 +3051,14 @@ mod tests {
         // 3. Correctly formed, but addressed to a different connection: rejected at the
         //    connection-id check — the other pre-authentication exit.
         let other_cid = ConnectionId(0x0A05_0000_0000_00FF);
-        let mut other =
-            GtpConnection::new_with_role(other_cid, client_addr, true, false, GtpConfig::default());
+        let mut other = GtpConnection::new_with_role(
+            other_cid,
+            client_addr,
+            true,
+            false,
+            OFFLINE_SIM_MASTER_SECRET,
+            GtpConfig::default(),
+        );
         other.hot.anti_amplification = gtp_path::AntiAmplificationLimiter::new();
         let mut misaddressed = buf_a;
         let res = other.handle_incoming_datagram(client_addr, &mut misaddressed[..len_a], now);
@@ -3349,8 +3357,14 @@ mod tests {
     fn drained_control_is_restored_when_the_datagram_is_rejected() {
         let cid = ConnectionId(0xC105_0000_0000_000C);
         let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let mut server =
-            GtpConnection::new_with_role(cid, client_addr, false, false, GtpConfig::default());
+        let mut server = GtpConnection::new_with_role(
+            cid,
+            client_addr,
+            false,
+            false,
+            OFFLINE_SIM_MASTER_SECRET,
+            GtpConfig::default(),
+        );
         // Force the unvalidated state: a fresh limiter with zero received bytes has zero
         // send budget, so can_send rejects — exactly the amplification-limited window.
         server.hot.anti_amplification = gtp_path::AntiAmplificationLimiter::new();
@@ -3553,6 +3567,7 @@ mod tests {
             "127.0.0.1:6000".parse().unwrap(),
             true,
             true,
+            OFFLINE_SIM_MASTER_SECRET,
             GtpConfig::default(),
         );
 
@@ -3570,17 +3585,16 @@ mod tests {
             .ordered_group_mut(OrderedGroupId(MAX_ORDERED_GROUPS as u16 + 1));
 
         assert!(
-            client.hot.ordered_groups.contains_key(&1),
+            client.hot.ordered_group_contains(1u16),
             "the touched early group must survive (LRU)"
         );
         assert!(
-            !client.hot.ordered_groups.contains_key(&2),
+            !client.hot.ordered_group_contains(2u16),
             "the untouched second-oldest group is the eviction victim"
         );
         assert!(client
             .hot
-            .ordered_groups
-            .contains_key(&(MAX_ORDERED_GROUPS as u16 + 1)));
+            .ordered_group_contains(MAX_ORDERED_GROUPS as u16 + 1));
     }
 
     /// FR-5: a Closed connection ignores incoming datagrams entirely — no
@@ -3673,6 +3687,7 @@ mod tests {
             "127.0.0.1:6000".parse().unwrap(),
             true,
             true,
+            OFFLINE_SIM_MASTER_SECRET,
             config,
         );
 
@@ -3715,6 +3730,7 @@ mod tests {
             "127.0.0.1:6000".parse().unwrap(),
             true,
             true,
+            OFFLINE_SIM_MASTER_SECRET,
             config,
         );
         conn.push_event(ControlEvent::PtoTriggered {

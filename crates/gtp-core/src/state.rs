@@ -1,7 +1,7 @@
 use gtp_cc::{CubicConfig, CubicCongestionController, PacingEngine, PacingEngineConfig};
 use gtp_crypto::{
-    derive_directional_session_keys, ratchet_key, DirectionalKeys, GtpAeadProtector,
-    PlaintextProtector, Protector, ReplayWindow,
+    derive_directional_session_keys, ratchet_key, DirectionalKeys, GtpAeadProtector, Protector,
+    ReplayWindow,
 };
 use gtp_path::{AntiAmplificationLimiter, ConnectionState, PathValidator};
 use gtp_recovery::{AckTracker, LossDetector, OwdEstimator};
@@ -10,6 +10,7 @@ use gtp_types::{ConnectionId, MonotonicTime, OrderedGroupId, PacketNumber};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use zeroize::Zeroizing;
 
 /// A protocol control frame queued for transmission as a real frame — never wrapped
 /// inside `Frame::Data` (Core-C1 fix). `dest` overrides the active path when the
@@ -120,6 +121,14 @@ pub const MAX_PATH_RESPONSES_PER_DATAGRAM: usize = 1;
 /// already recovers from by issuing a fresh `PathChallenge`.
 pub const MAX_PENDING_PATH_RESPONSES: usize = 2;
 
+/// Explicit master secret for OFFLINE SIMULATION, EXAMPLES, AND TESTS ONLY.
+///
+/// This is not a hidden default: every caller must name it explicitly at the
+/// call site, so a production path cannot silently end up on a compile-time
+/// shared secret. Production connections derive per-session keys through the
+/// X25519 handshake (`GtpEndpoint::connect` + `new_with_directional_keys`).
+pub const OFFLINE_SIM_MASTER_SECRET: &[u8] = b"gtp_offline_sim_master_secret_NOT_FOR_PRODUCTION";
+
 pub struct ConnectionHot {
     pub connection_id: ConnectionId,
     pub next_packet_number: PacketNumber,
@@ -131,11 +140,14 @@ pub struct ConnectionHot {
     pub cc: CubicCongestionController,
     pub pacing: PacingEngine,
     pub scheduler: GameScheduler,
-    pub ordered_groups: FxHashMap<u16, OrderedGroupReceiver>,
-    /// Insertion order of the live receive-side ordered groups (FR-2). Bounds the map
-    /// so a peer choosing many distinct `group_id`s off the wire cannot force unbounded
-    /// allocation (up to 65536 groups × 256 KB each).
-    pub ordered_group_order: VecDeque<u16>,
+    /// Live receive-side ordered groups, keyed by `group_id` (FR-2). PRIVATE:
+    /// the map and `ordered_group_order` form a coupled pair whose sync
+    /// enforces the `MAX_ORDERED_GROUPS` DoS bound — mutation happens only
+    /// through [`ConnectionHot::ordered_group_mut`], which maintains both.
+    ordered_groups: FxHashMap<u16, OrderedGroupReceiver>,
+    /// Insertion/LRU order of the live receive-side ordered groups (FR-2).
+    /// Private twin of `ordered_groups` — see that field's doc.
+    ordered_group_order: VecDeque<u16>,
     /// RX-side freshness table (SEM-2): drops late sequenced state at the receiver.
     pub rx_state_table: StateTable,
     /// ReliableUnordered duplicate-delivery guard (ORD-4).
@@ -154,11 +166,18 @@ pub struct ConnectionHot {
     /// ratchet delivered no forward secrecy at all. The grace window is now finite;
     /// when it expires the protector is dropped (and its key zeroized).
     pub rx_prev_grace_packets: u32,
-    pub tx_key: [u8; 32],
-    pub rx_key: [u8; 32],
-    pub tx_iv: [u8; 12],
-    pub rx_iv: [u8; 12],
+    /// Session key material, wrapped so retired/live keys are zeroized when
+    /// overwritten or dropped (the plain-array fields the R-6 comment relied
+    /// on were never wiped — only the protector's copies were).
+    pub tx_key: Zeroizing<[u8; 32]>,
+    pub rx_key: Zeroizing<[u8; 32]>,
+    pub tx_iv: Zeroizing<[u8; 12]>,
+    pub rx_iv: Zeroizing<[u8; 12]>,
+    /// Wire key-phase bit (header flag) — flips on every ratchet.
     pub key_phase: bool,
+    /// Monotonic ratchet counter feeding the key derivation (distinct material
+    /// per phase; the wire flag above cannot distinguish 2k rotations apart).
+    pub key_phase_counter: u64,
     /// Protocol control frames awaiting transmission (Core-C1 fix).
     pub control_queue: VecDeque<OutgoingControlFrame>,
     /// Set once the CLOSE frame has been encoded into an outgoing datagram.
@@ -193,22 +212,16 @@ pub struct ConnectionHot {
 }
 
 impl ConnectionHot {
+    /// Legacy static-secret constructor. The master secret must be supplied
+    /// EXPLICITLY — there is no embedded default (a compile-time shared
+    /// secret on a production-reachable path let anyone with the source
+    /// derive every connection's keys).
+    ///
+    /// For offline simulation/examples/tests, pass
+    /// [`OFFLINE_SIM_MASTER_SECRET`]; production must use the handshake-driven
+    /// [`ConnectionHot::new_with_directional_keys`] instead.
     #[deprecated(
-        note = "Uses a hardcoded shared secret; use the handshake-driven GtpEndpoint::connect which derives real per-session keys via X25519. Only safe for offline gtp-sim testing."
-    )]
-    pub fn new(cid: ConnectionId, peer_addr: SocketAddr, secure: bool) -> Self {
-        #[allow(deprecated)]
-        Self::new_with_master_secret(
-            cid,
-            peer_addr,
-            secure,
-            b"gtp_default_session_master_secret_2026",
-            true,
-        )
-    }
-
-    #[deprecated(
-        note = "Uses a hardcoded shared secret; use the handshake-driven GtpEndpoint::connect which derives real per-session keys via X25519. Only safe for offline gtp-sim testing."
+        note = "Static shared secret; use the handshake-driven GtpEndpoint::connect which derives real per-session keys via X25519. Only safe for offline gtp-sim testing."
     )]
     pub fn new_with_master_secret(
         cid: ConnectionId,
@@ -217,7 +230,7 @@ impl ConnectionHot {
         master_secret: &[u8],
         as_client: bool,
     ) -> Self {
-        let (tx, rx, tx_key, rx_key, tx_iv, rx_iv) = if secure {
+        let (tx, rx, tx_key, rx_key, tx_iv, rx_iv) = {
             // SEC-1: even the legacy path derives per-direction keys so packet
             // number N never collides on the same (key, nonce) in both directions.
             let dirs = derive_directional_session_keys(master_secret, cid);
@@ -232,23 +245,33 @@ impl ConnectionHot {
                     (dirs.client_tx_key, dirs.client_tx_iv),
                 )
             };
-            (
-                Protector::Aead(GtpAeadProtector::new(tx.0, tx.1)),
-                Protector::Aead(GtpAeadProtector::new(rx.0, rx.1)),
-                tx.0,
-                rx.0,
-                tx.1,
-                rx.1,
-            )
-        } else {
-            (
-                Protector::Plaintext(PlaintextProtector),
-                Protector::Plaintext(PlaintextProtector),
-                [0u8; 32],
-                [0u8; 32],
-                [0u8; 12],
-                [0u8; 12],
-            )
+            let (tx_p, rx_p) = if secure {
+                // Bound each key to this CID so the nonce-space contract is
+                // enforced structurally (see GtpAeadProtector::new_for_cid).
+                (
+                    Protector::Aead(GtpAeadProtector::new_for_cid(tx.0, tx.1, cid)),
+                    Protector::Aead(GtpAeadProtector::new_for_cid(rx.0, rx.1, cid)),
+                )
+            } else {
+                // Insecure plaintext mode exists only in test/sim builds; in
+                // production builds (feature off) the connection is sealed
+                // anyway — never silently plaintext.
+                #[cfg(any(test, feature = "insecure-plaintext"))]
+                {
+                    (
+                        Protector::Plaintext(gtp_crypto::PlaintextProtector),
+                        Protector::Plaintext(gtp_crypto::PlaintextProtector),
+                    )
+                }
+                #[cfg(not(any(test, feature = "insecure-plaintext")))]
+                {
+                    (
+                        Protector::Aead(GtpAeadProtector::new_for_cid(tx.0, tx.1, cid)),
+                        Protector::Aead(GtpAeadProtector::new_for_cid(rx.0, rx.1, cid)),
+                    )
+                }
+            };
+            (tx_p, rx_p, tx.0, rx.0, tx.1, rx.1)
         };
 
         Self::build(
@@ -269,8 +292,8 @@ impl ConnectionHot {
         Self::build(
             cid,
             peer_addr,
-            Protector::Aead(GtpAeadProtector::new(tx_key, tx_iv)),
-            Protector::Aead(GtpAeadProtector::new(rx_key, rx_iv)),
+            Protector::Aead(GtpAeadProtector::new_for_cid(tx_key, tx_iv, cid)),
+            Protector::Aead(GtpAeadProtector::new_for_cid(rx_key, rx_iv, cid)),
             None,
             tx_key,
             rx_key,
@@ -355,15 +378,10 @@ impl ConnectionHot {
             pacing: PacingEngine::with_config(PacingEngineConfig {
                 max_burst_bytes: config.max_pacing_burst_bytes,
             }),
-            // Per-tier caps are enforced individually in a later phase; the scheduler
-            // currently takes one cap per tier array position via its constructor.
-            scheduler: GameScheduler::new(
-                *config
-                    .max_queue_bytes_per_tier
-                    .iter()
-                    .max()
-                    .unwrap_or(&(512 * 1024)),
-            ),
+            // P1-2/QoS: the per-tier byte budgets from `GtpConfig` are now
+            // enforced per tier — tier 0 keeps its latency-critical 64 KB bound
+            // instead of inheriting the largest tier's 1 MB ceiling.
+            scheduler: GameScheduler::with_per_tier_byte_caps(config.max_queue_bytes_per_tier),
             ordered_groups: FxHashMap::default(),
             ordered_group_order: VecDeque::new(),
             rx_state_table: StateTable::new(),
@@ -373,11 +391,12 @@ impl ConnectionHot {
             rx_protector,
             rx_protector_prev,
             rx_prev_grace_packets: 0,
-            tx_key,
-            rx_key,
-            tx_iv,
-            rx_iv,
+            tx_key: Zeroizing::new(tx_key),
+            rx_key: Zeroizing::new(rx_key),
+            tx_iv: Zeroizing::new(tx_iv),
+            rx_iv: Zeroizing::new(rx_iv),
             key_phase,
+            key_phase_counter: 0,
             control_queue: VecDeque::new(),
             close_frame_sent: false,
             anti_amplification: anti_amp,
@@ -427,30 +446,63 @@ impl ConnectionHot {
             .expect("group is present: just inserted or already tracked")
     }
 
+    /// Number of live receive-side ordered groups (FR-2 bounded by
+    /// `MAX_ORDERED_GROUPS`).
+    pub fn ordered_group_count(&self) -> usize {
+        self.ordered_groups.len()
+    }
+
+    /// Whether `group_id` is currently tracked as a live ordered group.
+    pub fn ordered_group_contains(&self, group_id: impl Into<u16>) -> bool {
+        self.ordered_groups.contains_key(&group_id.into())
+    }
+
     /// Rotates BOTH direction keys in lockstep (SEC-6 / P2-5) and retains the old RX
     /// key for a grace window. Both peers must invoke this at the same logical point
     /// (documented limitation until a wire-level key update frame exists).
     pub fn ratchet_session_key(&mut self) {
+        // R-6/P2-5: rotating again while the previous grace window is still
+        // open would retire the pre-ratchet key while its packets may still be
+        // in flight (and strand a lockstep peer one ratchet behind — it would
+        // fail BOTH of its protectors and drop all traffic with no recovery
+        // path). Refuse instead.
+        if self.rx_protector_prev.is_some() && self.rx_prev_grace_packets > 0 {
+            return;
+        }
+        #[cfg(any(test, feature = "insecure-plaintext"))]
         if matches!(self.tx_protector, Protector::Plaintext(_)) {
             return;
         }
-        let new_tx_key = ratchet_key(&self.tx_key, self.connection_id);
-        let new_rx_key = ratchet_key(&self.rx_key, self.connection_id);
-        let new_tx_iv = gtp_crypto::derive_session_keys(&new_tx_key, self.connection_id).1;
-        let new_rx_iv = gtp_crypto::derive_session_keys(&new_rx_key, self.connection_id).1;
+
+        // Phase counter is bound into the derivation: distinct material per
+        // phase, and the base IV rotates together with the key (distinct label)
+        // so the (key, IV) nonce pair stays coherent across phases.
+        let next_phase = self.key_phase_counter + 1;
+        let (new_tx_key, new_tx_iv) = ratchet_key(&self.tx_key, self.connection_id, next_phase);
+        let (new_rx_key, new_rx_iv) = ratchet_key(&self.rx_key, self.connection_id, next_phase);
 
         let old_rx = std::mem::replace(
             &mut self.rx_protector,
-            Protector::Aead(GtpAeadProtector::new(new_rx_key, new_rx_iv)),
+            Protector::Aead(GtpAeadProtector::new_for_cid(
+                new_rx_key,
+                new_rx_iv,
+                self.connection_id,
+            )),
         );
         self.rx_protector_prev = Some(old_rx);
         self.rx_prev_grace_packets = RX_PREV_KEY_GRACE_PACKETS;
-        self.tx_protector = Protector::Aead(GtpAeadProtector::new(new_tx_key, new_tx_iv));
-        self.tx_key = new_tx_key;
-        self.rx_key = new_rx_key;
-        self.tx_iv = new_tx_iv;
-        self.rx_iv = new_rx_iv;
+        self.tx_protector = Protector::Aead(GtpAeadProtector::new_for_cid(
+            new_tx_key,
+            new_tx_iv,
+            self.connection_id,
+        ));
+        // Assigning through Zeroizing wipes the retired key bytes in place.
+        *self.tx_key = new_tx_key;
+        *self.rx_key = new_rx_key;
+        *self.tx_iv = new_tx_iv;
+        *self.rx_iv = new_rx_iv;
         self.key_phase = !self.key_phase;
+        self.key_phase_counter = next_phase;
         self.packets_since_ratchet = 0;
     }
 
