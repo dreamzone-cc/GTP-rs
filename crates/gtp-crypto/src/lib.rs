@@ -10,7 +10,7 @@ pub use aead::{GtpAeadProtector, AEAD_TAG_LEN};
 pub use handshake::{
     compute_client_proof, compute_server_proof, derive_directional_handshake_session_keys,
     ratchet_key, verify_client_proof, verify_server_proof, DirectionalKeys, EphemeralKeyPair,
-    HandshakeSharedSecret, HandshakeTranscript,
+    HandshakeSharedSecret, HandshakeTranscript, StaticIdentity,
 };
 /// Legacy single-pair derivation — see the deprecation note for the SEC-1 hazard.
 #[allow(deprecated)]

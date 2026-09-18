@@ -1,6 +1,6 @@
 use crate::async_connection::AsyncGtpConnection;
 use gtp_core::{GtpConfig, GtpConnection, ReceivedMessage};
-use gtp_crypto::{derive_directional_handshake_session_keys, EphemeralKeyPair};
+use gtp_crypto::{derive_directional_handshake_session_keys, EphemeralKeyPair, StaticIdentity};
 use gtp_path::StatelessTokenManager;
 use gtp_types::{ConnectionId, MessageClass, MonotonicTime, PacketNumber, Result, TransportError};
 use gtp_wire::frame::{
@@ -21,8 +21,17 @@ use gtp_core::state::OFFLINE_SIM_MASTER_SECRET;
 type ConnectionMap = Arc<
     RwLock<FxHashMap<ConnectionId, (Arc<Mutex<GtpConnection>>, mpsc::Sender<ReceivedMessage>)>>,
 >;
+/// What a client needs from one ServerHello (v1.3 adds the static key).
+#[derive(Clone, Copy)]
+struct ServerHelloInfo {
+    server_pk: [u8; 32],
+    server_nonce: [u8; 32],
+    stateless_cookie: [u8; 32],
+    server_static_pk: [u8; 32],
+}
+
 type PendingClientHandshakeMap =
-    Arc<RwLock<FxHashMap<ConnectionId, oneshot::Sender<([u8; 32], [u8; 32], [u8; 32])>>>>;
+    Arc<RwLock<FxHashMap<ConnectionId, oneshot::Sender<ServerHelloInfo>>>>;
 /// v1.2: client-side waiters for the server's mirrored confirmation proof.
 type PendingServerFinishMap = Arc<RwLock<FxHashMap<ConnectionId, oneshot::Sender<[u8; 32]>>>>;
 /// v1.2: (proof, dest, time) of accepted finishes, so a retransmitted
@@ -141,6 +150,12 @@ pub struct GtpEndpoint {
     pending_server_handshakes: PendingServerHandshakeMap,
     pending_server_finishes: PendingServerFinishMap,
     accepted_finishes: AcceptedFinishMap,
+    /// v1.3 trust anchor (server side): long-term static identity whose
+    /// public half clients pin. `None` = anonymous server.
+    static_identity: Option<Arc<StaticIdentity>>,
+    /// v1.3 trust anchor (client side): the pinned server static public key.
+    /// `None` = anonymous client (v1.2 semantics).
+    trusted_server_static: Option<[u8; 32]>,
     hello_rate_limiter: Arc<Mutex<HelloRateLimiter>>,
     incoming_connections_tx: mpsc::Sender<AsyncGtpConnection>,
     incoming_connections_rx: Arc<Mutex<mpsc::Receiver<AsyncGtpConnection>>>,
@@ -148,6 +163,10 @@ pub struct GtpEndpoint {
 
 impl GtpEndpoint {
     pub async fn bind(addr: SocketAddr) -> Result<Self> {
+        Self::bind_inner(addr, None).await
+    }
+
+    async fn bind_inner(addr: SocketAddr, identity: Option<Arc<StaticIdentity>>) -> Result<Self> {
         let socket = UdpSocket::bind(addr)
             .await
             .map_err(|e| TransportError::Io(e.to_string()))?;
@@ -165,6 +184,8 @@ impl GtpEndpoint {
             pending_server_handshakes: Arc::new(RwLock::new(FxHashMap::default())),
             pending_server_finishes: Arc::new(RwLock::new(FxHashMap::default())),
             accepted_finishes: Arc::new(Mutex::new(FxHashMap::default())),
+            static_identity: identity,
+            trusted_server_static: None,
             hello_rate_limiter: Arc::new(Mutex::new(HelloRateLimiter::default())),
             incoming_connections_tx: incoming_tx,
             incoming_connections_rx: Arc::new(Mutex::new(incoming_rx)),
@@ -172,6 +193,40 @@ impl GtpEndpoint {
 
         endpoint.start_rx_loop();
         Ok(endpoint)
+    }
+
+    /// Binds an IDENTIFIED server (v1.3): every handshake's key schedule mixes
+    /// the static identity term, so only clients pinning
+    /// `StaticIdentity::public_key()` can complete a session with this
+    /// endpoint. Persist the seed and reuse it across restarts to keep the
+    /// identity stable.
+    pub async fn bind_with_static_identity(
+        addr: SocketAddr,
+        identity_seed: [u8; 32],
+    ) -> Result<Self> {
+        Self::bind_inner(
+            addr,
+            Some(Arc::new(StaticIdentity::from_seed(identity_seed))),
+        )
+        .await
+    }
+
+    /// Anchors this endpoint's `connect()` to a pinned server static public
+    /// key (v1.3). A ServerHello advertising any other static key — e.g. an
+    /// on-path substitute — fails the handshake immediately with a classified
+    /// error instead of deriving keys with the wrong peer.
+    pub fn set_trusted_server_static(&mut self, pinned: [u8; 32]) {
+        self.trusted_server_static = Some(pinned);
+    }
+
+    /// The pinned trust anchor, if this endpoint anchors its connections.
+    pub fn trusted_server_static(&self) -> Option<[u8; 32]> {
+        self.trusted_server_static
+    }
+
+    /// This server's long-term identity public key (to distribute to clients).
+    pub fn static_identity_public(&self) -> Option<[u8; 32]> {
+        self.static_identity.as_ref().map(|id| id.public_key())
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -259,7 +314,7 @@ impl GtpEndpoint {
         let mut attempts = 0;
         let mut rx = resp_rx;
 
-        let (server_pk, server_nonce, stateless_cookie) = loop {
+        let hello = loop {
             match tokio::time::timeout(std::time::Duration::from_millis(400), &mut rx).await {
                 Ok(Ok(data)) => break data,
                 Ok(Err(_)) => {
@@ -283,9 +338,30 @@ impl GtpEndpoint {
             }
         };
 
-        let shared = client_pair
-            .compute_shared_secret(&server_pk)
-            .map_err(|_| TransportError::HandshakeFailed("non-contributory server key"))?;
+        let ServerHelloInfo {
+            server_pk,
+            server_nonce,
+            stateless_cookie,
+            server_static_pk,
+        } = hello;
+
+        // v1.3 trust anchor: when this endpoint pins a server identity, the
+        // static key ON THE WIRE must equal the pin byte-for-byte — any
+        // on-path substitution fails here, before a single key is derived.
+        let shared = if let Some(pinned) = self.trusted_server_static {
+            if server_static_pk != pinned {
+                return Err(TransportError::HandshakeFailed(
+                    "server identity mismatch (pinned static key not on the wire)",
+                ));
+            }
+            client_pair
+                .compute_shared_secret_with_static(&server_pk, &pinned)
+                .map_err(|_| TransportError::HandshakeFailed("non-contributory server key"))?
+        } else {
+            client_pair
+                .compute_shared_secret(&server_pk)
+                .map_err(|_| TransportError::HandshakeFailed("non-contributory server key"))?
+        };
         let keys =
             derive_directional_handshake_session_keys(&shared, &client_nonce, &server_nonce, cid);
 
@@ -443,6 +519,7 @@ impl GtpEndpoint {
         let pending_server_handshakes = Arc::clone(&self.pending_server_handshakes);
         let pending_server_finishes = Arc::clone(&self.pending_server_finishes);
         let accepted_finishes = Arc::clone(&self.accepted_finishes);
+        let static_identity = self.static_identity.clone();
         let rate_limiter = Arc::clone(&self.hello_rate_limiter);
         let incoming_tx = self.incoming_connections_tx.clone();
 
@@ -573,6 +650,12 @@ impl GtpEndpoint {
                                         server_nonce,
                                         stateless_cookie: cookie,
                                         assigned_cid: cid,
+                                        // v1.3: advertise the identity (or
+                                        // zeros for an anonymous server).
+                                        server_static_pk: static_identity
+                                            .as_ref()
+                                            .map(|id| id.public_key())
+                                            .unwrap_or([0u8; 32]),
                                     };
                                     if let Ok(s_len) = s_frame.encode(&mut resp_buf[s_hdr_len..]) {
                                         let _ = socket
@@ -592,17 +675,19 @@ impl GtpEndpoint {
                                     server_nonce,
                                     stateless_cookie,
                                     assigned_cid,
+                                    server_static_pk,
                                 },
                                 _,
                             )) = Frame::decode(frame_payload)
                             {
                                 let mut pending = pending_client_handshakes.write().await;
                                 if let Some(tx) = pending.remove(&assigned_cid) {
-                                    let _ = tx.send((
-                                        server_public_key,
+                                    let _ = tx.send(ServerHelloInfo {
+                                        server_pk: server_public_key,
                                         server_nonce,
                                         stateless_cookie,
-                                    ));
+                                        server_static_pk,
+                                    });
                                 }
                             }
                             continue;
@@ -652,9 +737,12 @@ impl GtpEndpoint {
                                     {
                                         let server_nonce = server_pair.nonce;
                                         let server_pk = server_pair.public_key;
-                                        let Ok(shared) =
-                                            server_pair.compute_shared_secret(&client_pk)
-                                        else {
+                                        let shared_res = match &static_identity {
+                                            Some(identity) => identity
+                                                .complete_server_session(server_pair, &client_pk),
+                                            None => server_pair.compute_shared_secret(&client_pk),
+                                        };
+                                        let Ok(shared) = shared_res else {
                                             continue;
                                         };
                                         let keys = derive_directional_handshake_session_keys(
@@ -1038,6 +1126,104 @@ mod tests {
         assert!(rl.allow(IpAddr::V4(Ipv4Addr::LOCALHOST), t2, window, 0));
     }
 
+    /// v1.3 happy path: an identified server and a pinned client complete the
+    /// anchored handshake and exchange traffic.
+    #[tokio::test]
+    async fn anchored_handshake_completes_and_carries_traffic() {
+        let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = GtpEndpoint::bind_with_static_identity(server_addr, [0x5E; 32])
+            .await
+            .unwrap();
+        let real_addr = server.local_addr().unwrap();
+        let pinned = server
+            .static_identity_public()
+            .expect("identified server exposes its static key");
+
+        let accept_task = tokio::spawn(async move {
+            let conn = server.accept().await.expect("accepted");
+            conn
+        });
+
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut client = GtpEndpoint::bind(bind_addr).await.unwrap();
+        client.set_trusted_server_static(pinned);
+
+        let cid = ConnectionId(0xA11C_0000_0000_0AA1);
+        let conn = client
+            .connect(cid, real_addr, true)
+            .await
+            .expect("anchored connect");
+        drop(conn);
+
+        let server_conn = tokio::time::timeout(std::time::Duration::from_secs(5), accept_task)
+            .await
+            .expect("server must accept within 5s (anchored handshake failed?)")
+            .unwrap();
+        assert_eq!(server_conn.cid, cid);
+    }
+
+    /// v1.3 MITM closure: an on-path attacker substituting its own ServerHello
+    /// advertises a static key that is NOT the pin — the client aborts with a
+    /// classified identity mismatch BEFORE deriving a single key. This is the
+    /// gap anonymous X25519 could never close (spec amendment v1.3 §4).
+    #[tokio::test]
+    async fn anchored_client_rejects_a_substituted_static_key() {
+        use gtp_crypto::StaticIdentity;
+
+        let attacker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let attacker_addr = attacker.local_addr().unwrap();
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut client = GtpEndpoint::bind(bind_addr).await.unwrap();
+        // The client pins the HONEST server's identity — never the attacker's.
+        let honest_pin = StaticIdentity::generate().public_key();
+        client.set_trusted_server_static(honest_pin);
+
+        let responder_task = tokio::spawn(async move {
+            let attacker_identity = StaticIdentity::generate();
+            let mut buf = [0u8; 2048];
+            let (n, peer) = attacker.recv_from(&mut buf).await.unwrap();
+            let (_hdr, hlen) = PacketHeader::decode(&buf[..n]).unwrap();
+            let (frame, _) = PacketHeader::decode(&buf[hlen..])
+                .map(|_| ((), 0))
+                .unwrap_or(((), 0));
+            let _ = frame;
+            let (ch, _) = gtp_wire::frame::Frame::decode(&buf[hlen..]).unwrap();
+            assert!(matches!(ch, gtp_wire::frame::Frame::ClientHello { .. }));
+            let cid = match ch {
+                gtp_wire::frame::Frame::ClientHello { .. } => {
+                    PacketHeader::decode(&buf[..n]).unwrap().0.connection_id
+                }
+                _ => unreachable!(),
+            };
+            let pair = EphemeralKeyPair::generate();
+            let mut out = [0u8; 256];
+            let hdr = PacketHeader::new_long(1, cid, PacketNumber(0), 0, 0);
+            let hlen = hdr.encode(&mut out).unwrap();
+            let hello = Frame::ServerHello {
+                server_public_key: pair.public_key,
+                server_nonce: pair.nonce,
+                stateless_cookie: [0x77; 32],
+                assigned_cid: cid,
+                // The attacker's OWN static key — the substitution under test.
+                server_static_pk: attacker_identity.public_key(),
+            };
+            let flen = hello.encode(&mut out[hlen..]).unwrap();
+            let _ = attacker.send_to(&out[..hlen + flen], peer).await;
+            // The anchored client aborts on this very ServerHello — nothing
+            // further arrives; the task ends here.
+        });
+
+        let cid = ConnectionId(0xBAD_0000_0000_0001);
+        let res = client.connect(cid, attacker_addr, true).await;
+        responder_task.await.unwrap();
+        match res {
+            Err(TransportError::HandshakeFailed(msg)) => {
+                assert!(msg.contains("server identity mismatch"), "got: {msg}");
+            }
+            other => panic!("expected identity mismatch, got {:?}", other.map(|_| ())),
+        }
+    }
+
     /// v1.2: a responder that completes the DH dance but cannot produce a
     /// valid mirrored proof (here: all-zero ServerFinish) must be rejected
     /// with a classified failure — never a silently established session.
@@ -1067,6 +1253,7 @@ mod tests {
                 server_nonce: pair.nonce,
                 stateless_cookie: [0x77; 32],
                 assigned_cid: cid,
+                server_static_pk: [0u8; 32], // anonymous
             };
             let flen = frame.encode(&mut out[hlen..]).unwrap();
             let _ = responder.send_to(&out[..hlen + flen], client).await;

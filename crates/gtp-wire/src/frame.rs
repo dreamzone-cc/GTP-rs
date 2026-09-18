@@ -26,7 +26,7 @@ pub const FRAME_TYPE_HANDSHAKE_FINISH: u8 = 0x0D;
 pub const FRAME_TYPE_SERVER_FINISH: u8 = 0x0E;
 /// Protocol version carried in ClientHello and bound into the confirmation
 /// transcript. v1.2 peers reject any other version outright.
-pub const PROTOCOL_VERSION: u32 = 0x0000_0002;
+pub const PROTOCOL_VERSION: u32 = 0x0000_0003;
 
 /// Compact ACK Range representation.
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Default)]
@@ -102,6 +102,9 @@ pub enum Frame<'a> {
         server_nonce: [u8; 32],
         stateless_cookie: [u8; 32],
         assigned_cid: ConnectionId,
+        /// v1.3 trust anchor: the server's long-term static identity public
+        /// key, or all zeros when the server runs anonymous.
+        server_static_pk: [u8; 32],
     },
     HandshakeFinish {
         cookie_echo: [u8; 32],
@@ -460,8 +463,9 @@ impl<'a> Frame<'a> {
                 server_nonce,
                 stateless_cookie,
                 assigned_cid,
+                server_static_pk,
             } => {
-                if buf.len() < offset + 32 + 32 + 32 + 8 {
+                if buf.len() < offset + 32 + 32 + 32 + 8 + 32 {
                     return Err(TransportError::BufferOverflow);
                 }
                 buf[offset..offset + 32].copy_from_slice(server_public_key);
@@ -472,6 +476,8 @@ impl<'a> Frame<'a> {
                 offset += 32;
                 buf[offset..offset + 8].copy_from_slice(&assigned_cid.to_be_bytes());
                 offset += 8;
+                buf[offset..offset + 32].copy_from_slice(server_static_pk);
+                offset += 32;
             }
 
             Self::ServerFinish { server_proof } => {
@@ -703,12 +709,17 @@ impl<'a> Frame<'a> {
                 let cid_bytes = read_u64(buf, &mut offset)?;
                 let cid = ConnectionId(cid_bytes);
 
+                let st = read_bytes(buf, &mut offset, 32)?;
+                let mut server_static_pk = [0u8; 32];
+                server_static_pk.copy_from_slice(st);
+
                 Ok((
                     Frame::ServerHello {
                         server_public_key,
                         server_nonce,
                         stateless_cookie,
                         assigned_cid: cid,
+                        server_static_pk,
                     },
                     offset,
                 ))
@@ -933,6 +944,7 @@ mod tests {
             server_nonce: [0x88; 32],
             stateless_cookie: [0x99; 32],
             assigned_cid: ConnectionId(0xDEADBEEFCAFE),
+            server_static_pk: [0x77; 32],
         };
         let len = server_hello.encode(&mut buf).unwrap();
         let (decoded, _) = Frame::decode(&buf[..len]).unwrap();

@@ -8,19 +8,76 @@ use std::ops::DerefMut;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Secure container for ephemeral Diffie-Hellman shared secret with guaranteed zeroization on drop.
+/// Session secret input to the key schedule (v1.3): the ephemeral-ephemeral
+/// X25519 shared secret concatenated with the ephemeral-static shared secret
+/// (`SS_eph ‖ SS_static`). The static term is 32 zero bytes in anonymous mode;
+/// with a pinned server identity it is uncomputable by a man-in-the-middle,
+/// which is exactly what closes the MITM gap (spec amendment v1.3 §4).
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct HandshakeSharedSecret {
-    secret: [u8; 32],
+    secret: [u8; 64],
 }
 
 impl HandshakeSharedSecret {
+    /// Anonymous (v1.2-compatible) construction: the static term reads as zeros.
     pub fn new(secret: [u8; 32]) -> Self {
-        Self { secret }
+        let mut full = [0u8; 64];
+        full[..32].copy_from_slice(&secret);
+        Self { secret: full }
     }
 
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub fn as_bytes(&self) -> &[u8; 64] {
         &self.secret
+    }
+}
+
+/// Long-term server identity (v1.3 trust anchor): a static X25519 keypair
+/// whose public half is pinned by clients ahead of time. The secret never
+/// leaves the server process; persistence/rotation is an application concern.
+pub struct StaticIdentity {
+    secret: StaticSecret,
+}
+
+impl StaticIdentity {
+    /// Generates a fresh identity from the OS CSPRNG.
+    pub fn generate() -> Self {
+        Self {
+            secret: StaticSecret::random_from_rng(OsRng),
+        }
+    }
+
+    /// Restores an identity from a persisted 32-byte seed (clamped as
+    /// x25519-dalek requires).
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        Self {
+            secret: StaticSecret::from(seed),
+        }
+    }
+
+    pub fn public_key(&self) -> [u8; 32] {
+        *PublicKey::from(&self.secret).as_bytes()
+    }
+
+    /// Server side of the v1.3 schedule: both DH terms against one client
+    /// ephemeral public key.
+    pub fn complete_server_session(
+        &self,
+        server_ephemeral_pair: EphemeralKeyPair,
+        client_public_key: &[u8; 32],
+    ) -> Result<HandshakeSharedSecret, &'static str> {
+        let ephemeral = EphemeralKeyPair::compute_shared_secret_raw(
+            server_ephemeral_pair.secret,
+            client_public_key,
+        )?;
+        let client_pk = PublicKey::from(*client_public_key);
+        let static_ss = self.secret.diffie_hellman(&client_pk);
+        if !static_ss.was_contributory() {
+            return Err("non-contributory client public key rejected");
+        }
+        let mut secret = [0u8; 64];
+        secret[..32].copy_from_slice(&ephemeral);
+        secret[32..].copy_from_slice(static_ss.as_bytes());
+        Ok(HandshakeSharedSecret { secret })
     }
 }
 
@@ -48,20 +105,47 @@ impl EphemeralKeyPair {
         }
     }
 
-    /// Perform Diffie-Hellman scalar multiplication against the peer's public key.
-    ///
-    /// Returns `Err` for non-contributory (low-order / all-zero) peer public keys
-    /// so that key material is never derived from a degenerate shared secret.
+    /// Ephemeral-ephemeral term only (usable by both sides).
+    fn compute_shared_secret_raw(
+        secret: StaticSecret,
+        peer_public_key: &[u8; 32],
+    ) -> Result<[u8; 32], &'static str> {
+        let peer_pk = PublicKey::from(*peer_public_key);
+        let shared = secret.diffie_hellman(&peer_pk);
+        if !shared.was_contributory() {
+            return Err("non-contributory X25519 public key rejected");
+        }
+        Ok(*shared.as_bytes())
+    }
+
+    /// Anonymous handshake (v1.2-compatible): the static term reads as zeros.
     pub fn compute_shared_secret(
         self,
         peer_public_key: &[u8; 32],
     ) -> Result<HandshakeSharedSecret, &'static str> {
-        let peer_pk = PublicKey::from(*peer_public_key);
-        let shared = self.secret.diffie_hellman(&peer_pk);
-        if !shared.was_contributory() {
-            return Err("non-contributory X25519 public key rejected");
+        let ephemeral = Self::compute_shared_secret_raw(self.secret, peer_public_key)?;
+        Ok(HandshakeSharedSecret::new(ephemeral))
+    }
+
+    /// Anchored client handshake (v1.3): computes `SS_eph ‖ SS_static` against
+    /// the PINNED server static public key. `server_static_pk` must already
+    /// have been verified against the pin — this function does not re-check it.
+    pub fn compute_shared_secret_with_static(
+        self,
+        peer_ephemeral_public_key: &[u8; 32],
+        server_static_pk: &[u8; 32],
+    ) -> Result<HandshakeSharedSecret, &'static str> {
+        let ephemeral =
+            Self::compute_shared_secret_raw(self.secret.clone(), peer_ephemeral_public_key)?;
+        let static_pk = PublicKey::from(*server_static_pk);
+        let static_ss = self.secret.diffie_hellman(&static_pk);
+        if !static_ss.was_contributory() {
+            return Err("non-contributory static server public key rejected");
         }
-        Ok(HandshakeSharedSecret::new(*shared.as_bytes()))
+        let mut secret = [0u8; 64];
+        secret[..32].copy_from_slice(&ephemeral);
+        secret[32..].copy_from_slice(static_ss.as_bytes());
+        Ok(HandshakeSharedSecret { secret })
     }
 }
 
@@ -122,11 +206,12 @@ pub fn derive_directional_handshake_session_keys(
     server_nonce: &[u8; 32],
     connection_id: ConnectionId,
 ) -> DirectionalKeys {
-    // Combine shared secret with client & server nonces into HKDF input
-    let mut ikm = [0u8; 96];
-    ikm[..32].copy_from_slice(shared_secret.as_bytes());
-    ikm[32..64].copy_from_slice(client_nonce);
-    ikm[64..96].copy_from_slice(server_nonce);
+    // Combine the (possibly anchored) session secret with both nonces into
+    // HKDF input: SS_eph ‖ SS_static ‖ client_nonce ‖ server_nonce (128B).
+    let mut ikm = [0u8; 128];
+    ikm[..64].copy_from_slice(shared_secret.as_bytes());
+    ikm[64..96].copy_from_slice(client_nonce);
+    ikm[96..128].copy_from_slice(server_nonce);
 
     let salt = b"GTP_V1_1_X25519_SESSION_KEY_EXCHANGE";
     let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);
@@ -520,6 +605,47 @@ mod tests {
             &transcript,
             &proof
         ));
+    }
+
+    /// v1.3: anchored derivation is symmetric between the pinned client and
+    /// the identity-holding server, and a man-in-the-middle (its own ephemeral
+    /// against the same pinned static key) derives DIFFERENT material — the
+    /// schedule term it cannot compute.
+    #[test]
+    fn anchored_session_secret_is_symmetric_and_mitm_proof() {
+        let identity = StaticIdentity::generate();
+        let pinned_static = identity.public_key();
+
+        let client_pair = EphemeralKeyPair::generate();
+        let server_pair = EphemeralKeyPair::generate();
+        let client_pk = client_pair.public_key;
+        let server_pk = server_pair.public_key;
+
+        // Client (pinned) and server (identity holder) agree exactly.
+        let client_ss = client_pair
+            .compute_shared_secret_with_static(&server_pk, &pinned_static)
+            .expect("contributory anchored DH");
+        let server_ss = identity
+            .complete_server_session(server_pair, &client_pk)
+            .expect("contributory server session");
+        assert_eq!(client_ss.as_bytes(), server_ss.as_bytes());
+
+        // The static term is non-zero (real DH output) in anchored mode.
+        assert_ne!(&client_ss.as_bytes()[32..], &[0u8; 32]);
+
+        // A MITM using its own ephemeral cannot reproduce the client's secret.
+        let mitm_pair = EphemeralKeyPair::generate();
+        let mitm_pk = mitm_pair.public_key;
+        let mitm_ss = mitm_pair
+            .compute_shared_secret_with_static(&client_pk, &pinned_static)
+            .expect("contributory");
+        assert_ne!(mitm_ss.as_bytes(), client_ss.as_bytes());
+        // And the honest server's schedule against a MITM-injected client key
+        // differs from the client's — proofs fail downstream, never match.
+        let honest_server_view = identity
+            .complete_server_session(EphemeralKeyPair::generate(), &mitm_pk)
+            .expect("contributory");
+        assert_ne!(honest_server_view.as_bytes(), client_ss.as_bytes());
     }
 
     /// SEC-12: non-contributory (low-order) peer public keys must be rejected.

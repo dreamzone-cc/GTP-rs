@@ -5,6 +5,33 @@ All notable changes to the Game Transport Protocol (GTP-rs) project will be docu
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 2026-09-18 v1.3: static-identity trust anchor — MITM closed
+
+Implements `docs/SPEC_AMENDMENT_V3_TRUST_ANCHOR_AR.md` (builds on v1.2).
+**199 → 202 tests green**, clippy clean.
+
+### Added
+- **Server long-term identity (X25519 static keypair)**: `StaticIdentity`
+  (generate / from_seed / public_key) and `GtpEndpoint::bind_with_static_identity`.
+  The advertised `server_static_pk` rides in ServerHello (protocol version 3;
+  zeros = anonymous server, v1.2 semantics preserved for tools/simulation).
+- **Client pinning**: `set_trusted_server_static` — a ServerHello advertising
+  anything but the pinned key aborts with a classified
+  `HandshakeFailed("server identity mismatch")` BEFORE any key derivation.
+- **Anchored key schedule**: the session secret becomes
+  `SS_eph ‖ SS_static ‖ nonces` (`compute_shared_secret_with_static` /
+  `complete_server_session`, non-contributory checks on both terms). A
+  man-in-the-middle cannot compute the static term, so it can derive neither
+  keys nor confirmation proofs on either leg — the gap anonymous X25519 could
+  never close. Anchored derivation symmetry + MITM divergence proven in
+  crypto unit tests, and end-to-end: a substituted static key is rejected
+  immediately; an anchored happy path completes and carries traffic.
+
+### Security scope
+- Anchor strength = secrecy of the pinned key in application distribution;
+  identity rotation = application release (no in-protocol upgrade yet).
+- v1.1 and v1.2 peers are rejected outright (version gate).
+
 ## [Unreleased] — 2026-09-18 comprehensive protocol audit: remediation, v1.2 handshake, hardening, ECN, performance
 
 Full-repo protocol engineering audit (sequential `ocr` scan for wire/core +
