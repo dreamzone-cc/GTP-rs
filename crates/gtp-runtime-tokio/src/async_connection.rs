@@ -5,13 +5,17 @@ use gtp_types::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 /// High-level asynchronous GTP Connection handle for tokio applications.
 pub struct AsyncGtpConnection {
     pub cid: ConnectionId,
     pub(crate) conn: Arc<Mutex<GtpConnection>>,
     pub(crate) rx_channel: mpsc::Receiver<ReceivedMessage>,
+    /// Wakes the endpoint's TX loop immediately on a new enqueue, so its
+    /// polling period can back off adaptively while idle without adding
+    /// first-packet latency.
+    pub(crate) tx_wake: Arc<Notify>,
 }
 
 impl AsyncGtpConnection {
@@ -21,6 +25,7 @@ impl AsyncGtpConnection {
             cid,
             conn: Arc::new(Mutex::new(conn)),
             rx_channel,
+            tx_wake: Arc::new(Notify::new()),
         }
     }
 
@@ -39,7 +44,10 @@ impl AsyncGtpConnection {
     ) -> Result<MessageId> {
         let mut guard = self.conn.lock().await;
         let now = MonotonicTime::now();
-        guard.send_unreliable(payload, priority, None, now)
+        let r = guard.send_unreliable(payload, priority, None, now);
+        drop(guard);
+        self.tx_wake.notify_one();
+        r
     }
 
     pub async fn send_sequenced(
@@ -61,7 +69,10 @@ impl AsyncGtpConnection {
     ) -> Result<MessageId> {
         let mut guard = self.conn.lock().await;
         let now = MonotonicTime::now();
-        guard.send_reliable_unordered(payload, priority, None, now)
+        let r = guard.send_reliable_unordered(payload, priority, None, now);
+        drop(guard);
+        self.tx_wake.notify_one();
+        r
     }
 
     pub async fn send_reliable_ordered(
@@ -72,7 +83,10 @@ impl AsyncGtpConnection {
     ) -> Result<MessageId> {
         let mut guard = self.conn.lock().await;
         let now = MonotonicTime::now();
-        guard.send_reliable_ordered(group_id, payload, priority, None, now)
+        let r = guard.send_reliable_ordered(group_id, payload, priority, None, now);
+        drop(guard);
+        self.tx_wake.notify_one();
+        r
     }
 
     pub async fn recv(&mut self) -> Option<ReceivedMessage> {
@@ -126,7 +140,10 @@ impl AsyncGtpConnection {
     pub async fn graceful_close(&self, error_code: u16, reason: &'static str) -> Result<()> {
         let mut guard = self.conn.lock().await;
         let now = MonotonicTime::now();
-        guard.control().graceful_close(error_code, reason, now)
+        let r = guard.control().graceful_close(error_code, reason, now);
+        drop(guard);
+        self.tx_wake.notify_one(); // a CLOSE frame must not wait for a poll
+        r
     }
 
     pub async fn ratchet_key(&self) {

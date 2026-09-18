@@ -420,12 +420,18 @@ impl GtpEndpoint {
             conns.insert(cid, (Arc::clone(&conn_arc), tx));
         }
 
-        Self::spawn_tx_loop(Arc::clone(&self.socket), Arc::clone(&conn_arc));
+        let tx_wake = Arc::new(tokio::sync::Notify::new());
+        Self::spawn_tx_loop(
+            Arc::clone(&self.socket),
+            Arc::clone(&conn_arc),
+            Arc::clone(&tx_wake),
+        );
 
         AsyncGtpConnection {
             cid,
             conn: conn_arc,
             rx_channel: rx,
+            tx_wake,
         }
     }
 
@@ -712,15 +718,18 @@ impl GtpEndpoint {
                                                 conns.insert(cid, (Arc::clone(&conn_arc), tx));
                                             }
 
+                                            let tx_wake = Arc::new(tokio::sync::Notify::new());
                                             Self::spawn_tx_loop(
                                                 Arc::clone(&socket),
                                                 Arc::clone(&conn_arc),
+                                                Arc::clone(&tx_wake),
                                             );
 
                                             let async_conn = AsyncGtpConnection {
                                                 cid,
                                                 conn: conn_arc,
                                                 rx_channel: rx,
+                                                tx_wake,
                                             };
 
                                             let _ = incoming_tx.send(async_conn).await;
@@ -764,6 +773,10 @@ impl GtpEndpoint {
                     let conns = connections.read().await;
                     if let Some((conn_arc, tx)) = conns.get(&cid) {
                         let mut guard = conn_arc.lock().await;
+                        // tokio's UdpSocket does not expose ancillary (cmsg)
+                        // reception, so the IP-layer ECN codepoint reads 0 on
+                        // this path; the sync gtp-io layer carries real ECN
+                        // via handle_incoming_datagram_with_ecn.
                         if let Ok(msgs) =
                             guard.handle_incoming_datagram(src, &mut datagram_copy, now)
                         {
@@ -852,13 +865,27 @@ impl GtpEndpoint {
         });
     }
 
-    fn spawn_tx_loop(socket: Arc<UdpSocket>, conn_arc: Arc<Mutex<GtpConnection>>) {
+    fn spawn_tx_loop(
+        socket: Arc<UdpSocket>,
+        conn_arc: Arc<Mutex<GtpConnection>>,
+        tx_wake: Arc<tokio::sync::Notify>,
+    ) {
         tokio::spawn(async move {
             let mut out_buf = [0u8; 1500];
-            let mut interval = tokio::time::interval(std::time::Duration::from_micros(500));
+            // Adaptive polling: 500us while active, backing off to 2ms after
+            // sustained idleness (4x fewer wakeups per idle connection), with
+            // an immediate wake on every application enqueue via `tx_wake` so
+            // the first packet after idle still leaves on the next loop turn.
+            let mut idle_rounds: u32 = 0;
 
             loop {
-                interval.tick().await;
+                let period = if idle_rounds >= 8 { 2_000 } else { 500 };
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_micros(period)) => {}
+                    _ = tx_wake.notified() => {
+                        // A producer enqueued something: run immediately.
+                    }
+                }
                 let now = MonotonicTime::now();
                 let mut guard = conn_arc.lock().await;
 
@@ -868,10 +895,17 @@ impl GtpEndpoint {
                     break;
                 }
 
+                let mut produced = 0;
                 while let Ok(Some((dest, len))) = guard.produce_outgoing_datagram(now, &mut out_buf)
                 {
+                    produced += 1;
                     let _ = socket.send_to(&out_buf[..len], dest).await;
                 }
+                idle_rounds = if produced == 0 {
+                    idle_rounds.saturating_add(1)
+                } else {
+                    0
+                };
             }
         });
     }

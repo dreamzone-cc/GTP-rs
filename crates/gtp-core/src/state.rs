@@ -141,13 +141,15 @@ pub struct ConnectionHot {
     pub pacing: PacingEngine,
     pub scheduler: GameScheduler,
     /// Live receive-side ordered groups, keyed by `group_id` (FR-2). PRIVATE:
-    /// the map and `ordered_group_order` form a coupled pair whose sync
-    /// enforces the `MAX_ORDERED_GROUPS` DoS bound — mutation happens only
-    /// through [`ConnectionHot::ordered_group_mut`], which maintains both.
+    /// bounded by `MAX_ORDERED_GROUPS`; mutation happens only through
+    /// [`ConnectionHot::ordered_group_mut`].
     ordered_groups: FxHashMap<u16, OrderedGroupReceiver>,
-    /// Insertion/LRU order of the live receive-side ordered groups (FR-2).
-    /// Private twin of `ordered_groups` — see that field's doc.
-    ordered_group_order: VecDeque<u16>,
+    /// FU-5/O(1) LRU: monotonic access generation per live group. A touch is
+    /// one hash insert; eviction (only when a NEW group arrives at the cap)
+    /// scans for the minimum generation. This replaces the per-frame
+    /// `VecDeque::retain` scan on the RX hot path.
+    group_gens: FxHashMap<u16, u64>,
+    gen_counter: u64,
     /// RX-side freshness table (SEM-2): drops late sequenced state at the receiver.
     pub rx_state_table: StateTable,
     /// ReliableUnordered duplicate-delivery guard (ORD-4).
@@ -383,7 +385,8 @@ impl ConnectionHot {
             // instead of inheriting the largest tier's 1 MB ceiling.
             scheduler: GameScheduler::with_per_tier_byte_caps(config.max_queue_bytes_per_tier),
             ordered_groups: FxHashMap::default(),
-            ordered_group_order: VecDeque::new(),
+            group_gens: FxHashMap::default(),
+            gen_counter: 0,
             rx_state_table: StateTable::new(),
             delivered_index: DeliveredIndex::new(4096),
             replay_window: ReplayWindow::new(),
@@ -423,23 +426,24 @@ impl ConnectionHot {
     /// recreated fresh.
     pub fn ordered_group_mut(&mut self, group_id: OrderedGroupId) -> &mut OrderedGroupReceiver {
         let key = group_id.as_u16();
-        if self.ordered_groups.contains_key(&key) {
-            // FU-5: touch — move to the most-recently-used end so eviction
-            // trims the least recently USED group, not the oldest created one.
-            self.ordered_group_order.retain(|k| *k != key);
-            self.ordered_group_order.push_back(key);
+        if let Some(gen_slot) = self.group_gens.get_mut(&key) {
+            // FU-5 touch: O(1) — bump the access generation.
+            self.gen_counter += 1;
+            *gen_slot = self.gen_counter;
         } else {
-            while self.ordered_group_order.len() >= MAX_ORDERED_GROUPS {
-                match self.ordered_group_order.pop_front() {
-                    Some(lru) => {
-                        self.ordered_groups.remove(&lru);
-                    }
-                    None => break,
-                }
+            // New group: evict the least-recently-USED one only when the cap
+            // is reached (rare path — once per distinct new group).
+            while self.ordered_groups.len() >= MAX_ORDERED_GROUPS {
+                let Some((&lru, _)) = self.group_gens.iter().min_by_key(|(_, g)| **g) else {
+                    break;
+                };
+                self.ordered_groups.remove(&lru);
+                self.group_gens.remove(&lru);
             }
+            self.gen_counter += 1;
+            self.group_gens.insert(key, self.gen_counter);
             self.ordered_groups
                 .insert(key, OrderedGroupReceiver::new(group_id));
-            self.ordered_group_order.push_back(key);
         }
         self.ordered_groups
             .get_mut(&key)
