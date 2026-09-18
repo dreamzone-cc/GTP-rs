@@ -5,6 +5,75 @@ All notable changes to the Game Transport Protocol (GTP-rs) project will be docu
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 2026-09-18 comprehensive protocol audit: remediation, v1.2 handshake, hardening, ECN, performance
+
+Full-repo protocol engineering audit (sequential `ocr` scan for wire/core +
+in-session delegated review for the remaining crates, per
+`docs/OCR_PROTOCOL_AUDIT_GUIDE.md`), followed by complete remediation.
+**187 → 199 tests green**, clippy clean across every commit; results,
+priorities and the follow-up plan live in `docs/POST_AUDIT_EXECUTION_PLAN_AR.md`.
+
+### Fixed — audit remediation (critical/high/medium)
+- **Hardcoded compile-time master secret removed from every production-reachable path**;
+  the legacy constructors now require an explicit secret named at each call site
+  (`OFFLINE_SIM_MASTER_SECRET` for sim/tests only); `connect(secure=false)` fails
+  closed in production builds.
+- **Handshake confirmation proofs** are keyed by a dedicated key derived from the
+  X25519 shared secret (SEC-9, never an AEAD traffic key) and bind the **full
+  transcript** (both public keys, both nonces, CID, and as of v1.2 the protocol
+  version) — replay/substitution/downgrade of any bound field breaks both proofs.
+- **Key ratchet** binds a monotonic key-phase counter into the HKDF info and rotates
+  (key, IV) together with distinct labels; a second rotation inside the open grace
+  window is refused (was: silently undecryptable in-flight traffic, no recovery).
+- **Key material zeroization**: DirectionalKeys/SessionDirectionalKeys drop
+  `Clone/Copy` and derive `Zeroize+ZeroizeOnDrop`; session key fields are
+  `Zeroizing`; the confirmation key is zeroized after use. The R-6 doc claim is
+  now true.
+- **Nonce-space contract enforced structurally**: `GtpAeadProtector::new_for_cid`
+  rejects any foreign ConnectionId at seal/open.
+- **PlaintextProtector** gated behind the off-by-default `insecure-plaintext`
+  feature (pass-through in gtp-core / gtp-runtime-tokio).
+- **Wire**: `PacketBuilder::finish` enforces `payload_len <= u16::MAX` with a typed
+  error (was: silent wrapping cast); header/payload length consistency asserted in
+  the round-trip test; `PacketBuilder::new` rejects a `header_len` that disagrees
+  with the flags-derived size; `FrameIterator` fails closed on zero-consumption
+  decodes (hostile-input infinite loop guard).
+- **Scheduler per-tier byte caps** actually enforced per tier (tier-0 latency budget
+  no longer inherits the largest tier's ceiling); ordered-group DoS bound made
+  private/structural.
+- Two-stage key schedule (traffic secrets chain through the master key); crypto
+  bench methodology aligned; workspace publish metadata and internal dep versions.
+
+### Added — v1.2 handshake (spec amendment `docs/SPEC_AMENDMENT_V2_SERVER_FINISH_AR.md`)
+- `Frame::ServerFinish` (0x0E): the server's mirrored confirmation proof; the client
+  declares the session established ONLY after it verifies (a ServerHello never
+  followed by a valid proof is a classified failure, not a silent session).
+- Protocol version (2) bound into the transcript; v1.1 peers are rejected outright
+  (no dual-version window); retransmitted/replayed Finishes are re-answered from a
+  bounded cache WITHOUT re-registering (a replay cannot reset live state).
+- Honest scope note: this closes the finish asymmetry, downgrade and reflection
+  gaps; full MITM resistance still needs a trust anchor (PSK/cert) — proposed v1.3.
+
+### Added — ECN (QUIC-style, sync I/O path)
+- `UdpSocketIo::enable_ecn()`: marks outgoing traffic ECT(0) at the IP layer and
+  receives with ancillary data (recvmsg + IP_RECVTOS/IPV6_TCLASS), reporting the
+  delivered 2-bit ECN codepoint per datagram; `handle_incoming_datagram_with_ecn`
+  feeds it into the ACK tracker so the peer's congestion controller reacts via
+  `on_ecn`. Loopback e2e test proves the marking survives to the receiver. The
+  tokio endpoint path still reads 0 (tokio has no ancillary recv) — documented.
+
+### Changed — hardening & performance
+- Per-IP hello rate limiter is self-pruning (spoofed-source floods cannot grow it);
+  pending-client entries are cleaned on failed initial sends; ACK delay saturates
+  instead of truncating; timed-out path challenges are reaped; transient ICMP-style
+  receive errors end the batch instead of aborting it; `MAX_DATAGRAM_SIZE` unified
+  in gtp-types.
+- Ordered-group LRU touch is O(1) (generation counters; eviction scan only when a
+  new group arrives at the cap) replacing the per-frame O(256) scan.
+- Endpoint TX loop polls adaptively (500us active → 2ms idle) with an immediate
+  wake (`Notify`) on every application enqueue — lower idle wakeups, no added
+  first-packet latency.
+
 ## [Unreleased] — 2026-09-07 G3 prelude: report freshness, structured decision log, adversarial suite
 
 First executable slice of the post-G2 gap paper (its P0 items, per

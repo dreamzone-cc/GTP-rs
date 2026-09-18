@@ -309,7 +309,11 @@ impl LossDetector {
 
         let mut lost_pns = Vec::new();
         for (&pn, record) in &self.sent_packets {
-            if pn > largest_pn || !record.in_flight {
+            // Loss is declared for in-flight AND ack-eliciting packets only
+            // (RFC 9002 §2); today no record is constructed with
+            // in_flight && !ack_eliciting, and this filter keeps it that way
+            // structurally instead of by convention.
+            if pn > largest_pn || !record.in_flight || !record.ack_eliciting {
                 continue;
             }
 
