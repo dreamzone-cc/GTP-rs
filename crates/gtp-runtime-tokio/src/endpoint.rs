@@ -13,6 +13,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+// Only the gated insecure branch and tests reference the sim secret.
+#[cfg(any(test, feature = "insecure-plaintext"))]
+use gtp_core::state::OFFLINE_SIM_MASTER_SECRET;
 
 type ConnectionMap = Arc<
     RwLock<FxHashMap<ConnectionId, (Arc<Mutex<GtpConnection>>, mpsc::Sender<ReceivedMessage>)>>,
@@ -118,9 +121,25 @@ impl GtpEndpoint {
         secure: bool,
     ) -> Result<AsyncGtpConnection> {
         if !secure {
-            #[allow(deprecated)]
-            let conn = GtpConnection::new(cid, peer_addr, false);
-            return Ok(self.register_connection(cid, conn).await);
+            // Fail closed: plaintext connections exist only in test/sim builds
+            // (the null-cipher protector is feature-gated off in production).
+            #[cfg(any(test, feature = "insecure-plaintext"))]
+            {
+                #[allow(deprecated)]
+                let conn = GtpConnection::new_with_role(
+                    cid,
+                    peer_addr,
+                    false,
+                    true,
+                    OFFLINE_SIM_MASTER_SECRET,
+                    GtpConfig::default(),
+                );
+                return Ok(self.register_connection(cid, conn).await);
+            }
+            #[cfg(not(any(test, feature = "insecure-plaintext")))]
+            return Err(TransportError::HandshakeFailed(
+                "insecure (plaintext) connections are disabled in production builds",
+            ));
         }
 
         // 1. Perform X25519 Ephemeral Handshake
@@ -190,9 +209,17 @@ impl GtpEndpoint {
         let keys =
             derive_directional_handshake_session_keys(&shared, &client_nonce, &server_nonce, cid);
 
-        // 4. Send HandshakeFinish confirmation with Key Confirmation Proof
-        let client_proof =
-            gtp_crypto::compute_client_proof(&keys.client_tx_key, &client_pk, &server_pk);
+        // 4. Send HandshakeFinish confirmation with Key Confirmation Proof.
+        // SEC-9: keyed by the dedicated confirmation key derived from the shared
+        // secret (never an AEAD traffic key), bound to the full transcript.
+        let transcript = gtp_crypto::HandshakeTranscript {
+            client_pk,
+            server_pk,
+            client_nonce,
+            server_nonce,
+            connection_id: cid,
+        };
+        let client_proof = gtp_crypto::compute_client_proof(&shared, &transcript);
         let mut fin_buf = [0u8; 128];
         let fin_hdr = PacketHeader::new_long(1, cid, PacketNumber(1), 0, 0);
         let fin_hdr_len = fin_hdr
@@ -522,10 +549,16 @@ impl GtpEndpoint {
                                         );
 
                                         // 2. Cryptographic Key Confirmation: Client & Server derived identical keys
+                                        let transcript = gtp_crypto::HandshakeTranscript {
+                                            client_pk,
+                                            server_pk,
+                                            client_nonce,
+                                            server_nonce,
+                                            connection_id: cid,
+                                        };
                                         if gtp_crypto::verify_client_proof(
-                                            &keys.client_tx_key,
-                                            &client_pk,
-                                            &server_pk,
+                                            &shared,
+                                            &transcript,
                                             &client_proof,
                                         ) {
                                             // Instantiate verified connection (pre_validated: true).
@@ -703,48 +736,65 @@ mod tests {
     use super::*;
     use gtp_types::PriorityTier;
 
-    /// N-1 regression, deterministic: drive a real sealed connection until it emits a
-    /// datagram whose first ciphertext byte collides with a handshake frame type, then
-    /// assert the routing gate still treats it as ordinary traffic. Before the gate this
-    /// exact datagram entered a handshake branch and was dropped by its `continue`.
+    /// N-1 regression: a datagram whose first ciphertext byte collides with a
+    /// handshake frame type must still be routed as ordinary traffic. Before the
+    /// gate this exact datagram entered a handshake branch and was dropped by
+    /// its `continue`.
+    ///
+    /// The colliding datagram is CRAFTED deterministically: the connection's
+    /// legacy key material is static, so its keystream is a pure function of
+    /// the packet number — sealing the same payload under successive PNs
+    /// sweeps first-ciphertext bytes until one lands on a handshake type
+    /// (pigeonhole: expected ~85 tries, bounded at 4096). Relying on the live
+    /// TX loop instead would race the congestion window: with no peer ACKs the
+    /// window fills and production stalls long before 3 random collisions are
+    /// guaranteed.
     #[test]
     fn short_header_ciphertext_colliding_with_handshake_types_is_still_routed() {
         let cid = ConnectionId(0xA11C_E000_1234_5678);
         let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        let mut conn = GtpConnection::new(cid, peer, true);
+        let mut conn = GtpConnection::new_with_role(
+            cid,
+            peer,
+            true,
+            true,
+            OFFLINE_SIM_MASTER_SECRET,
+            GtpConfig::default(),
+        );
 
+        let payload = b"n1-collision-probe".to_vec();
+        let aad = b"short_header_aad";
         let mut out = [0u8; 1500];
-        let mut now = MonotonicTime::from_micros(1_000_000);
         let mut collisions = 0usize;
 
-        // 3/256 of datagrams collide, so a few hundred sends make this practically certain
-        // while keeping the test deterministic in cost.
-        for i in 0..4096u32 {
-            now += gtp_types::Duration::from_millis(1);
-            conn.send_unreliable(
-                format!("n1-probe-{i}").into_bytes(),
-                PriorityTier::P1Input,
-                None,
-                now,
+        for pn_offset in 1u64..=4096 {
+            // Deterministic keystream sweep: seal under successive packet numbers.
+            let pn = PacketNumber(pn_offset);
+            out[..payload.len()].copy_from_slice(&payload);
+            let sealed = gtp_crypto::PacketProtector::seal(
+                &gtp_crypto::GtpAeadProtector::new(*conn.hot.tx_key, *conn.hot.tx_iv),
+                pn,
+                cid,
+                aad,
+                &mut out[..],
+                payload.len(),
             )
-            .expect("probe send fits the datagram budget");
+            .expect("probe seals");
+            let sealed_len = sealed + 24; // + short header
 
-            let Ok(Some((_, len))) = conn.produce_outgoing_datagram(now, &mut out) else {
-                continue;
-            };
-            let (header, header_len) =
-                PacketHeader::decode(&out[..len]).expect("self-produced datagram decodes");
+            // Build a real short-header datagram around the sealed payload.
+            let header = PacketHeader::new_short(cid, pn, 1_000_000, 0);
+            let header_len = header.encode(&mut out).expect("header encodes");
+            assert_eq!(header_len, 24);
+            let total_len = header_len + sealed;
 
-            // Established traffic must always use the short header — that is what makes
-            // the gate a sound discriminator in the first place.
+            // Established traffic must always use the short header — that is
+            // what makes the gate a sound discriminator in the first place.
             assert!(
                 !header.flags.is_long_header(),
                 "established-connection traffic must carry a short header"
             );
 
-            if header_len >= len {
-                continue;
-            }
             let first_payload_byte = out[header_len];
             if matches!(
                 first_payload_byte,
@@ -752,7 +802,7 @@ mod tests {
             ) {
                 collisions += 1;
                 assert!(
-                    !is_handshake_candidate(&header, header_len, len),
+                    !is_handshake_candidate(&header, header_len, total_len),
                     "datagram whose ciphertext starts with 0x{first_payload_byte:02X} was \
                      routed into the handshake path and would be dropped (N-1)"
                 );
@@ -762,7 +812,10 @@ mod tests {
             }
         }
 
-        panic!("no ciphertext/handshake-type collision produced in 4096 datagrams — the probe is broken, not the gate");
+        panic!(
+            "no ciphertext/handshake-type collision produced in 4096 sealed probes — \
+             the probe is broken, not the gate"
+        );
     }
 
     /// The gate must not cost the handshake anything: all three handshake frames are

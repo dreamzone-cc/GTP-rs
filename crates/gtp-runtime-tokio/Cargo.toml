@@ -15,3 +15,7 @@ gtp-path = { workspace = true }
 tokio = { workspace = true }
 rand = { workspace = true }
 rustc-hash = { workspace = true }
+
+[features]
+# Passthrough: enables the null-cipher protector for simulation builds only.
+insecure-plaintext = ["gtp-crypto/insecure-plaintext", "gtp-core/insecure-plaintext"]

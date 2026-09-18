@@ -1,4 +1,5 @@
 use gtp::prelude::*;
+use gtp_core::state::OFFLINE_SIM_MASTER_SECRET;
 use std::net::SocketAddr;
 
 #[test]
@@ -14,6 +15,7 @@ fn test_gtp_library_end_to_end_integration() {
         server_addr,
         true, // AEAD encryption
         true, // client role
+        OFFLINE_SIM_MASTER_SECRET,
         GtpConfig::competitive_fps(),
     );
 
@@ -22,6 +24,7 @@ fn test_gtp_library_end_to_end_integration() {
         client_addr,
         true,
         false, // server role
+        OFFLINE_SIM_MASTER_SECRET,
         GtpConfig::competitive_fps(),
     );
 

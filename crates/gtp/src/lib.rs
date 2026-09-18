@@ -14,12 +14,18 @@
 //! use gtp::prelude::*;
 //! use std::net::SocketAddr;
 //!
+//! // Offline-simulation secret: production code derives per-session keys via
+//! // the X25519 handshake (GtpEndpoint::connect) instead.
+//! use gtp_core::state::OFFLINE_SIM_MASTER_SECRET;
+//!
 //! let server_addr: SocketAddr = "127.0.0.1:7777".parse().unwrap();
-//! let mut conn = GtpConnection::new_with_config(
+//! let mut conn = GtpConnection::new_with_role(
 //!     ConnectionId(0x1020304050607080),
 //!     server_addr,
 //!     true, // AEAD protection
-//!     GtpConfig::competitive_fps(),
+//!     true, // client role
+//!     OFFLINE_SIM_MASTER_SECRET,
+//!     GtpConfig::competitive_fps()
 //! );
 //!
 //! let now = MonotonicTime::now();
@@ -111,15 +117,18 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::prelude::*;
+    use crate::core::state::OFFLINE_SIM_MASTER_SECRET;
     use std::net::SocketAddr;
 
     #[test]
     fn test_sdk_facade_roundtrip() {
         let server_addr: SocketAddr = "127.0.0.1:8888".parse().unwrap();
-        let mut conn = GtpConnection::new_with_config(
+        let mut conn = GtpConnection::new_with_role(
             ConnectionId(0x1111_2222_3333_4444),
             server_addr,
             true,
+            true,
+            OFFLINE_SIM_MASTER_SECRET,
             GtpConfig::competitive_fps(),
         );
 

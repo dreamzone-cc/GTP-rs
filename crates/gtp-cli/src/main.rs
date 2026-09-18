@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use gtp::prelude::*;
+use gtp_core::state::OFFLINE_SIM_MASTER_SECRET;
 use gtp_sim::{NetworkProfile, SimulationRunner};
 use gtp_wire::{FrameIterator, PacketHeader};
 use std::net::SocketAddr;
@@ -217,10 +218,14 @@ async fn main() -> Result<()> {
             println!("=== GTP/1.1 Dedicated Runtime Control API Demo ===");
 
             let server_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-            let mut conn = GtpConnection::new_with_config(
+            // Offline-simulation demo path; production uses GtpEndpoint::connect.
+            #[allow(deprecated)]
+            let mut conn = GtpConnection::new_with_role(
                 ConnectionId(0x1020304050607080),
                 server_addr,
                 true,
+                true,
+                OFFLINE_SIM_MASTER_SECRET,
                 GtpConfig::competitive_fps(),
             );
 

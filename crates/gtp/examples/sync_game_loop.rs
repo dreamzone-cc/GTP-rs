@@ -1,6 +1,7 @@
 //! Example: Synchronous 60 FPS Game Loop using the GTP Rust Library SDK
 
 use gtp::prelude::*;
+use gtp_core::state::OFFLINE_SIM_MASTER_SECRET;
 use std::net::SocketAddr;
 
 fn main() -> Result<()> {
@@ -10,10 +11,12 @@ fn main() -> Result<()> {
     let cid = ConnectionId(0xDEAD_BEEF_0000_0001);
 
     // 1. Initialize connection using the high-level library API
-    let mut conn = GtpConnection::new_with_config(
+    let mut conn = GtpConnection::new_with_role(
         cid,
         server_addr,
         true, // AEAD Protected
+        true, // client role
+        OFFLINE_SIM_MASTER_SECRET,
         GtpConfig::competitive_fps(),
     );
 

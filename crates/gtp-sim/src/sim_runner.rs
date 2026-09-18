@@ -1,5 +1,8 @@
+// Simulation-only crate: intentionally drives the legacy static-secret
+#![allow(deprecated)] // constructors (see gtp_core::state::OFFLINE_SIM_MASTER_SECRET).
 use crate::impairments::NetworkProfile;
 use crate::simulated_network::SimulatedNetwork;
+use gtp_core::state::OFFLINE_SIM_MASTER_SECRET;
 use gtp_core::{GtpConnection, ReceivedMessage};
 use gtp_types::{ConnectionId, Duration, MonotonicTime};
 use std::net::SocketAddr;
@@ -24,9 +27,22 @@ impl SimulationRunner {
         // SEC-1: the two peers must hold opposite directional roles — with the same
         // role both would seal with the same key and every packet number would
         // collide on one (key, nonce) pair across directions.
-        let client = GtpConnection::new_with_role(cid, server_addr, true, true, Default::default());
-        let server =
-            GtpConnection::new_with_role(cid, client_addr, true, false, Default::default());
+        let client = GtpConnection::new_with_role(
+            cid,
+            server_addr,
+            true,
+            true,
+            OFFLINE_SIM_MASTER_SECRET,
+            Default::default(),
+        );
+        let server = GtpConnection::new_with_role(
+            cid,
+            client_addr,
+            true,
+            false,
+            OFFLINE_SIM_MASTER_SECRET,
+            Default::default(),
+        );
 
         Self {
             client,

@@ -6,13 +6,28 @@
 //! layers stops agreeing on the contract between them.
 
 use gtp::prelude::*;
+use gtp_core::state::OFFLINE_SIM_MASTER_SECRET;
 use std::net::SocketAddr;
 
 fn pair(cid: ConnectionId, client_port: u16, server_port: u16) -> (GtpConnection, GtpConnection) {
     let client_addr: SocketAddr = format!("127.0.0.1:{client_port}").parse().unwrap();
     let server_addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
-    let client = GtpConnection::new_with_role(cid, server_addr, true, true, GtpConfig::default());
-    let server = GtpConnection::new_with_role(cid, client_addr, true, false, GtpConfig::default());
+    let client = GtpConnection::new_with_role(
+        cid,
+        server_addr,
+        true,
+        true,
+        OFFLINE_SIM_MASTER_SECRET,
+        GtpConfig::default(),
+    );
+    let server = GtpConnection::new_with_role(
+        cid,
+        client_addr,
+        true,
+        false,
+        OFFLINE_SIM_MASTER_SECRET,
+        GtpConfig::default(),
+    );
     (client, server)
 }
 

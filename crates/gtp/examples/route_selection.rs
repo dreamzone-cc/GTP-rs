@@ -5,6 +5,7 @@
 
 use gtp::prelude::*;
 use gtp::route::{health, select, PathStats};
+use gtp_core::state::OFFLINE_SIM_MASTER_SECRET;
 use std::net::SocketAddr;
 
 fn main() {
@@ -12,12 +13,20 @@ fn main() {
     // genuine engine output, not hand-made numbers.
     let cid = ConnectionId(0x5E11_0000_0000_0001);
     let peer: SocketAddr = "127.0.0.1:6000".parse().unwrap();
-    let mut client = GtpConnection::new_with_role(cid, peer, true, true, GtpConfig::default());
+    let mut client = GtpConnection::new_with_role(
+        cid,
+        peer,
+        true,
+        true,
+        OFFLINE_SIM_MASTER_SECRET,
+        GtpConfig::default(),
+    );
     let mut server = GtpConnection::new_with_role(
         cid,
         "127.0.0.1:5000".parse().unwrap(),
         true,
         false,
+        OFFLINE_SIM_MASTER_SECRET,
         GtpConfig::default(),
     );
 

@@ -13,6 +13,7 @@
 //! verdict for a near-tie is the deterministic `TIE_BREAK_LOWER_ID` —
 //! the test pins the CURRENT contract and records the G4 mapping.
 
+use gtp_core::state::OFFLINE_SIM_MASTER_SECRET;
 use gtp_route::{select, DecisionTracker, HealthVerdict, PathStats, PolicyClass, SelectionReason};
 use gtp_sim::{NetworkProfile, SimulationRunner};
 use gtp_types::{Duration, PriorityTier};
@@ -436,6 +437,7 @@ fn s12_queue_saturation_stays_bounded_with_exact_accounting() {
             "127.0.0.1:6000".parse().unwrap(),
             true,
             true,
+            OFFLINE_SIM_MASTER_SECRET,
             config,
         );
         // Sustained over-pressure: 1000 pushes against every capacity.
