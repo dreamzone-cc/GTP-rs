@@ -9,6 +9,9 @@ authors.workspace = true
 gtp-types = { workspace = true }
 socket2 = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["std"]
 std = ["gtp-types/std"]

@@ -428,6 +428,7 @@ name = "gtp-io"
 version = "0.2.0"
 dependencies = [
  "gtp-types",
+ "libc",
  "socket2 0.5.10",
 ]
 

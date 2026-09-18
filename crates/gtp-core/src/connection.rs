@@ -314,6 +314,22 @@ impl GtpConnection {
         datagram: &mut [u8],
         now: MonotonicTime,
     ) -> Result<Vec<ReceivedMessage>> {
+        self.handle_incoming_datagram_with_ecn(src_addr, datagram, now, 0)
+    }
+
+    /// Full ingress with the IP-layer ECN codepoint the network actually
+    /// delivered (QUIC-style): the receiver counts it in the ACK tracker and
+    /// reports the totals back, so the peer's congestion controller can react
+    /// via `on_ecn`. The protocol header's own ecn_bits live inside the
+    /// authenticated AAD and cannot be marked en route — the IP layer is the
+    /// only honest signal source. Callers without ancillary reception pass 0.
+    pub fn handle_incoming_datagram_with_ecn(
+        &mut self,
+        src_addr: SocketAddr,
+        datagram: &mut [u8],
+        now: MonotonicTime,
+        ip_ecn: u8,
+    ) -> Result<Vec<ReceivedMessage>> {
         // FR-5: a Closed connection processes no further input — no decryption,
         // no dispatch, no bookkeeping. Late peer datagrams (including delayed
         // CLOSE acknowledgements) are dropped at the door instead of being
@@ -772,7 +788,7 @@ impl GtpConnection {
         self.hot.ack_tracker.on_packet_received(
             header.packet_number,
             is_ack_eliciting,
-            header.flags.ecn_bits(),
+            ip_ecn,
             now,
         );
 
