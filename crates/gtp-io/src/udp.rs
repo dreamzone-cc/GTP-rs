@@ -43,6 +43,19 @@ impl UdpSocketIo {
     }
 }
 
+/// Transient receive conditions that simply end the current batch, mirroring
+/// the runtime layer's P2-1 policy: an ICMP port-unreachable surfacing as
+/// ConnectionReset on a UDP socket must not abort the whole batch.
+fn is_transient_recv(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::WouldBlock
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::Interrupted
+    )
+}
+
 impl PacketIo for UdpSocketIo {
     fn send_batch(&self, packets: &[(&[u8], SocketAddr)]) -> Result<usize> {
         let mut sent_count = 0;
@@ -66,7 +79,7 @@ impl PacketIo for UdpSocketIo {
                     item.ecn = 0;
                     count += 1;
                 }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(ref e) if is_transient_recv(e.kind()) => break,
                 Err(e) => return Err(TransportError::Io(e.to_string())),
             }
         }
@@ -83,6 +96,20 @@ impl PacketIo for UdpSocketIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_recv_kinds_end_the_batch_instead_of_erroring() {
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(is_transient_recv(kind), "{kind:?} must be transient");
+        }
+        assert!(!is_transient_recv(ErrorKind::AddrInUse));
+        assert!(!is_transient_recv(ErrorKind::UnexpectedEof));
+    }
 
     #[test]
     fn test_udp_socket_io_loopback_batch() {

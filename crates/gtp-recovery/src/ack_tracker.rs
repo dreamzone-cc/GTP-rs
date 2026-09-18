@@ -192,7 +192,12 @@ impl AckTracker {
     /// `ReplayWindow`.
     pub fn peek_ack_frame(&self, now: MonotonicTime) -> Option<Frame<'static>> {
         let largest = self.largest_received?;
-        let ack_delay_us = now.duration_since(self.largest_received_time).as_micros() as u32;
+        // Saturate, never truncate: a >71-minute delay (idle connection whose
+        // pending ACK rides a much later datagram) would wrap modulo 2^32 and
+        // report a misleadingly small delay to the peer's RTT estimator.
+        let ack_delay_us =
+            u32::try_from(now.duration_since(self.largest_received_time).as_micros())
+                .unwrap_or(u32::MAX);
 
         let mut ranges = [AckRange::default(); MAX_ACK_RANGES];
         let mut range_count = 0;
@@ -356,6 +361,23 @@ mod tests {
         patient.set_policy(1, Duration::from_millis(25));
         patient.on_packet_received(PacketNumber(2), true, 0, t0);
         assert!(patient.should_send_ack(t0));
+    }
+
+    /// A very long ACK delay must saturate to u32::MAX, not wrap modulo 2^32
+    /// into a misleadingly small value.
+    #[test]
+    fn ack_delay_saturates_instead_of_truncating() {
+        let mut tracker = AckTracker::new();
+        let t0 = MonotonicTime::from_micros(1_000_000);
+        tracker.on_packet_received(PacketNumber(1), true, 0, t0);
+        // 72 minutes later: (72*60*1e6) as u64 > u32::MAX.
+        let much_later = t0 + Duration::from_secs(72 * 60);
+        let frame = tracker.peek_ack_frame(much_later).unwrap();
+        if let Frame::Ack { ack_delay_us, .. } = frame {
+            assert_eq!(ack_delay_us, u32::MAX);
+        } else {
+            panic!("expected ACK frame");
+        }
     }
 
     #[test]

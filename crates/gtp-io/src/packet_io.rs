@@ -1,8 +1,9 @@
 use gtp_types::Result;
 use std::net::SocketAddr;
 
-/// Datagram payload buffer for batch reception.
-pub const MAX_DATAGRAM_SIZE: usize = 2048;
+/// Datagram payload buffer for batch reception — the shared constant lives
+/// in `gtp-types` next to the wire limits (single source of truth).
+pub use gtp_types::MAX_DATAGRAM_SIZE;
 
 #[derive(Clone, Debug)]
 pub struct RecvDatagram {

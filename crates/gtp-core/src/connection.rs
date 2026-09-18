@@ -939,6 +939,9 @@ impl GtpConnection {
         // 1. Prune expired messages from scheduler
         let pruned = self.hot.scheduler.prune_stale(now);
         self.cold.total_stale_drops += pruned as u64;
+        // Housekeeping: reap a timed-out path challenge so it stops pinning
+        // pending_addr and the probe amplification slot.
+        self.hot.path_validator.expire(now);
 
         // 2. Update Pacing Token Bucket
         let pacing_rate = self.hot.cc.pacing_rate();

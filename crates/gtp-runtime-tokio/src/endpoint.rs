@@ -63,6 +63,48 @@ fn is_handshake_candidate(header: &PacketHeader, header_len: usize, datagram_len
     header.flags.is_long_header() && header_len < datagram_len
 }
 
+/// Per-IP ClientHello rate limiter with self-pruning state.
+///
+/// The map of seen source addresses is itself bounded: every hello prunes
+/// entries older than the accounting window first, so spoofed-source floods
+/// cannot grow it without limit (each distinct IP used to insert an entry
+/// that nothing ever removed).
+#[derive(Default)]
+struct HelloRateLimiter {
+    seen: FxHashMap<IpAddr, (u32, MonotonicTime)>,
+}
+
+impl HelloRateLimiter {
+    /// Accounts one hello from `ip` and returns whether it is within `max`
+    /// per `window`. Loopback is always allowed (local tooling).
+    fn allow(
+        &mut self,
+        ip: IpAddr,
+        now: MonotonicTime,
+        window: gtp_types::Duration,
+        max: u32,
+    ) -> bool {
+        if ip.is_loopback() {
+            return true;
+        }
+        self.seen
+            .retain(|_, (_, t)| now.duration_since(*t) < window);
+        let entry = self.seen.entry(ip).or_insert((0, now));
+        if now.duration_since(entry.1) >= window {
+            *entry = (1, now);
+        } else {
+            entry.0 += 1;
+        }
+        entry.0 <= max
+    }
+
+    /// Retained-entry count (test observability for the pruning bound).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
 /// Async GTP Endpoint running on top of Tokio with automated X25519 Handshake and Anti-Amplification defense.
 pub struct GtpEndpoint {
     socket: Arc<UdpSocket>,
@@ -70,7 +112,7 @@ pub struct GtpEndpoint {
     stateless_tokens: Arc<StatelessTokenManager>,
     pending_client_handshakes: PendingClientHandshakeMap,
     pending_server_handshakes: PendingServerHandshakeMap,
-    hello_rate_limiter: Arc<Mutex<FxHashMap<IpAddr, (u32, MonotonicTime)>>>,
+    hello_rate_limiter: Arc<Mutex<HelloRateLimiter>>,
     incoming_connections_tx: mpsc::Sender<AsyncGtpConnection>,
     incoming_connections_rx: Arc<Mutex<mpsc::Receiver<AsyncGtpConnection>>>,
 }
@@ -92,7 +134,7 @@ impl GtpEndpoint {
             stateless_tokens: Arc::new(StatelessTokenManager::new(token_secret)),
             pending_client_handshakes: Arc::new(RwLock::new(FxHashMap::default())),
             pending_server_handshakes: Arc::new(RwLock::new(FxHashMap::default())),
-            hello_rate_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            hello_rate_limiter: Arc::new(Mutex::new(HelloRateLimiter::default())),
             incoming_connections_tx: incoming_tx,
             incoming_connections_rx: Arc::new(Mutex::new(incoming_rx)),
         };
@@ -170,10 +212,17 @@ impl GtpEndpoint {
             .map_err(|_| TransportError::BufferOverflow)?;
         let total_len = header_len + frame_len;
 
-        self.socket
+        if let Err(e) = self
+            .socket
             .send_to(&hello_buf[..total_len], peer_addr)
             .await
-            .map_err(|e| TransportError::Io(e.to_string()))?;
+        {
+            // Do not strand the pending entry on a failed initial send —
+            // nothing but a later same-CID handshake would ever clear it.
+            let mut pending = self.pending_client_handshakes.write().await;
+            pending.remove(&cid);
+            return Err(TransportError::Io(e.to_string()));
+        }
 
         // 3. Await ServerHello with automatic 400ms retransmission (NO silent fallback to static secret!)
         let mut attempts = 0;
@@ -403,17 +452,14 @@ impl GtpEndpoint {
                                 _,
                             )) = Frame::decode(frame_payload)
                             {
-                                // Rate limit per IP (max 20 hellos per second)
-                                let mut rl = rate_limiter.lock().await;
-                                let entry = rl.entry(src.ip()).or_insert((0, now));
-                                if now.duration_since(entry.1) >= gtp_types::Duration::from_secs(1)
-                                {
-                                    *entry = (1, now);
-                                } else {
-                                    entry.0 += 1;
-                                }
+                                // Rate limit per IP (max 20 hellos per second,
+                                // self-pruning map).
+                                let allowed = {
+                                    let mut rl = rate_limiter.lock().await;
+                                    rl.allow(src.ip(), now, gtp_types::Duration::from_secs(1), 20)
+                                };
 
-                                if src.ip().is_loopback() || entry.0 <= 20 {
+                                if allowed {
                                     let (server_pk, server_nonce, cookie) = {
                                         let mut psh = pending_server_handshakes.write().await;
                                         // Prune expired handshakes older than 3 seconds
@@ -820,6 +866,44 @@ mod tests {
 
     /// The gate must not cost the handshake anything: all three handshake frames are
     /// emitted in long-header packets and must still be inspected.
+    /// The per-IP hello limiter must not grow without bound under
+    /// spoofed-source floods: entries older than the accounting window are
+    /// pruned by every allow() call.
+    #[test]
+    fn hello_rate_limiter_prunes_stale_entries() {
+        use std::net::Ipv4Addr;
+        let mut rl = HelloRateLimiter::default();
+        let t0 = MonotonicTime::from_micros(1_000_000);
+        let window = gtp_types::Duration::from_secs(1);
+
+        // A flood of distinct (spoofed) sources at t0.
+        for i in 0..1000u32 {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, (i >> 16) as u8, (i >> 8) as u8, i as u8));
+            assert!(rl.allow(ip, t0, window, 20), "first hello is allowed");
+        }
+        assert_eq!(rl.len(), 1000);
+
+        // One hello a window later: the stale flood is pruned first.
+        let t1 = t0 + gtp_types::Duration::from_secs(2);
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        assert!(rl.allow(ip, t1, window, 20));
+        assert!(
+            rl.len() <= 2,
+            "stale entries must be reaped, got {}",
+            rl.len()
+        );
+
+        // And the limit itself: 20 hellos per window pass, the 21st does not.
+        let t2 = t1 + gtp_types::Duration::from_secs(2);
+        let flood_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        for _ in 0..20 {
+            assert!(rl.allow(flood_ip, t2, window, 20));
+        }
+        assert!(!rl.allow(flood_ip, t2, window, 20));
+        // Loopback bypasses the limit entirely.
+        assert!(rl.allow(IpAddr::V4(Ipv4Addr::LOCALHOST), t2, window, 0));
+    }
+
     #[test]
     fn long_header_handshake_packets_are_still_inspected() {
         let cid = ConnectionId(7);

@@ -26,6 +26,17 @@ impl PathValidator {
         self.pending_challenge = Some((new_addr, nonce, now));
     }
 
+    /// Clears a challenge whose timeout has already lapsed: a timed-out
+    /// challenge must not keep pinning `pending_addr` (and with it the probe
+    /// anti-amplification slot) indefinitely.
+    pub fn expire(&mut self, now: MonotonicTime) {
+        if let Some((_, _, start_time)) = self.pending_challenge {
+            if now.duration_since(start_time) > PATH_CHALLENGE_TIMEOUT {
+                self.pending_challenge = None;
+            }
+        }
+    }
+
     /// Address of the challenge currently outstanding, if any.
     ///
     /// New-8: this is the single authority for which remote address may hold an
@@ -88,5 +99,23 @@ mod tests {
 
         // The pending challenge was consumed: the same nonce cannot be replayed.
         assert!(!validator.validate_response(new_addr, &challenge_nonce, now));
+    }
+
+    /// A timed-out challenge is reaped by `expire`, releasing pending_addr.
+    #[test]
+    fn expired_challenge_is_reaped() {
+        let addr: SocketAddr = "192.168.1.50:7000".parse().unwrap();
+        let mut validator = PathValidator::new();
+        let now = MonotonicTime::from_micros(1_000_000);
+        validator.start_challenge(addr, [9; 8], now);
+        assert_eq!(validator.pending_addr(), Some(addr));
+
+        // Just inside the timeout: still pending.
+        validator.expire(now + PATH_CHALLENGE_TIMEOUT);
+        assert!(validator.pending_addr().is_some());
+
+        // Beyond it: reaped.
+        validator.expire(now + PATH_CHALLENGE_TIMEOUT + Duration::from_micros(1));
+        assert!(validator.pending_addr().is_none());
     }
 }
