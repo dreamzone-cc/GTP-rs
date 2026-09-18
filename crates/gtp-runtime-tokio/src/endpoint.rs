@@ -4,7 +4,8 @@ use gtp_crypto::{derive_directional_handshake_session_keys, EphemeralKeyPair};
 use gtp_path::StatelessTokenManager;
 use gtp_types::{ConnectionId, MessageClass, MonotonicTime, PacketNumber, Result, TransportError};
 use gtp_wire::frame::{
-    Frame, FRAME_TYPE_CLIENT_HELLO, FRAME_TYPE_HANDSHAKE_FINISH, FRAME_TYPE_SERVER_HELLO,
+    Frame, FRAME_TYPE_CLIENT_HELLO, FRAME_TYPE_HANDSHAKE_FINISH, FRAME_TYPE_SERVER_FINISH,
+    FRAME_TYPE_SERVER_HELLO, PROTOCOL_VERSION,
 };
 use gtp_wire::header::PacketHeader;
 use rand::RngCore;
@@ -22,6 +23,12 @@ type ConnectionMap = Arc<
 >;
 type PendingClientHandshakeMap =
     Arc<RwLock<FxHashMap<ConnectionId, oneshot::Sender<([u8; 32], [u8; 32], [u8; 32])>>>>;
+/// v1.2: client-side waiters for the server's mirrored confirmation proof.
+type PendingServerFinishMap = Arc<RwLock<FxHashMap<ConnectionId, oneshot::Sender<[u8; 32]>>>>;
+/// v1.2: (proof, dest, time) of accepted finishes, so a retransmitted
+/// HandshakeFinish is answered with a fresh ServerFinish without touching
+/// the registered connection state.
+type AcceptedFinishMap = Arc<Mutex<FxHashMap<ConnectionId, ([u8; 32], SocketAddr, MonotonicTime)>>>;
 type PendingServerHandshakeMap = Arc<
     RwLock<
         FxHashMap<
@@ -105,6 +112,26 @@ impl HelloRateLimiter {
     }
 }
 
+/// Builds and transmits one ServerFinish datagram (long header, v1.2).
+async fn send_server_finish(
+    socket: &UdpSocket,
+    cid: ConnectionId,
+    proof: [u8; 32],
+    dest: SocketAddr,
+) {
+    let mut buf = [0u8; 128];
+    let hdr = PacketHeader::new_long(1, cid, PacketNumber(0), 0, 0);
+    let Ok(hdr_len) = hdr.encode(&mut buf) else {
+        return;
+    };
+    let frame = Frame::ServerFinish {
+        server_proof: proof,
+    };
+    if let Ok(flen) = frame.encode(&mut buf[hdr_len..]) {
+        let _ = socket.send_to(&buf[..hdr_len + flen], dest).await;
+    }
+}
+
 /// Async GTP Endpoint running on top of Tokio with automated X25519 Handshake and Anti-Amplification defense.
 pub struct GtpEndpoint {
     socket: Arc<UdpSocket>,
@@ -112,6 +139,8 @@ pub struct GtpEndpoint {
     stateless_tokens: Arc<StatelessTokenManager>,
     pending_client_handshakes: PendingClientHandshakeMap,
     pending_server_handshakes: PendingServerHandshakeMap,
+    pending_server_finishes: PendingServerFinishMap,
+    accepted_finishes: AcceptedFinishMap,
     hello_rate_limiter: Arc<Mutex<HelloRateLimiter>>,
     incoming_connections_tx: mpsc::Sender<AsyncGtpConnection>,
     incoming_connections_rx: Arc<Mutex<mpsc::Receiver<AsyncGtpConnection>>>,
@@ -134,6 +163,8 @@ impl GtpEndpoint {
             stateless_tokens: Arc::new(StatelessTokenManager::new(token_secret)),
             pending_client_handshakes: Arc::new(RwLock::new(FxHashMap::default())),
             pending_server_handshakes: Arc::new(RwLock::new(FxHashMap::default())),
+            pending_server_finishes: Arc::new(RwLock::new(FxHashMap::default())),
+            accepted_finishes: Arc::new(Mutex::new(FxHashMap::default())),
             hello_rate_limiter: Arc::new(Mutex::new(HelloRateLimiter::default())),
             incoming_connections_tx: incoming_tx,
             incoming_connections_rx: Arc::new(Mutex::new(incoming_rx)),
@@ -205,7 +236,7 @@ impl GtpEndpoint {
         let hello_frame = Frame::ClientHello {
             client_public_key: client_pk,
             client_nonce,
-            version: 1,
+            version: PROTOCOL_VERSION,
         };
         let frame_len = hello_frame
             .encode(&mut hello_buf[header_len..])
@@ -267,6 +298,8 @@ impl GtpEndpoint {
             client_nonce,
             server_nonce,
             connection_id: cid,
+            // the client binds the version it SENT
+            version: PROTOCOL_VERSION,
         };
         let client_proof = gtp_crypto::compute_client_proof(&shared, &transcript);
         let mut fin_buf = [0u8; 128];
@@ -281,6 +314,14 @@ impl GtpEndpoint {
         let fin_frame_len = fin_frame
             .encode(&mut fin_buf[fin_hdr_len..])
             .map_err(|_| TransportError::BufferOverflow)?;
+
+        // v1.2: register the ServerFinish waiter BEFORE the Finish goes out,
+        // so a fast server answer cannot race the registration.
+        let (sf_tx, mut sf_rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_server_finishes.write().await;
+            pending.insert(cid, sf_tx);
+        }
         let _ = self
             .socket
             .send_to(&fin_buf[..fin_hdr_len + fin_frame_len], peer_addr)
@@ -298,51 +339,50 @@ impl GtpEndpoint {
 
         let async_conn = self.register_connection(cid, conn).await;
 
-        // 5. Establishment confirmation. The server accepts the session only after
-        // it verifies this HandshakeFinish; a Finish that is lost — or that races
-        // ahead of the server's connection registration — leaves the session
-        // half-open, and the client would stream application data into a black hole
-        // with no way to notice. So do not declare the connection established on
-        // faith: enqueue an ack-eliciting Ping (which the tx loop sends), wait for
-        // the server's ACK, and retransmit the HandshakeFinish until that ACK
-        // arrives — mirroring the ClientHello retransmission above. An ACK can only
-        // come from a peer that decrypted our traffic, which proves it accepted and
-        // registered the connection.
+        // 5. v1.2 establishment confirmation: the session is established only
+        // once the server's MIRRORED proof verifies. A ServerHello without a
+        // follow-up ServerFinish (loss, or a peer that never accepted) is a
+        // classified handshake failure — never a silently established session
+        // (spec amendment §2.2, acceptance §5.5).
         let fin_datagram_len = fin_hdr_len + fin_frame_len;
         let mut confirmed = false;
-        'confirm: for _ in 0..8 {
-            {
-                let mut guard = async_conn.conn.lock().await;
-                let now = MonotonicTime::now();
-                let _ = guard.control().send_ping(0x00C0_FFEE, now);
-            }
-            // Poll for the server's ACK for up to ~400ms (≈ several RTTs).
-            for _ in 0..8 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if async_conn
-                    .conn
-                    .lock()
-                    .await
-                    .hot
-                    .loss_detector
-                    .has_received_ack()
-                {
-                    confirmed = true;
-                    break 'confirm;
+        for _ in 0..8 {
+            match tokio::time::timeout(std::time::Duration::from_millis(400), &mut sf_rx).await {
+                Ok(Ok(server_proof)) => {
+                    if gtp_crypto::verify_server_proof(&shared, &transcript, &server_proof) {
+                        confirmed = true;
+                        break;
+                    }
+                    let mut pending = self.pending_server_finishes.write().await;
+                    pending.remove(&cid);
+                    return Err(TransportError::HandshakeFailed(
+                        "server proof mismatch (transcript tamper or wrong peer)",
+                    ));
+                }
+                Ok(Err(_)) => break, // endpoint dropped the waiter
+                Err(_) => {
+                    // Finish may have been lost: retransmit; the server
+                    // answers a retransmitted Finish with a fresh ServerFinish.
+                    let _ = self
+                        .socket
+                        .send_to(&fin_buf[..fin_datagram_len], peer_addr)
+                        .await;
                 }
             }
-            // No confirmation yet: the Finish may have been lost. Retransmit it.
-            let _ = self
-                .socket
-                .send_to(&fin_buf[..fin_datagram_len], peer_addr)
-                .await;
+        }
+        {
+            let mut pending = self.pending_server_finishes.write().await;
+            pending.remove(&cid);
+        }
+        if !confirmed {
+            return Err(TransportError::HandshakeTimeout);
         }
 
-        // If still unconfirmed after the retransmit budget, return the connection
-        // anyway: a genuinely one-way or dead path should still hand the caller a
-        // handle (the dead link is observable via telemetry — Total RX Packets stays
-        // 0) rather than blocking connect() indefinitely.
-        let _ = confirmed;
+        // Seed an RTT sample with one ack-eliciting ping (liveness/telemetry).
+        {
+            let mut guard = async_conn.conn.lock().await;
+            let _ = guard.control().send_ping(0x00C0_FFEE, MonotonicTime::now());
+        }
 
         Ok(async_conn)
     }
@@ -395,6 +435,8 @@ impl GtpEndpoint {
         let stateless_tokens = Arc::clone(&self.stateless_tokens);
         let pending_client_handshakes = Arc::clone(&self.pending_client_handshakes);
         let pending_server_handshakes = Arc::clone(&self.pending_server_handshakes);
+        let pending_server_finishes = Arc::clone(&self.pending_server_finishes);
+        let accepted_finishes = Arc::clone(&self.accepted_finishes);
         let rate_limiter = Arc::clone(&self.hello_rate_limiter);
         let incoming_tx = self.incoming_connections_tx.clone();
 
@@ -447,11 +489,16 @@ impl GtpEndpoint {
                                 Frame::ClientHello {
                                     client_public_key,
                                     client_nonce,
-                                    ..
+                                    version,
                                 },
                                 _,
                             )) = Frame::decode(frame_payload)
                             {
+                                // v1.2: older protocol versions are rejected
+                                // outright (no dual-version window).
+                                if version != PROTOCOL_VERSION {
+                                    continue;
+                                }
                                 // Rate limit per IP (max 20 hellos per second,
                                 // self-pruning map).
                                 let allowed = {
@@ -567,6 +614,23 @@ impl GtpEndpoint {
                             {
                                 // 1. Strict Cookie Verification (Address Ownership Verified!)
                                 if stateless_tokens.verify_cookie(src, &cookie_echo, now) {
+                                    // v1.2: a retransmitted/replayed Finish is
+                                    // answered from the cache with a fresh
+                                    // ServerFinish — WITHOUT re-registering, so a
+                                    // replay can never reset live connection state.
+                                    let cached = {
+                                        let mut af = accepted_finishes.lock().await;
+                                        af.retain(|_, (_, _, t)| {
+                                            now.duration_since(*t)
+                                                <= gtp_types::Duration::from_secs(3)
+                                        });
+                                        af.get(&cid).copied()
+                                    };
+                                    if let Some((proof, dest, _)) = cached {
+                                        send_server_finish(&socket, cid, proof, dest).await;
+                                        continue;
+                                    }
+
                                     let pending_entry = {
                                         let mut psh = pending_server_handshakes.write().await;
                                         psh.remove(&cid)
@@ -601,12 +665,27 @@ impl GtpEndpoint {
                                             client_nonce,
                                             server_nonce,
                                             connection_id: cid,
+                                            // the server binds the version it DECODED
+                                            // (validated == PROTOCOL_VERSION above)
+                                            version: PROTOCOL_VERSION,
                                         };
                                         if gtp_crypto::verify_client_proof(
                                             &shared,
                                             &transcript,
                                             &client_proof,
                                         ) {
+                                            // v1.2: mirrored confirmation proof.
+                                            let server_proof = gtp_crypto::compute_server_proof(
+                                                &shared,
+                                                &transcript,
+                                            );
+                                            send_server_finish(&socket, cid, server_proof, src)
+                                                .await;
+                                            {
+                                                let mut af = accepted_finishes.lock().await;
+                                                af.insert(cid, (server_proof, src, now));
+                                            }
+
                                             // Instantiate verified connection (pre_validated: true).
                                             // SEC-1: the server seals with the server->client direction.
                                             let conn = GtpConnection::new_with_directional_keys(
@@ -618,6 +697,13 @@ impl GtpEndpoint {
                                                 GtpConfig::competitive_fps(),
                                             );
 
+                                            let already_registered = {
+                                                let conns = connections.read().await;
+                                                conns.contains_key(&cid)
+                                            };
+                                            if already_registered {
+                                                continue;
+                                            }
                                             let (tx, rx) = mpsc::channel(1024);
                                             let conn_arc = Arc::new(Mutex::new(conn));
 
@@ -640,6 +726,20 @@ impl GtpEndpoint {
                                             let _ = incoming_tx.send(async_conn).await;
                                         }
                                     }
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Case D (v1.2): mirrored server confirmation proof,
+                        // routed to the connect() waiter by CID.
+                        if frame_type == FRAME_TYPE_SERVER_FINISH {
+                            if let Ok((Frame::ServerFinish { server_proof }, _)) =
+                                Frame::decode(frame_payload)
+                            {
+                                let mut pending = pending_server_finishes.write().await;
+                                if let Some(tx) = pending.remove(&cid) {
+                                    let _ = tx.send(server_proof);
                                 }
                             }
                             continue;
@@ -902,6 +1002,64 @@ mod tests {
         assert!(!rl.allow(flood_ip, t2, window, 20));
         // Loopback bypasses the limit entirely.
         assert!(rl.allow(IpAddr::V4(Ipv4Addr::LOCALHOST), t2, window, 0));
+    }
+
+    /// v1.2: a responder that completes the DH dance but cannot produce a
+    /// valid mirrored proof (here: all-zero ServerFinish) must be rejected
+    /// with a classified failure — never a silently established session.
+    #[tokio::test]
+    async fn connect_rejects_a_server_finish_with_wrong_proof() {
+        use gtp_crypto::EphemeralKeyPair;
+
+        let responder = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let raddr = responder.local_addr().unwrap();
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let endpoint = GtpEndpoint::bind(bind_addr).await.unwrap();
+        let cid = ConnectionId(0xDEAD_BEEF_0000_0001);
+
+        let responder_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            // 1. ClientHello -> answer with OUR (attacker) ephemeral material.
+            let (n, client) = responder.recv_from(&mut buf).await.unwrap();
+            let (_hdr, hlen) = PacketHeader::decode(&buf[..n]).unwrap();
+            let (frame, _) = Frame::decode(&buf[hlen..]).unwrap();
+            assert!(matches!(frame, Frame::ClientHello { .. }));
+            let pair = EphemeralKeyPair::generate();
+            let mut out = [0u8; 256];
+            let hdr = PacketHeader::new_long(1, cid, PacketNumber(0), 0, 0);
+            let hlen = hdr.encode(&mut out).unwrap();
+            let frame = Frame::ServerHello {
+                server_public_key: pair.public_key,
+                server_nonce: pair.nonce,
+                stateless_cookie: [0x77; 32],
+                assigned_cid: cid,
+            };
+            let flen = frame.encode(&mut out[hlen..]).unwrap();
+            let _ = responder.send_to(&out[..hlen + flen], client).await;
+
+            // 2. HandshakeFinish arrives -> answer with a GARBAGE proof.
+            let (n2, _src) = responder.recv_from(&mut buf).await.unwrap();
+            assert!(n2 > 0);
+            let hdr2 = PacketHeader::new_long(1, cid, PacketNumber(0), 0, 0);
+            let hlen2 = hdr2.encode(&mut out).unwrap();
+            let fin = Frame::ServerFinish {
+                server_proof: [0x00; 32],
+            };
+            let flen2 = fin.encode(&mut out[hlen2..]).unwrap();
+            let _ = responder.send_to(&out[..hlen2 + flen2], client).await;
+        });
+
+        let res = endpoint.connect(cid, raddr, true).await;
+        responder_task.await.unwrap();
+        match res {
+            Err(TransportError::HandshakeFailed(msg)) => {
+                assert!(msg.contains("server proof mismatch"), "got: {msg}");
+            }
+            other => panic!(
+                "expected proof-mismatch failure, got {:?}",
+                other.map(|_| ())
+            ),
+        }
     }
 
     #[test]

@@ -88,6 +88,7 @@ fn bench_handshake_crypto(c: &mut Criterion) {
         client_nonce,
         server_nonce,
         connection_id: cid,
+        version: 2,
     };
 
     c.bench_function("handshake_client_proof_hmac", |b| {

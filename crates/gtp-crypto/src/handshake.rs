@@ -235,6 +235,11 @@ pub struct HandshakeTranscript {
     pub client_nonce: [u8; 32],
     pub server_nonce: [u8; 32],
     pub connection_id: ConnectionId,
+    /// Protocol version as carried in ClientHello (v1.2 amendment): the
+    /// client binds the version it SENT, the server the version it DECODED,
+    /// so any on-path tamper breaks both proofs. See
+    /// docs/SPEC_AMENDMENT_V2_SERVER_FINISH_AR.md.
+    pub version: u32,
 }
 
 /// Derives the dedicated handshake-confirmation key from the X25519 shared
@@ -260,6 +265,7 @@ fn update_with_transcript(mac: &mut hmac::Hmac<Sha256>, label: &[u8], t: &Handsh
     mac.update(&t.client_nonce);
     mac.update(&t.server_nonce);
     mac.update(&t.connection_id.0.to_be_bytes());
+    mac.update(&t.version.to_be_bytes());
 }
 
 /// Computes the client key-confirmation proof (HMAC-SHA256) over the full
@@ -323,6 +329,11 @@ pub fn verify_server_proof(
     use subtle::ConstantTimeEq;
     let expected = compute_server_proof(shared_secret, transcript);
     expected.ct_eq(candidate_proof).into()
+}
+
+#[cfg(test)]
+fn gtp_wire_safe_version() -> u32 {
+    2
 }
 
 #[cfg(test)]
@@ -450,6 +461,7 @@ mod tests {
             client_nonce,
             server_nonce,
             connection_id: cid,
+            version: gtp_wire_safe_version(),
         };
         let proof = compute_client_proof(&client_shared, &transcript);
         assert!(verify_client_proof(&server_shared, &transcript, &proof));
@@ -493,6 +505,10 @@ mod tests {
         assert!(!verify_client_proof(&server_shared, &hijacked, &proof));
         hijacked = transcript;
         hijacked.server_pk = [0xCD; 32];
+        assert!(!verify_client_proof(&server_shared, &hijacked, &proof));
+        // v1.2: a downgraded/tampered protocol version breaks the proof too.
+        hijacked = transcript;
+        hijacked.version += 1;
         assert!(!verify_client_proof(&server_shared, &hijacked, &proof));
 
         // SEC-9: the confirmation key must not be an AEAD-traffic-key derivation —

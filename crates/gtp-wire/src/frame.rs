@@ -21,6 +21,12 @@ pub const FRAME_TYPE_CLIENT_HELLO: u8 = 0x0B;
 pub const FRAME_TYPE_HANDSHAKE_RESPONSE: u8 = 0x0C;
 pub const FRAME_TYPE_SERVER_HELLO: u8 = 0x0C;
 pub const FRAME_TYPE_HANDSHAKE_FINISH: u8 = 0x0D;
+/// v1.2 (spec amendment: ServerFinish + version binding): the server's
+/// mirrored key-confirmation proof, long-header packets only.
+pub const FRAME_TYPE_SERVER_FINISH: u8 = 0x0E;
+/// Protocol version carried in ClientHello and bound into the confirmation
+/// transcript. v1.2 peers reject any other version outright.
+pub const PROTOCOL_VERSION: u32 = 0x0000_0002;
 
 /// Compact ACK Range representation.
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Default)]
@@ -100,6 +106,9 @@ pub enum Frame<'a> {
     HandshakeFinish {
         cookie_echo: [u8; 32],
         client_proof: [u8; 32],
+    },
+    ServerFinish {
+        server_proof: [u8; 32],
     },
     Padding {
         len: usize,
@@ -190,6 +199,7 @@ impl<'a> Frame<'a> {
             Self::ClientHello { .. } => FRAME_TYPE_CLIENT_HELLO,
             Self::ServerHello { .. } => FRAME_TYPE_SERVER_HELLO,
             Self::HandshakeFinish { .. } => FRAME_TYPE_HANDSHAKE_FINISH,
+            Self::ServerFinish { .. } => FRAME_TYPE_SERVER_FINISH,
             Self::Padding { .. } => FRAME_TYPE_PADDING,
         }
     }
@@ -464,6 +474,14 @@ impl<'a> Frame<'a> {
                 offset += 8;
             }
 
+            Self::ServerFinish { server_proof } => {
+                if buf.len() < offset + 32 {
+                    return Err(TransportError::BufferOverflow);
+                }
+                buf[offset..offset + 32].copy_from_slice(server_proof);
+                offset += 32;
+            }
+
             Self::HandshakeFinish {
                 cookie_echo,
                 client_proof,
@@ -714,6 +732,13 @@ impl<'a> Frame<'a> {
                 ))
             }
 
+            FRAME_TYPE_SERVER_FINISH => {
+                let proof = read_bytes(buf, &mut offset, 32)?;
+                let mut server_proof = [0u8; 32];
+                server_proof.copy_from_slice(proof);
+                Ok((Frame::ServerFinish { server_proof }, offset))
+            }
+
             FRAME_TYPE_PADDING => {
                 let padding_len = buf.len().saturating_sub(offset);
                 offset = buf.len();
@@ -728,6 +753,27 @@ impl<'a> Frame<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v1.2 amendment: ServerFinish round-trips exactly.
+    #[test]
+    fn test_server_finish_roundtrip() {
+        let frame = Frame::ServerFinish {
+            server_proof: [0xAB; 32],
+        };
+        let mut buf = [0u8; 64];
+        let n = frame.encode(&mut buf).unwrap();
+        assert_eq!(n, 33); // type tag + 32-byte proof
+        let (decoded, consumed) = Frame::decode(&buf[..n]).unwrap();
+        assert_eq!(consumed, n);
+        assert_eq!(
+            decoded,
+            Frame::ServerFinish {
+                server_proof: [0xAB; 32]
+            }
+        );
+        // Truncated payload is rejected whole.
+        assert!(Frame::decode(&buf[..20]).is_err());
+    }
 
     #[test]
     fn test_ack_frame_roundtrip() {

@@ -234,6 +234,7 @@ fn test_active_mitm_key_tamper_rejected() {
         client_nonce,
         server_nonce,
         connection_id: cid,
+        version: 2,
     };
     let client_proof = compute_client_proof(&client_shared, &client_transcript);
 
@@ -245,6 +246,7 @@ fn test_active_mitm_key_tamper_rejected() {
         client_nonce,
         server_nonce,
         connection_id: cid,
+        version: 2,
     };
     let is_valid = verify_client_proof(&server_shared, &server_view, &client_proof);
     assert!(
