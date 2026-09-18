@@ -19,11 +19,47 @@ pub const AEAD_TAG_LEN: usize = 16;
 pub struct GtpAeadProtector {
     key: [u8; 32],
     iv: [u8; 12],
+    /// CONTRACT: when set, this protector's key/IV are bound to exactly this
+    /// `ConnectionId` (the handshake HKDF mixes the full 8-byte CID into the
+    /// key schedule). `seal`/`open` reject any other CID so the nonce-space
+    /// invariant (one key ↔ one CID) is enforced structurally instead of by
+    /// caller convention — the nonce derivation only mixes the upper 32 bits
+    /// of the CID, so two CIDs sharing those bits would otherwise collide for
+    /// equal packet numbers if a key were ever shared across connections.
+    bound_cid: Option<u64>,
 }
 
 impl GtpAeadProtector {
+    /// Unbound constructor — for tests, benchmarks, and key-schedule
+    /// experiments only.
+    ///
+    /// Production callers must use [`GtpAeadProtector::new_for_cid`] so the
+    /// key↔CID binding is enforced on every seal/open.
     pub fn new(key: [u8; 32], iv: [u8; 12]) -> Self {
-        Self { key, iv }
+        Self {
+            key,
+            iv,
+            bound_cid: None,
+        }
+    }
+
+    /// Production constructor: binds this key/IV pair to `cid` and rejects
+    /// any other connection id at seal/open time (a cheap u64 compare that
+    /// keeps the nonce-uniqueness contract local to the protector).
+    pub fn new_for_cid(key: [u8; 32], iv: [u8; 12], cid: ConnectionId) -> Self {
+        Self {
+            key,
+            iv,
+            bound_cid: Some(cid.0),
+        }
+    }
+
+    /// Returns `Err` when the protector is bound to a different connection.
+    fn check_binding(&self, connection_id: ConnectionId) -> Result<()> {
+        match self.bound_cid {
+            Some(bound) if bound != connection_id.0 => Err(TransportError::CryptoFailure),
+            _ => Ok(()),
+        }
     }
 
     /// Derives 96-bit unique nonce from base IV XOR (CID ‖ full 64-bit PacketNumber).
@@ -61,14 +97,21 @@ impl PacketProtector for GtpAeadProtector {
         payload: &mut [u8],
         payload_len: usize,
     ) -> Result<usize> {
+        self.check_binding(connection_id)?;
         let needed = payload_len
             .checked_add(AEAD_TAG_LEN)
             .ok_or(TransportError::BufferOverflow)?;
         if payload.len() < needed {
-            return Err(TransportError::BufferOverflow);
+            // Mirror-image of `open`'s capacity check — same variant for the
+            // same condition in both directions.
+            return Err(TransportError::BufferTooShort);
         }
 
         let nonce_bytes = self.derive_nonce(connection_id, packet_number);
+        // Deliberate per-call construction: `ChaCha20Poly1305::new` is state-word
+        // setup only (the Poly1305 one-time key is derived per message), so caching
+        // the cipher is not worth the Clone/zeroize complexity. See crypto_bench.rs
+        // before changing this.
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
         let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -80,6 +123,15 @@ impl PacketProtector for GtpAeadProtector {
         Ok(payload_len + AEAD_TAG_LEN)
     }
 
+    /// Authenticates and decrypts payload in-place.
+    ///
+    /// # Postcondition (hard contract, R-8)
+    /// On error, `payload` MUST be left byte-identical. The receive path's
+    /// key-phase fallback retries `open` on the SAME buffer after a failure,
+    /// which is only sound because the backend verifies the Poly1305 tag
+    /// before applying any keystream. Every `PacketProtector` implementation
+    /// must preserve this postcondition — a decrypt-then-verify cipher would
+    /// silently corrupt every packet that takes the fallback path.
     fn open(
         &self,
         packet_number: PacketNumber,
@@ -88,6 +140,7 @@ impl PacketProtector for GtpAeadProtector {
         payload: &mut [u8],
         ciphertext_len: usize,
     ) -> Result<usize> {
+        self.check_binding(connection_id)?;
         if ciphertext_len < AEAD_TAG_LEN || payload.len() < ciphertext_len {
             return Err(TransportError::BufferTooShort);
         }
@@ -260,5 +313,48 @@ mod tests {
         let rendered = format!("{:?}", protector);
         assert!(!rendered.contains("171")); // 0xAB decimal
         assert!(rendered.contains("REDACTED"));
+    }
+
+    /// Key↔CID binding: a protector constructed for one connection must
+    /// refuse to seal or open for another, so a key can never silently be
+    /// reused across CIDs sharing nonce-space bits.
+    #[test]
+    fn bound_protector_rejects_foreign_cid() {
+        let cid_a = ConnectionId(0x1111_1111_0000_0001);
+        let cid_b = ConnectionId(0x1111_1111_0000_0002); // shares the upper 32 bits
+        let protector = GtpAeadProtector::new_for_cid([0x5Au8; 32], [0x1Fu8; 12], cid_a);
+
+        let mut buf = [0u8; 64];
+        buf[..4].copy_from_slice(b"data");
+        assert!(
+            protector
+                .seal(PacketNumber(1), cid_b, b"aad", &mut buf, 4)
+                .is_err(),
+            "seal under a foreign CID must be rejected"
+        );
+
+        // Sealing under the bound CID still works, and the result cannot be
+        // opened under a foreign CID either.
+        let sealed = protector
+            .seal(PacketNumber(1), cid_a, b"aad", &mut buf, 4)
+            .unwrap();
+        let mut open_buf = buf;
+        assert!(protector
+            .open(PacketNumber(1), cid_b, b"aad", &mut open_buf, sealed)
+            .is_err());
+        let mut ok_buf = buf;
+        assert_eq!(
+            protector
+                .open(PacketNumber(1), cid_a, b"aad", &mut ok_buf, sealed)
+                .unwrap(),
+            4
+        );
+
+        // The unbound legacy constructor keeps working for tests/benches.
+        let unbound = GtpAeadProtector::new([0x5Au8; 32], [0x1Fu8; 12]);
+        let mut ub = buf;
+        assert!(unbound
+            .seal(PacketNumber(1), cid_b, b"aad", &mut ub, 4)
+            .is_ok());
     }
 }

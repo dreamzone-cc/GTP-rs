@@ -19,6 +19,10 @@ rand = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# Self dev-dependency: enables `insecure-plaintext` for the integration tests
+# (tests/ compile against the library WITHOUT cfg(test), so the feature gate
+# for PlaintextProtector must be turned on explicitly here).
+gtp-crypto = { path = ".", features = ["insecure-plaintext"] }
 
 [[bench]]
 name = "crypto_bench"
@@ -27,3 +31,7 @@ harness = false
 [features]
 default = ["std"]
 std = ["gtp-types/std"]
+# Null-cipher (PlaintextProtector) for benchmarking, fuzzing, and offline
+# simulation ONLY. Off by default so production builds cannot accidentally
+# ship a protector that disables confidentiality and integrity.
+insecure-plaintext = []

@@ -1,8 +1,10 @@
 use gtp_types::ConnectionId;
 use hkdf::Hkdf;
+use hmac::Mac;
 use rand::rngs::OsRng;
 use sha2::Sha256;
 use std::fmt;
+use std::ops::DerefMut;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -68,7 +70,10 @@ impl EphemeralKeyPair {
 /// SEC-1: the client encrypts with `client_tx` (and opens with `server_tx`) while the
 /// server does the inverse. Sharing one key/IV across both directions would replay the
 /// same ChaCha20 keystream and Poly1305 one-time key for colliding packet numbers.
-#[derive(Clone, Copy)]
+///
+/// Key material: no `Clone`/`Copy` — wholesale duplication would create untracked
+/// copies that escape zeroization (SEC-14). The struct is wiped on drop.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct DirectionalKeys {
     pub client_tx_key: [u8; 32],
     pub client_tx_iv: [u8; 12],
@@ -139,12 +144,27 @@ pub fn derive_directional_handshake_session_keys(
     };
 
     let mut master_key = [0u8; 32];
+    expand(b"master  ", b"key     ", &mut master_key);
+
+    // Two-stage key schedule: the traffic secrets are children of the master
+    // key, not siblings of it. Chaining through `master_key` means each stage
+    // has a single, documented role (extraction vs. expansion) and the label
+    // "master key" describes an actual chaining step.
+    let traffic_hk = Hkdf::<Sha256>::new(Some(b"GTP_V1_1_TRAFFIC_KEY_SCHEDULE"), &master_key);
+    let expand = |label: &[u8; 8], suffix: &[u8; 8], out: &mut [u8]| {
+        let mut info = [0u8; 24];
+        info[..8].copy_from_slice(label);
+        info[8..16].copy_from_slice(suffix);
+        info[16..24].copy_from_slice(&cid_bytes);
+        traffic_hk
+            .expand(&info, out)
+            .expect("fixed output lengths are valid for HKDF-SHA256")
+    };
+
     let mut client_tx_key = [0u8; 32];
     let mut client_tx_iv = [0u8; 12];
     let mut server_tx_key = [0u8; 32];
     let mut server_tx_iv = [0u8; 12];
-
-    expand(b"master  ", b"key     ", &mut master_key);
     expand(b"c2s key ", b"gtp/v1  ", &mut client_tx_key);
     expand(b"c2s iv  ", b"gtp/v1  ", &mut client_tx_iv);
     expand(b"s2c key ", b"gtp/v1  ", &mut server_tx_key);
@@ -162,62 +182,146 @@ pub fn derive_directional_handshake_session_keys(
 }
 
 /// Rotates session encryption key for long-lived connections (Key Ratchet / Key Phase transition).
-pub fn ratchet_key(current_key: &[u8; 32], connection_id: ConnectionId) -> [u8; 32] {
+///
+/// The derivation binds the monotonically increasing `key_phase` counter into the HKDF
+/// info, so (a) every step from the same current key yields distinct material,
+/// (b) out-of-order or replayed transitions cannot alias an earlier phase, and
+/// (c) the base IV rotates together with the key with a distinct label, keeping the
+/// (key, IV) nonce-uniqueness pair intact across phases. Callers must reject
+/// non-increasing phase counters before invoking this.
+pub fn ratchet_key(
+    current_key: &[u8; 32],
+    connection_id: ConnectionId,
+    key_phase: u64,
+) -> ([u8; 32], [u8; 12]) {
     let salt = b"GTP_V1_1_KEY_RATCHET_SALT";
     let hk = Hkdf::<Sha256>::new(Some(salt), current_key);
 
-    let mut next_key = [0u8; 32];
-    let mut info = [0u8; 16];
-    info[..8].copy_from_slice(&connection_id.0.to_be_bytes());
-    info[8..16].copy_from_slice(b"KEYPHASE");
+    let cid_bytes = connection_id.0.to_be_bytes();
+    let phase_bytes = key_phase.to_be_bytes();
 
-    hk.expand(&info, &mut next_key)
+    let mut next_key = [0u8; 32];
+    let mut info_key = [0u8; 24];
+    info_key[..8].copy_from_slice(&cid_bytes);
+    info_key[8..16].copy_from_slice(&phase_bytes);
+    info_key[16..24].copy_from_slice(b"KEYPHASE");
+    hk.expand(&info_key, &mut next_key)
         .expect("32 bytes is valid length for HKDF-SHA256");
 
-    next_key
+    let mut next_iv = [0u8; 12];
+    let mut info_iv = [0u8; 24];
+    info_iv[..8].copy_from_slice(&cid_bytes);
+    info_iv[8..16].copy_from_slice(&phase_bytes);
+    info_iv[16..24].copy_from_slice(b"KEYPH-IV");
+    hk.expand(&info_iv, &mut next_iv)
+        .expect("12 bytes is valid length for HKDF-SHA256");
+
+    (next_key, next_iv)
 }
 
 type HmacSha256 = hmac::Hmac<Sha256>;
 
-/// Derives the dedicated handshake-confirmation key (key-separation from the AEAD keys).
-fn confirmation_key(derived_key: &[u8; 32]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(Some(b"GTP_V1_1_CONFIRM_SALT"), derived_key);
-    let mut finished = [0u8; 32];
-    hk.expand(b"gtp/v1 handshake finished key", &mut finished)
+/// The complete negotiated transcript the handshake confirmation proofs
+/// authenticate. Binding both public keys, both nonces, and the connection id
+/// into the MAC input makes replay of a proof onto a different session, and
+/// substitution of un-hashed parameters (nonces, CID), detectable.
+///
+/// Contains only public values (ephemeral keys and wire-visible nonces), so
+/// `Copy` is safe here — unlike key material.
+#[derive(Clone, Copy)]
+pub struct HandshakeTranscript {
+    pub client_pk: [u8; 32],
+    pub server_pk: [u8; 32],
+    pub client_nonce: [u8; 32],
+    pub server_nonce: [u8; 32],
+    pub connection_id: ConnectionId,
+}
+
+/// Derives the dedicated handshake-confirmation key from the X25519 shared
+/// secret (SEC-9 key-separation: never from an AEAD traffic key, so verifying
+/// a proof is not an oracle on traffic-key-derived material).
+///
+/// Returned wrapped in `Zeroizing` so the confirmation key is wiped when the
+/// caller's binding goes out of scope.
+fn confirmation_key(shared_secret: &HandshakeSharedSecret) -> zeroize::Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(Some(b"GTP_V1_1_CONFIRM_SALT"), shared_secret.as_bytes());
+    let mut finished = zeroize::Zeroizing::new([0u8; 32]);
+    hk.expand(b"gtp/v1 handshake finished key", finished.deref_mut())
         .expect("32 bytes is valid length for HKDF-SHA256");
     finished
 }
 
-/// Computes HMAC-SHA256 client key confirmation proof over `b"gtp-handshake-finish"` || `client_pk` || `server_pk`.
-///
-/// The proof is keyed by a dedicated confirmation key derived from the shared secret,
-/// never by the AEAD traffic key itself (SEC-9 key-separation).
+/// Feeds the full authenticated transcript into the MAC in a fixed order:
+/// label ‖ client_pk ‖ server_pk ‖ client_nonce ‖ server_nonce ‖ cid.
+fn update_with_transcript(mac: &mut hmac::Hmac<Sha256>, label: &[u8], t: &HandshakeTranscript) {
+    mac.update(label);
+    mac.update(&t.client_pk);
+    mac.update(&t.server_pk);
+    mac.update(&t.client_nonce);
+    mac.update(&t.server_nonce);
+    mac.update(&t.connection_id.0.to_be_bytes());
+}
+
+/// Computes the client key-confirmation proof (HMAC-SHA256) over the full
+/// handshake transcript, keyed by the dedicated confirmation key derived from
+/// the shared secret — never by an AEAD traffic key (SEC-9).
 pub fn compute_client_proof(
-    derived_key: &[u8; 32],
-    client_pk: &[u8; 32],
-    server_pk: &[u8; 32],
+    shared_secret: &HandshakeSharedSecret,
+    transcript: &HandshakeTranscript,
 ) -> [u8; 32] {
-    use hmac::Mac;
-    let finished_key = confirmation_key(derived_key);
-    let mut mac = HmacSha256::new_from_slice(&finished_key).expect("HMAC can take key of any size");
-    mac.update(b"gtp-handshake-finish");
-    mac.update(client_pk);
-    mac.update(server_pk);
+    let finished_key = confirmation_key(shared_secret);
+    let mut mac =
+        HmacSha256::new_from_slice(&*finished_key).expect("HMAC can take key of any size");
+    update_with_transcript(&mut mac, b"gtp-handshake-finish", transcript);
     let result = mac.finalize();
     let mut proof = [0u8; 32];
     proof.copy_from_slice(&result.into_bytes());
     proof
 }
 
-/// Verifies client key confirmation proof in constant time.
+/// Verifies the client key-confirmation proof in constant time.
 pub fn verify_client_proof(
-    derived_key: &[u8; 32],
-    client_pk: &[u8; 32],
-    server_pk: &[u8; 32],
+    shared_secret: &HandshakeSharedSecret,
+    transcript: &HandshakeTranscript,
     candidate_proof: &[u8; 32],
 ) -> bool {
     use subtle::ConstantTimeEq;
-    let expected = compute_client_proof(derived_key, client_pk, server_pk);
+    let expected = compute_client_proof(shared_secret, transcript);
+    expected.ct_eq(candidate_proof).into()
+}
+
+/// Computes the mirrored server key-confirmation proof. The two proofs use the
+/// same confirmation key but distinct labels, so each endpoint independently
+/// confirms the identical transcript.
+///
+/// # Security
+/// The X25519 handshake this crate provides is anonymous Diffie-Hellman: it
+/// resists passive observers but NOT an active man-in-the-middle, who can
+/// complete two handshakes and relay proofs. Full peer authentication requires
+/// wiring this server proof (or a PSK/certificate anchor) into the endpoint
+/// handshake flow and rejecting connections that do not complete it.
+pub fn compute_server_proof(
+    shared_secret: &HandshakeSharedSecret,
+    transcript: &HandshakeTranscript,
+) -> [u8; 32] {
+    let finished_key = confirmation_key(shared_secret);
+    let mut mac =
+        HmacSha256::new_from_slice(&*finished_key).expect("HMAC can take key of any size");
+    update_with_transcript(&mut mac, b"gtp-handshake-server-finish", transcript);
+    let result = mac.finalize();
+    let mut proof = [0u8; 32];
+    proof.copy_from_slice(&result.into_bytes());
+    proof
+}
+
+/// Verifies the server key-confirmation proof in constant time.
+pub fn verify_server_proof(
+    shared_secret: &HandshakeSharedSecret,
+    transcript: &HandshakeTranscript,
+    candidate_proof: &[u8; 32],
+) -> bool {
+    use subtle::ConstantTimeEq;
+    let expected = compute_server_proof(shared_secret, transcript);
     expected.ct_eq(candidate_proof).into()
 }
 
@@ -326,32 +430,79 @@ mod tests {
             .open(PacketNumber(1), cid2, b"aad", &mut bad_buf, sealed)
             .is_err());
 
-        // Test key ratcheting produces new key
-        let ratcheted = ratchet_key(&keys_client.client_tx_key, cid);
-        assert_ne!(ratcheted, keys_client.client_tx_key);
+        // Key ratchet: distinct material per phase; the base IV rotates with the key
+        let (ratcheted_k1, ratcheted_iv1) = ratchet_key(&keys_client.client_tx_key, cid, 1);
+        let (ratcheted_k2, ratcheted_iv2) = ratchet_key(&keys_client.client_tx_key, cid, 2);
+        assert_ne!(ratcheted_k1, keys_client.client_tx_key);
+        assert_ne!(ratcheted_k1, ratcheted_k2);
+        assert_ne!(ratcheted_iv1, keys_client.client_tx_iv);
+        assert_ne!(ratcheted_iv1, ratcheted_iv2);
+        // Same phase from the same key is deterministic
+        assert_eq!(
+            ratcheted_k1,
+            ratchet_key(&keys_client.client_tx_key, cid, 1).0
+        );
 
-        // Test client proof HMAC verification (confirmation key, not AEAD key)
-        let proof = compute_client_proof(&keys_client.client_tx_key, &client_pk, &server_pk);
-        assert!(verify_client_proof(
-            &keys_server.client_tx_key,
-            &client_pk,
-            &server_pk,
-            &proof
+        // Client proof: keyed from the shared secret, bound to the full transcript
+        let transcript = HandshakeTranscript {
+            client_pk,
+            server_pk,
+            client_nonce,
+            server_nonce,
+            connection_id: cid,
+        };
+        let proof = compute_client_proof(&client_shared, &transcript);
+        assert!(verify_client_proof(&server_shared, &transcript, &proof));
+
+        // Mirrored server proof: same secret, distinct label
+        let server_proof = compute_server_proof(&server_shared, &transcript);
+        assert!(verify_server_proof(
+            &client_shared,
+            &transcript,
+            &server_proof
+        ));
+        // The two directions must not be interchangeable
+        assert_ne!(proof, server_proof);
+        assert!(!verify_client_proof(
+            &server_shared,
+            &transcript,
+            &server_proof
         ));
 
         let mut tampered_proof = proof;
         tampered_proof[0] ^= 0xFF;
         assert!(!verify_client_proof(
-            &keys_server.client_tx_key,
-            &client_pk,
-            &server_pk,
+            &server_shared,
+            &transcript,
             &tampered_proof
         ));
 
-        // Mismatched keys must fail
-        let wrong_key = [0x55u8; 32];
+        // Mismatched shared secrets must fail
+        let wrong_pair = EphemeralKeyPair::generate();
+        let wrong_shared = wrong_pair
+            .compute_shared_secret(&server_pk)
+            .expect("contributory DH");
+        assert!(!verify_client_proof(&wrong_shared, &transcript, &proof));
+
+        // Transcript binding: a proof must NOT verify against substituted parameters
+        let mut hijacked = transcript;
+        hijacked.connection_id = ConnectionId(0x9999_9999_9999_9999);
+        assert!(!verify_client_proof(&server_shared, &hijacked, &proof));
+        hijacked = transcript;
+        hijacked.client_nonce = [0xAB; 32];
+        assert!(!verify_client_proof(&server_shared, &hijacked, &proof));
+        hijacked = transcript;
+        hijacked.server_pk = [0xCD; 32];
+        assert!(!verify_client_proof(&server_shared, &hijacked, &proof));
+
+        // SEC-9: the confirmation key must not be an AEAD-traffic-key derivation —
+        // a proof computed from the shared secret must not verify when the peer
+        // mistakenly keys confirmation from its traffic key.
+        let traffic_key_secret = HandshakeSharedSecret::new(keys_client.client_tx_key);
         assert!(!verify_client_proof(
-            &wrong_key, &client_pk, &server_pk, &proof
+            &traffic_key_secret,
+            &transcript,
+            &proof
         ));
     }
 

@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use gtp_crypto::{
-    compute_client_proof, derive_directional_handshake_session_keys, DirectionalKeys,
-    EphemeralKeyPair, GtpAeadProtector, PacketProtector,
+    compute_client_proof, derive_directional_handshake_session_keys, EphemeralKeyPair,
+    GtpAeadProtector, PacketProtector,
 };
 use gtp_types::{ConnectionId, PacketNumber};
 
@@ -16,13 +16,22 @@ fn bench_chacha20_poly1305(c: &mut Criterion) {
     let payload = vec![0xABu8; 1200];
 
     c.bench_function("chacha20_poly1305_seal_1200b", |b| {
-        let mut buf = vec![0u8; 1500];
-        b.iter(|| {
-            buf[..payload.len()].copy_from_slice(&payload);
-            protector
-                .seal(pn, cid, aad, &mut buf, black_box(payload.len()))
-                .unwrap()
-        })
+        // Mirror the open bench's methodology (C-20): buffer preparation
+        // happens in iter_batched setup so the measured iteration is the
+        // AEAD operation alone — seal and open figures stay comparable.
+        b.iter_batched(
+            || {
+                let mut buf = vec![0u8; 1500];
+                buf[..payload.len()].copy_from_slice(&payload);
+                buf
+            },
+            |mut buf| {
+                protector
+                    .seal(pn, cid, aad, &mut buf, black_box(payload.len()))
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     // C-20: the buffer clone moved OUT of the measured loop so the benchmark
@@ -73,20 +82,19 @@ fn bench_handshake_crypto(c: &mut Criterion) {
     let client_shared = client_pair
         .compute_shared_secret(&server_pk)
         .expect("contributory DH");
-    let keys: DirectionalKeys = derive_directional_handshake_session_keys(
-        &client_shared,
-        &client_nonce,
-        &server_nonce,
-        cid,
-    );
-    let key = keys.client_tx_key;
+    let transcript = gtp_crypto::HandshakeTranscript {
+        client_pk,
+        server_pk,
+        client_nonce,
+        server_nonce,
+        connection_id: cid,
+    };
 
     c.bench_function("handshake_client_proof_hmac", |b| {
         b.iter(|| {
             black_box(compute_client_proof(
-                black_box(&key),
-                black_box(&client_pk),
-                black_box(&server_pk),
+                black_box(&client_shared),
+                black_box(&transcript),
             ))
         })
     });

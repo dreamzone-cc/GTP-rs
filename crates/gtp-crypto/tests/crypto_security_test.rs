@@ -5,6 +5,7 @@ use gtp_crypto::{
 use gtp_types::{ConnectionId, PacketNumber};
 
 #[test]
+#[allow(deprecated)] // legacy single-pair derivation: isolation property under test
 fn test_hkdf_multi_connection_entropy_isolation() {
     let master_secret = b"championship_final_tournament_master_secret";
     let mut derived_keys = std::collections::HashSet::new();
@@ -38,6 +39,7 @@ fn test_hkdf_directional_keys_isolation() {
 }
 
 #[test]
+#[allow(deprecated)] // legacy single-pair derivation feeds the protector under test
 fn test_protector_static_dispatch_behavior() {
     let cid = ConnectionId(0xDEADBEEF);
     let pn = PacketNumber(1);
@@ -182,12 +184,18 @@ fn test_key_ratchet_forward_security() {
     let cid = ConnectionId(0x7777_8888_9999);
     let initial_key = [0x42u8; 32];
 
-    let phase_1_key = ratchet_key(&initial_key, cid);
-    let phase_2_key = ratchet_key(&phase_1_key, cid);
+    let (phase_1_key, phase_1_iv) = ratchet_key(&initial_key, cid, 1);
+    let (phase_2_key, phase_2_iv) = ratchet_key(&phase_1_key, cid, 2);
 
     assert_ne!(initial_key, phase_1_key);
     assert_ne!(phase_1_key, phase_2_key);
     assert_ne!(initial_key, phase_2_key);
+    // The base IV rotates together with the key (nonce-pair stays coherent)
+    assert_ne!(phase_1_iv, phase_2_iv);
+    // Phase binding: re-deriving phase 1 from the same key is deterministic
+    assert_eq!(phase_1_key, ratchet_key(&initial_key, cid, 1).0);
+    // ...and a different phase never aliases another one's material
+    assert_ne!(ratchet_key(&initial_key, cid, 3).0, phase_1_key);
 }
 
 #[test]
@@ -212,35 +220,33 @@ fn test_active_mitm_key_tamper_rejected() {
     let client_shared = client_ephemeral
         .compute_shared_secret(&server_pk)
         .expect("contributory DH");
-    let client_keys = derive_directional_handshake_session_keys(
-        &client_shared,
-        &client_nonce,
-        &server_nonce,
-        cid,
-    );
 
     // 2. Attacker tampers with ClientHello on the wire, substituting client_pk with attacker_pk
     // Server computes shared secret with attacker_pk instead of client_pk
     let server_shared = server_ephemeral
         .compute_shared_secret(&attacker_pk)
         .expect("contributory DH");
-    let server_keys = derive_directional_handshake_session_keys(
-        &server_shared,
-        &client_nonce,
-        &server_nonce,
-        cid,
-    );
 
-    // 3. Client generates HMAC Key Confirmation proof based on its confirmation key and PKs
-    let client_proof = compute_client_proof(&client_keys.client_tx_key, &client_pk, &server_pk);
+    // 3. Client generates the transcript-bound HMAC key confirmation proof
+    let client_transcript = gtp_crypto::HandshakeTranscript {
+        client_pk,
+        server_pk,
+        client_nonce,
+        server_nonce,
+        connection_id: cid,
+    };
+    let client_proof = compute_client_proof(&client_shared, &client_transcript);
 
-    // 4. Server MUST REJECT the tampered handshake finish proof
-    let is_valid = verify_client_proof(
-        &server_keys.client_tx_key,
-        &attacker_pk,
-        &server_pk,
-        &client_proof,
-    );
+    // 4. Server MUST REJECT the tampered handshake finish proof: it shares a
+    // secret with the attacker's leg and sees attacker_pk in the transcript.
+    let server_view = gtp_crypto::HandshakeTranscript {
+        client_pk: attacker_pk,
+        server_pk,
+        client_nonce,
+        server_nonce,
+        connection_id: cid,
+    };
+    let is_valid = verify_client_proof(&server_shared, &server_view, &client_proof);
     assert!(
         !is_valid,
         "Active MITM key substitution MUST fail cryptographic key confirmation!"

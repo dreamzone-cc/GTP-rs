@@ -7,7 +7,7 @@ use gtp_types::ConnectionId;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::fmt;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const KEY_LEN: usize = 32;
 pub const IV_LEN: usize = 12;
@@ -47,6 +47,18 @@ impl HandshakeSecret {
 /// Derives a 32-byte AEAD encryption key and a 12-byte base IV using HKDF-SHA256.
 ///
 /// Uses the 64-bit `ConnectionId` in the info parameter to ensure per-connection isolation.
+///
+/// # Deprecated (SEC-1 hazard)
+/// This returns ONE key + ONE base IV with no direction label. Any caller that
+/// uses the returned pair for both sending and receiving makes client packet N
+/// and server packet N collide on the same (key, nonce) — catastrophic for
+/// ChaCha20-Poly1305 (keystream reuse + tag forgery). Use
+/// [`derive_directional_session_keys`] instead. The only legitimate legacy use
+/// is deriving the base IV alone for a caller that already holds
+/// direction-distinct keys.
+#[deprecated(
+    note = "bidirectional use reuses one (key, nonce) pair — SEC-1; use derive_directional_session_keys or only the IV half"
+)]
 pub fn derive_session_keys(
     shared_secret: &[u8],
     cid: ConnectionId,
@@ -74,7 +86,10 @@ pub fn derive_session_keys(
 }
 
 /// Directional key material for a session (see `derive_directional_session_keys`).
-#[derive(Clone, Copy)]
+///
+/// Raw key material: no `Clone`/`Copy` (duplication would escape zeroization,
+/// SEC-14) and wiped on drop.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SessionDirectionalKeys {
     pub client_tx_key: [u8; KEY_LEN],
     pub client_tx_iv: [u8; IV_LEN],
@@ -99,6 +114,14 @@ impl fmt::Debug for SessionDirectionalKeys {
 /// Even the legacy static-secret path must never share one key/IV across both
 /// directions (SEC-1): client packet N and server packet N would collide on the
 /// same (key, nonce) pair.
+///
+/// # Forward secrecy assumption
+/// `master_secret` MUST be the ephemeral handshake output (X25519 shared
+/// secret mixed with both parties' random nonces), never a static/PSK secret:
+/// with a static secret, per-connection separation comes only from the public
+/// 64-bit CID, so compromise of the secret passively yields every session's
+/// directional keys (no FS, no post-compromise security). The unsalted HKDF
+/// here also provides no extraction strengthening for non-uniform IKM.
 pub fn derive_directional_session_keys(
     master_secret: &[u8],
     cid: ConnectionId,
@@ -134,6 +157,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(deprecated)]
     fn test_hkdf_session_key_derivation_isolation() {
         let secret = b"super_secure_game_session_master_secret_2026";
         let cid1 = ConnectionId(0x1122_3344_5566_7788);
