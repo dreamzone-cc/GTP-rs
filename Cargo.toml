@@ -22,21 +22,24 @@ version = "0.2.0"
 edition = "2021"
 authors = ["GTP Engineering Team"]
 license = "AGPL-3.0"
+description = "GTP: a gaming-VPN transport protocol with adaptive multi-path routing (Rust workspace)"
+repository = "https://example.invalid/gtp/gtp-rs" # TODO: set the real repository URL before publishing
+rust-version = "1.85"
 
 [workspace.dependencies]
-gtp-types = { path = "crates/gtp-types" }
-gtp-wire = { path = "crates/gtp-wire" }
-gtp-recovery = { path = "crates/gtp-recovery" }
-gtp-cc = { path = "crates/gtp-cc" }
-gtp-scheduler = { path = "crates/gtp-scheduler" }
-gtp-path = { path = "crates/gtp-path" }
-gtp-route = { path = "crates/gtp-route" }
-gtp-crypto = { path = "crates/gtp-crypto" }
-gtp-core = { path = "crates/gtp-core" }
-gtp-io = { path = "crates/gtp-io" }
-gtp-runtime-tokio = { path = "crates/gtp-runtime-tokio" }
-gtp-sim = { path = "crates/gtp-sim" }
-gtp = { path = "crates/gtp" }
+gtp-types = { path = "crates/gtp-types", version = "0.2.0" }
+gtp-wire = { path = "crates/gtp-wire", version = "0.2.0" }
+gtp-recovery = { path = "crates/gtp-recovery", version = "0.2.0" }
+gtp-cc = { path = "crates/gtp-cc", version = "0.2.0" }
+gtp-scheduler = { path = "crates/gtp-scheduler", version = "0.2.0" }
+gtp-path = { path = "crates/gtp-path", version = "0.2.0" }
+gtp-route = { path = "crates/gtp-route", version = "0.2.0" }
+gtp-crypto = { path = "crates/gtp-crypto", version = "0.2.0" }
+gtp-core = { path = "crates/gtp-core", version = "0.2.0" }
+gtp-io = { path = "crates/gtp-io", version = "0.2.0" }
+gtp-runtime-tokio = { path = "crates/gtp-runtime-tokio", version = "0.2.0" }
+gtp-sim = { path = "crates/gtp-sim", version = "0.2.0" }
+gtp = { path = "crates/gtp", version = "0.2.0" }
 
 # Standard dependencies
 bytes = "1.9"
