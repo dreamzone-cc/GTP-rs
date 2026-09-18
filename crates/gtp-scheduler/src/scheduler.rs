@@ -40,7 +40,9 @@ pub struct GameScheduler {
     /// collapse where every call restarted the scan at P1.
     drr_pointer: usize,
     state_table: StateTable,
-    max_queue_bytes_per_tier: usize,
+    /// FR-7/QoS: byte cap enforced PER TIER, so a latency-critical tier keeps
+    /// its own small budget instead of inheriting the largest tier's ceiling.
+    max_queue_bytes_per_tier: [usize; NUM_PRIORITY_TIERS],
     max_queue_items_per_tier: usize,
     /// FR-7: O(1) per-tier byte counters, maintained on every queue mutation.
     queue_bytes: [usize; NUM_PRIORITY_TIERS],
@@ -58,9 +60,27 @@ impl GameScheduler {
         Self::with_item_limit(max_queue_bytes_per_tier, DEFAULT_MAX_QUEUE_ITEMS_PER_TIER)
     }
 
+    /// Per-tier byte caps: each priority tier gets its own budget (mirrors
+    /// `GtpConfig::max_queue_bytes_per_tier`), so tier-0's latency-critical
+    /// bound is not inflated by a larger tier's ceiling.
+    pub fn with_per_tier_byte_caps(caps: [usize; NUM_PRIORITY_TIERS]) -> Self {
+        Self::with_per_tier_caps_and_item_limit(caps, DEFAULT_MAX_QUEUE_ITEMS_PER_TIER)
+    }
+
     /// N-7: constructor that also bounds the item count per tier.
     pub fn with_item_limit(
         max_queue_bytes_per_tier: usize,
+        max_queue_items_per_tier: usize,
+    ) -> Self {
+        Self::with_per_tier_caps_and_item_limit(
+            [max_queue_bytes_per_tier; NUM_PRIORITY_TIERS],
+            max_queue_items_per_tier,
+        )
+    }
+
+    /// Full constructor: per-tier byte caps plus a per-tier item limit.
+    pub fn with_per_tier_caps_and_item_limit(
+        max_queue_bytes_per_tier: [usize; NUM_PRIORITY_TIERS],
         max_queue_items_per_tier: usize,
     ) -> Self {
         Self {
@@ -90,7 +110,8 @@ impl GameScheduler {
         let tier_idx = item.priority as usize;
 
         // Check buffer limits (FR-7: O(1) counters, no per-enqueue tier scan).
-        if self.queue_bytes[tier_idx] + item.size_bytes() > self.max_queue_bytes_per_tier {
+        if self.queue_bytes[tier_idx] + item.size_bytes() > self.max_queue_bytes_per_tier[tier_idx]
+        {
             return Err(TransportError::ResourceLimitExceeded(
                 "Scheduler queue tier capacity reached",
             ));
@@ -161,7 +182,8 @@ impl GameScheduler {
         }
 
         let tier_idx = item.priority as usize;
-        if self.queue_bytes[tier_idx] + item.size_bytes() > self.max_queue_bytes_per_tier {
+        if self.queue_bytes[tier_idx] + item.size_bytes() > self.max_queue_bytes_per_tier[tier_idx]
+        {
             return Err(TransportError::ResourceLimitExceeded(
                 "Scheduler queue tier capacity reached",
             ));
