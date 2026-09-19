@@ -220,6 +220,13 @@ pub struct ConnectionHot {
     pub packets_since_ratchet: u64,
     /// F2: a KeyUpdate frame is queued; ratchet the keys AFTER it leaves.
     pub pending_ratchet: bool,
+    /// F3: adaptive route switching controller (None = routing disabled).
+    pub route_controller: Option<gtp_route::SwitchController>,
+    /// F3: path_id → remote address mapping for the controller's decisions.
+    pub route_paths: Vec<(u32, std::net::SocketAddr)>,
+    /// F3: latest measured PathStats per candidate (indexed by position in
+    /// route_paths — the application feeds these from telemetry/reports).
+    pub route_stats: Vec<gtp_route::PathStats>,
 }
 
 impl ConnectionHot {
@@ -422,6 +429,9 @@ impl ConnectionHot {
             next_order_seqs: FxHashMap::default(),
             packets_since_ratchet: 0,
             pending_ratchet: false,
+            route_controller: None,
+            route_paths: Vec::new(),
+            route_stats: Vec::new(),
         }
     }
 

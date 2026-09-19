@@ -65,6 +65,16 @@ pub enum ControlEvent {
     },
     /// Extensible custom hook for future experimental or custom protocol features.
     CustomExtensionEvent { extension_id: u16, payload: Vec<u8> },
+    /// F3: the route controller decided to stay on the current path.
+    RouteHeld { path_id: u32, reason: String },
+    /// F3: the route controller switched to a better path.
+    RouteSwitched {
+        from_path: u32,
+        to_path: u32,
+        reason: String,
+    },
+    /// F3: the route controller reverted to the previous path (transient degradation).
+    RouteReverted { from_path: u32, to_path: u32 },
 }
 
 /// Classification of a detected path event (RE-6, consumed from G5).

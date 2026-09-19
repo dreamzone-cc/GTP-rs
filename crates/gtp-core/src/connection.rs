@@ -154,6 +154,88 @@ impl GtpConnection {
     // Semantic Game Send API
     // ==========================================
 
+    // ==========================================
+    // F3: Adaptive Route Switching
+    // ==========================================
+
+    /// Enables adaptive route switching with the given policy and candidate paths.
+    pub fn enable_route_switching(
+        &mut self,
+        policy: gtp_route::SwitchPolicy,
+        paths: Vec<(u32, SocketAddr)>,
+    ) {
+        let n = paths.len();
+        self.hot.route_controller = Some(gtp_route::SwitchController::new(policy));
+        self.hot.route_paths = paths;
+        self.hot.route_stats = vec![gtp_route::PathStats::default(); n];
+    }
+
+    /// Feeds one path's measured statistics.
+    pub fn feed_route_stats(&mut self, path_id: u32, stats: gtp_route::PathStats) {
+        if let Some(pos) = self
+            .hot
+            .route_paths
+            .iter()
+            .position(|(id, _)| *id == path_id)
+        {
+            self.hot.route_stats[pos] = stats;
+        }
+    }
+
+    /// Evaluates the routing decision and actuates it.
+    fn tick_route_evaluation(&mut self, now: MonotonicTime) {
+        let Some(controller) = self.hot.route_controller.as_mut() else {
+            return;
+        };
+        let stats = std::mem::take(&mut self.hot.route_stats);
+        let mut tracker = gtp_route::DecisionTracker::new(64);
+        let decision = controller.evaluate(&stats, now, &mut tracker);
+        self.hot.route_stats = stats;
+
+        let event = match &decision {
+            gtp_route::SwitchDecision::Hold { current, reason } => ControlEvent::RouteHeld {
+                path_id: *current,
+                reason: reason.code().to_string(),
+            },
+            gtp_route::SwitchDecision::Switch { from, to, .. } => ControlEvent::RouteSwitched {
+                from_path: *from,
+                to_path: *to,
+                reason: "clear_winner".to_string(),
+            },
+            gtp_route::SwitchDecision::Revert { from, to } => ControlEvent::RouteReverted {
+                from_path: *from,
+                to_path: *to,
+            },
+        };
+        self.event_queue.push(event);
+
+        match decision {
+            gtp_route::SwitchDecision::Switch { to, .. }
+            | gtp_route::SwitchDecision::Revert { to, .. } => {
+                if let Some((_, addr)) = self.hot.route_paths.iter().find(|(id, _)| *id == to) {
+                    self.hot.active_path = *addr;
+                }
+            }
+            gtp_route::SwitchDecision::Hold { .. } => {}
+        }
+
+        // Always sync active_path with the controller's selection (Enforce only).
+        if let Some(controller) = &self.hot.route_controller {
+            if controller.policy() == gtp_route::SwitchPolicy::Enforce {
+                if let Some(selected_id) = controller.selected() {
+                    if let Some((_, addr)) = self
+                        .hot
+                        .route_paths
+                        .iter()
+                        .find(|(id, _)| *id == selected_id)
+                    {
+                        self.hot.active_path = *addr;
+                    }
+                }
+            }
+        }
+    }
+
     /// Largest application payload that is guaranteed to fit in a single datagram at
     /// the minimum MTU, after the packet header, the AEAD tag, and the worst-case
     /// per-message frame overhead (the `Data` frame at 27 bytes).
@@ -1249,6 +1331,8 @@ impl GtpConnection {
         // accepted — fire the deferred ratchet NOW so the NEXT datagram
         // rides the new key while this one left under the old key.
         self.hot.flush_pending_ratchet();
+        // F3: evaluate the adaptive route controller on every TX tick.
+        self.tick_route_evaluation(now);
         Ok(Some((dest, total_datagram_len)))
     }
     fn build_control_frame(ctrl: &OutgoingControlFrame) -> Frame<'_> {
@@ -3977,5 +4061,59 @@ mod tests {
             msgs.iter().any(|m| m.payload == b"before-ratchet"),
             "the old-key datagram must deliver within the grace window"
         );
+    }
+
+    /// F3 integration: adaptive route switching end-to-end on the connection.
+    #[test]
+    fn route_switching_integration_end_to_end() {
+        use gtp_types::PriorityTier;
+        let cid = ConnectionId(0x50A7_0000_0000_0001);
+        let path1: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let path2: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let (mut conn, _peer) = loopback_pair(cid);
+        let t0 = MonotonicTime::from_micros(1_000_000);
+        let mut buf = [0u8; 1500];
+
+        conn.enable_route_switching(
+            gtp_route::SwitchPolicy::Enforce,
+            vec![(1, path1), (2, path2)],
+        );
+
+        macro_rules! tick {
+            ($t:expr, $degraded:expr) => {{
+                let _ = conn.send_unreliable(b"rp".to_vec(), PriorityTier::P1Input, None, $t);
+                if $degraded {
+                    conn.feed_route_stats(
+                        1,
+                        gtp_route::PathStats::full(
+                            1, 45_000, 18_000, 40_000, 16_000, 250_000, 60, 0, 0,
+                        ),
+                    );
+                } else {
+                    conn.feed_route_stats(
+                        1,
+                        gtp_route::PathStats::full(1, 1_000, 300, 1_000, 300, 30_000, 60, 0, 0),
+                    );
+                }
+                conn.feed_route_stats(
+                    2,
+                    gtp_route::PathStats::full(2, 5_000, 1_000, 5_000, 1_000, 50_000, 60, 0, 0),
+                );
+                let _ = conn.produce_outgoing_datagram($t, &mut buf);
+            }};
+        }
+
+        tick!(t0, false);
+        assert_eq!(conn.hot.active_path, path1, "adopted the better path");
+        tick!(t0 + Duration::from_millis(100), true);
+        assert_eq!(conn.hot.active_path, path1, "inside dwell: no switch");
+        tick!(t0 + Duration::from_millis(300), true);
+        assert_eq!(conn.hot.active_path, path2, "past dwell: switched");
+        assert!(conn
+            .event_queue
+            .iter()
+            .any(|ev| matches!(ev, ControlEvent::RouteSwitched { to_path: 2, .. })));
+        tick!(t0 + Duration::from_millis(500), false);
+        assert_eq!(conn.hot.active_path, path1, "reverted (recovered)");
     }
 }

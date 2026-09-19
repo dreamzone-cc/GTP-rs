@@ -40,6 +40,7 @@ pub use decision_log::{DecisionRecord, DecisionTracker, PolicyClass, DECISION_LO
 pub use report::{MeasurementReport, REPORT_GROUP_ID, REPORT_PREFIX};
 pub use score::{confidence, freshness, score};
 pub use select::{health, select, HealthVerdict, Selection, SelectionReason};
+pub use switch::{SwitchController, SwitchDecision, SwitchPolicy};
 
 /// One candidate path's measurements, both directions, one epoch.
 ///
