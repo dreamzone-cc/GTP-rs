@@ -49,6 +49,10 @@ enum Commands {
         /// UDP bind address (e.g. 0.0.0.0:7777)
         #[arg(short, long, default_value = "0.0.0.0:7777")]
         bind: String,
+        /// v1.3: 64-hex-char seed of the server's long-term static identity.
+        /// When set, only clients pinning the derived public key can connect.
+        #[arg(long)]
+        identity_seed: Option<String>,
     },
     /// Connects a live GTP network client to a remote GTP server to benchmark real network performance
     NetClient {
@@ -58,6 +62,9 @@ enum Commands {
         /// Number of test game frames to transmit (default: 100)
         #[arg(short, long, default_value_t = 100)]
         count: usize,
+        /// v1.3: 64-hex-char pinned server static public key (anchor mode).
+        #[arg(long)]
+        pinned_static: Option<String>,
     },
     /// Bidirectional route measurement probe: measures device→node and node→device,
     /// prints the combined table and the shadow route verdict (no switching).
@@ -81,6 +88,23 @@ enum Commands {
         #[arg(short, long, default_value_t = 10000)]
         count: usize,
     },
+}
+
+/// Parses 64 hex chars into a 32-byte key material.
+fn parse_hex32(s: &str) -> std::result::Result<[u8; 32], TransportError> {
+    let bytes = hex_decode(s).map_err(TransportError::Io)?;
+    bytes
+        .try_into()
+        .map_err(|_| TransportError::Io("expected 64 hex chars (32 bytes)".into()))
+}
+
+fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("odd-length hex string".into());
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string()))
+        .collect()
 }
 
 fn get_process_memory_mb() -> f64 {
@@ -262,7 +286,10 @@ async fn main() -> Result<()> {
             println!("\nControl API demonstration completed successfully.");
         }
 
-        Commands::NetServer { bind } => {
+        Commands::NetServer {
+            bind,
+            identity_seed,
+        } => {
             let bind_addr: SocketAddr = bind
                 .parse()
                 .map_err(|e| TransportError::Io(format!("Invalid bind address: {}", e)))?;
@@ -275,7 +302,20 @@ async fn main() -> Result<()> {
             );
             println!("============================================================\n");
 
-            let endpoint = GtpEndpoint::bind(bind_addr).await?;
+            let endpoint = match identity_seed {
+                Some(seed_hex) => {
+                    let seed = parse_hex32(&seed_hex)?;
+                    let ep = GtpEndpoint::bind_with_static_identity(bind_addr, seed).await?;
+                    println!(
+                        "🔐 v1.3 IDENTIFIED server — clients must pin this static public key (hex):\n   {}",
+                        ep.static_identity_public()
+                            .map(|k| k.iter().fold(String::new(), |mut s, b| { s.push_str(&format!("{b:02x}")); s }))
+                            .unwrap_or_default()
+                    );
+                    ep
+                }
+                None => GtpEndpoint::bind(bind_addr).await?,
+            };
             let running = Arc::new(AtomicBool::new(true));
 
             println!("[Server Loop] Ready and listening for incoming client connections via X25519 Handshake on UDP {}...\n", bind_addr);
@@ -402,7 +442,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::NetClient { server, count } => {
+        Commands::NetClient {
+            server,
+            count,
+            pinned_static,
+        } => {
             let server_addr: SocketAddr = server
                 .parse()
                 .map_err(|e| TransportError::Io(format!("Invalid server address: {}", e)))?;
@@ -414,9 +458,14 @@ async fn main() -> Result<()> {
             println!("Encryption:                 ChaCha20-Poly1305 + HKDF Keys");
             println!("============================================================\n");
 
-            let client_ep = GtpEndpoint::bind("0.0.0.0:0".parse().unwrap()).await?;
+            let mut client_ep = GtpEndpoint::bind("0.0.0.0:0".parse().unwrap()).await?;
             let local_addr = client_ep.local_addr()?;
             println!("Client local UDP socket bound to: {}\n", local_addr);
+            if let Some(pinned) = &pinned_static {
+                let pk = parse_hex32(pinned)?;
+                client_ep.set_trusted_server_static(pk);
+                println!("🔐 v1.3 ANCHORED client — pinning server static key {pinned}");
+            }
 
             // Each client session MUST use a fresh Connection ID. The server keys all
             // handshake and routing state on the client-chosen CID, so reusing one
