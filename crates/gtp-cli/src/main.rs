@@ -18,8 +18,18 @@ fn fmt_min_rtt(min_rtt: Option<gtp_types::Duration>) -> String {
     }
 }
 
+/// Build stamp injected at deploy time by scripts/deploy_vps.sh
+/// (GTP_BUILD_SHA = "gtp-<version>-<git-short-sha>"); falls back to the
+/// package version for local builds. `gtp-cli --version` on the VPS must
+/// match the deploying machine — the deploy script enforces it.
+pub const BUILD_SHA: &str = match option_env!("GTP_BUILD_SHA") {
+    Some(stamp) => stamp,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser, Debug)]
 #[command(name = "gtp-cli")]
+#[command(version = BUILD_SHA)]
 #[command(
     about = "Game Transport Protocol (GTP/1.1) CLI, Control Engine, Stress & Stability Harness",
     long_about = None
