@@ -42,6 +42,7 @@ async fn bidirectional_report_exchange_produces_a_shadow_verdict() {
                         samples: m.total_rx_packets.min(u32::MAX as u64) as u32,
                         // RT-3: forward evidence age (GTPRP2).
                         since_last_rx_us: m.since_last_rx.map(|d| d.as_micros()),
+                        loss_rate: None,
                     };
                     let _ = conn
                         .send_reliable_ordered(
@@ -128,6 +129,7 @@ async fn bidirectional_report_exchange_produces_a_shadow_verdict() {
         rtt_us: Some(m.smoothed_rtt.as_micros() as u32),
         sample_count: frames.max(1),
         rev_age_us: m.since_last_rx.map(|d| d.as_micros()),
+        loss_rate: None,
         ..Default::default()
     };
     let stats = report.into_path_stats(0, &local_stats);

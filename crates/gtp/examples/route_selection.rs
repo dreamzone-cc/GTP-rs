@@ -74,6 +74,7 @@ fn main() {
         // Freshness: the loop just ran — both bases are as fresh as can be.
         fwd_age_us: server_metrics.since_last_rx.map(|d| d.as_micros()),
         rev_age_us: client_metrics.since_last_rx.map(|d| d.as_micros()),
+        loss_rate: None,
     };
 
     let selection = select(&[stats]);

@@ -21,7 +21,15 @@ pub const VAR_AXIS_WEIGHT: f64 = 0.6;
 /// Path-level weights: forward direction, reverse direction, round trip.
 /// Starting points only — the shipped defaults are a calibration output of
 /// the G3 24-hour shadow dataset (ARDP §11.1), not constants.
-pub const PATH_WEIGHTS: (f64, f64, f64) = (0.35, 0.35, 0.30);
+pub const PATH_WEIGHTS: (f64, f64, f64) = (0.30, 0.30, 0.25);
+
+/// F4 (RT-1/E-5): loss rate at and above this reads as a fully degraded
+/// axis. 5%: beyond this, interactive gameplay is impossible regardless of
+/// how good the latency axes are.
+pub const LOSS_SATURATION: f64 = 0.05;
+/// F4: weight of the loss axis relative to the latency axes (the remaining
+/// weight is distributed among the latency axes by their own weights).
+pub const LOSS_AXIS_WEIGHT: f64 = 0.15;
 
 /// Sample count at which [`confidence`] reaches 1.0.
 pub const CONFIDENCE_FULL_SAMPLES: f64 = 30.0;
@@ -76,16 +84,23 @@ pub fn score(stats: &PathStats) -> Option<f64> {
     let mut weight_sum = 0.0;
     let mut acc = 0.0;
     if let Some(s) = fwd {
-        weight_sum += w_fwd;
-        acc += w_fwd * s;
+        weight_sum += w_fwd * (1.0 - LOSS_AXIS_WEIGHT);
+        acc += w_fwd * (1.0 - LOSS_AXIS_WEIGHT) * s;
     }
     if let Some(s) = rev {
-        weight_sum += w_rev;
-        acc += w_rev * s;
+        weight_sum += w_rev * (1.0 - LOSS_AXIS_WEIGHT);
+        acc += w_rev * (1.0 - LOSS_AXIS_WEIGHT) * s;
     }
     if let Some(s) = rtt {
-        weight_sum += w_rtt;
-        acc += w_rtt * s;
+        weight_sum += w_rtt * (1.0 - LOSS_AXIS_WEIGHT);
+        acc += w_rtt * (1.0 - LOSS_AXIS_WEIGHT) * s;
+    }
+    // F4: loss axis — lower-is-better onto [0,1] with 5% saturation.
+    // Unknown (None) is excluded and the remaining weights renormalize.
+    if let Some(lr) = stats.loss_rate {
+        let loss_score = 1.0 - (lr / LOSS_SATURATION).min(1.0);
+        weight_sum += LOSS_AXIS_WEIGHT;
+        acc += LOSS_AXIS_WEIGHT * loss_score;
     }
     if weight_sum == 0.0 {
         None
@@ -150,12 +165,12 @@ mod tests {
         };
         assert_eq!(score(&fwd_only), Some(1.0));
 
-        // Forward perfect + RTT fully saturated: (0.35*1 + 0.30*0) / 0.65.
+        // Forward perfect + RTT fully saturated: (0.30*1 + 0.25*0) / 0.55.
         let mixed = PathStats {
             rtt_us: Some(RTT_SATURATION_US),
             ..fwd_only
         };
-        let expected = 0.35 / 0.65;
+        let expected = 0.30 / 0.55;
         let got = score(&mixed).unwrap();
         assert!(
             (got - expected).abs() < 1e-12,
@@ -198,6 +213,55 @@ mod tests {
                 worse
             );
         }
+    }
+
+    /// F4: loss degrades the score monotonically; 5%+ saturates to zero.
+    #[test]
+    fn loss_axis_degrades_and_saturates() {
+        let base = PathStats::full(0, 1_000, 300, 1_000, 300, 30_000, 60, 0, 0);
+        let s0 = score(&base).unwrap();
+
+        for (rate, expect_lower) in [
+            (0.005, true),
+            (0.01, true),
+            (0.03, true),
+            (0.05, true),
+            (0.10, true), // saturated: same as 0.05
+        ] {
+            let degraded = PathStats {
+                loss_rate: Some(rate),
+                ..base
+            };
+            let s = score(&degraded).unwrap();
+            if expect_lower {
+                assert!(
+                    s < s0,
+                    "loss_rate={rate} must lower the score ({s} >= {s0})"
+                );
+            }
+        }
+        // 5% and 10% both saturate — identical scores.
+        let l5 = score(&PathStats {
+            loss_rate: Some(0.05),
+            ..base
+        })
+        .unwrap();
+        let l10 = score(&PathStats {
+            loss_rate: Some(0.10),
+            ..base
+        })
+        .unwrap();
+        assert_eq!(l5, l10, "beyond saturation the axis is clamped");
+        // Unknown loss renormalizes — the latency axes still work.
+        let unknown = score(&PathStats {
+            loss_rate: None,
+            ..base
+        })
+        .unwrap();
+        assert_eq!(
+            unknown, s0,
+            "unknown loss is neutral (excluded, not excellent)"
+        );
     }
 
     #[test]

@@ -78,6 +78,9 @@ pub struct PathStats {
     /// RT-3: age of the REVERSE evidence — µs since this endpoint last
     /// received authenticated traffic. `None` = unknown.
     pub rev_age_us: Option<u64>,
+    /// F4 (RT-1/E-5): loss RATE in [0,1] — windowed fraction of packets
+    /// lost on this path (NOT the cumulative bytes ratio). `None` = unknown.
+    pub loss_rate: Option<f64>,
 }
 
 impl PathStats {
@@ -105,6 +108,7 @@ impl PathStats {
             sample_count,
             fwd_age_us: Some(fwd_age_us),
             rev_age_us: Some(rev_age_us),
+            loss_rate: None,
         }
     }
 

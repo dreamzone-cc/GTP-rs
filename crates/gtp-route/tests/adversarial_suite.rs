@@ -391,6 +391,7 @@ fn s11_delayed_and_duplicate_reports_are_stale_aware_and_inert() {
         srtt_us: Some(50_000),
         samples: 500,
         since_last_rx_us: Some(4_200_000),
+        loss_rate: None,
     };
     let line = old_report.encode();
     assert!(line.starts_with("GTPRP2|"));

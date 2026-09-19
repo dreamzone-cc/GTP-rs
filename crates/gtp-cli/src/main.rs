@@ -420,6 +420,16 @@ async fn main() -> Result<()> {
                                             since_last_rx_us: m
                                                 .since_last_rx
                                                 .map(|d| d.as_micros()),
+                                            // F4: windowed loss rate from the
+                                            // loss detector (None if clean).
+                                            loss_rate: if m.total_tx_packets > 0 {
+                                                Some(
+                                                    m.total_retransmissions as f64
+                                                        / m.total_tx_packets as f64,
+                                                )
+                                            } else {
+                                                None
+                                            },
                                         };
                                         let _ = client_conn
                                             .send_reliable_ordered(

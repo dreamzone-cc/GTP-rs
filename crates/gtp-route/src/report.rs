@@ -10,6 +10,8 @@ use crate::PathStats;
 /// Line prefix identifying the current report format (version 2 — adds the
 /// measurement-basis age, RT-3).
 pub const REPORT_PREFIX: &str = "GTPRP2";
+/// F4: v3 prefix — adds the loss-rate axis.
+pub const REPORT_PREFIX_V3: &str = "GTPRP3";
 /// Legacy v1 prefix (no age field) — still parsed for compatibility; its
 /// age reads as unknown (`None`).
 pub const REPORT_PREFIX_V1: &str = "GTPRP1";
@@ -35,6 +37,8 @@ pub struct MeasurementReport {
     /// clock — `DetailedMetrics::since_last_rx`). `None` on v1 reports:
     /// unknown freshness, never zero.
     pub since_last_rx_us: Option<u64>,
+    /// F4: windowed loss rate [0,1] (None = not carried in v1/v2).
+    pub loss_rate: Option<f64>,
 }
 
 fn field(v: Option<u32>) -> String {
@@ -55,6 +59,20 @@ impl MeasurementReport {
     /// Encode as `GTPRP2|var|jitter|srtt|samples|since_last_rx`
     /// (`-` = not yet measured / not carried).
     pub fn encode(&self) -> String {
+        if self.loss_rate.is_some() {
+            return format!(
+                "{}|{}|{}|{}|{}|{}|{:.6}",
+                REPORT_PREFIX_V3,
+                field(self.owd_var_us),
+                field(self.jitter_us),
+                field(self.srtt_us),
+                self.samples,
+                field_u64(self.since_last_rx_us),
+                self.loss_rate
+                    .map(|l| format!("{l:.6}"))
+                    .unwrap_or("-".into())
+            );
+        }
         format!(
             "{}|{}|{}|{}|{}|{}",
             REPORT_PREFIX,
@@ -72,6 +90,11 @@ impl MeasurementReport {
     /// (unknown freshness, per the RT-3 semantics).
     pub fn parse(line: &str) -> Option<Self> {
         let (version, rest) = if let Some(r) = line
+            .strip_prefix(REPORT_PREFIX_V3)
+            .and_then(|r| r.strip_prefix('|'))
+        {
+            (3, r)
+        } else if let Some(r) = line
             .strip_prefix(REPORT_PREFIX)
             .and_then(|r| r.strip_prefix('|'))
         {
@@ -84,6 +107,7 @@ impl MeasurementReport {
         } else {
             return None;
         };
+        let is_v3 = line.starts_with(REPORT_PREFIX_V3);
         let mut parts = rest.split('|');
         let next = |parts: &mut std::str::Split<'_, char>| -> Option<Option<u32>> {
             match parts.next()? {
@@ -97,16 +121,25 @@ impl MeasurementReport {
         let jitter_us = next(&mut parts)?;
         let srtt_us = next(&mut parts)?;
         let samples = parts.next()?.parse::<u32>().ok()?;
-        let since_last_rx_us = match version {
-            2 => {
-                let raw = parts.next()?;
-                if raw == "-" {
-                    None
-                } else {
-                    Some(raw.parse::<u64>().ok()?)
-                }
+        let since_last_rx_us = if version >= 2 {
+            let raw = parts.next()?;
+            if raw == "-" {
+                None
+            } else {
+                Some(raw.parse::<u64>().ok()?)
             }
-            _ => None, // v1: no age field carried
+        } else {
+            None
+        };
+        let loss_rate = if is_v3 {
+            let raw = parts.next()?;
+            if raw == "-" {
+                None
+            } else {
+                Some(raw.parse::<f64>().ok()?)
+            }
+        } else {
+            None
         };
         if parts.next().is_some() {
             return None; // trailing fields: not our format
@@ -117,6 +150,7 @@ impl MeasurementReport {
             srtt_us,
             samples,
             since_last_rx_us,
+            loss_rate,
         })
     }
 
@@ -140,6 +174,7 @@ impl MeasurementReport {
             sample_count: self.samples.min(rev.sample_count.max(1)),
             fwd_age_us: self.since_last_rx_us,
             rev_age_us: rev.rev_age_us,
+            loss_rate: self.loss_rate,
         }
     }
 }
@@ -156,6 +191,7 @@ mod tests {
             srtt_us: Some(51_379),
             samples: 812,
             since_last_rx_us: Some(1_240),
+            loss_rate: None,
         };
         assert_eq!(r.encode(), "GTPRP2|4032|537|51379|812|1240");
         assert_eq!(MeasurementReport::parse(&r.encode()), Some(r));
@@ -218,6 +254,7 @@ mod tests {
             srtt_us: Some(50_000),
             samples: 100,
             since_last_rx_us: Some(700),
+            loss_rate: None,
         };
         let local = PathStats {
             rev_owd_var_us: Some(1_500),
@@ -244,6 +281,7 @@ mod tests {
         let both = PathStats {
             fwd_age_us: Some(700),
             rev_age_us: Some(3_000),
+            loss_rate: None,
             ..stats
         };
         assert_eq!(both.path_age(), Some(3_000), "the staler direction governs");

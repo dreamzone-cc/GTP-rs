@@ -58,6 +58,7 @@ fn measure_pair(seed: u64, profile: NetworkProfile, path_id: u32) -> gtp_route::
         // both directions' evidence is fresh (age 0).
         fwd_age_us: Some(0),
         rev_age_us: Some(0),
+        loss_rate: None,
     }
 }
 

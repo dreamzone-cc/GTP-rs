@@ -385,6 +385,7 @@ mod tests {
         let legacy = PathStats {
             fwd_age_us: None,
             rev_age_us: None,
+            loss_rate: None,
             ..PathStats::full(3, 100, 100, 100, 100, 10_000, 60, 0, 0)
         };
         let s = select(&[legacy]);

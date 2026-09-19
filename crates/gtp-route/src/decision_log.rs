@@ -397,6 +397,7 @@ mod tests {
         let stale7 = PathStats {
             fwd_age_us: Some(4_500_000),
             rev_age_us: Some(4_500_000),
+            loss_rate: None,
             ..clean(7)
         };
         t.record(
