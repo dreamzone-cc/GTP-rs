@@ -43,6 +43,11 @@ pub enum OutgoingControlFrame {
         error_code: u16,
         reason: String,
     },
+    /// F2: wire-level key-phase negotiation. The initiator ratchets then
+    /// enqueues this frame (sealed under the NEW key).
+    KeyUpdate {
+        next_phase: u64,
+    },
 }
 
 /// Bounded FIFO index of recently delivered reliable message ids (ORD-4): blocks
@@ -213,6 +218,8 @@ pub struct ConnectionHot {
     pub next_message_id: u64,
     pub next_order_seqs: FxHashMap<u16, u32>,
     pub packets_since_ratchet: u64,
+    /// F2: a KeyUpdate frame is queued; ratchet the keys AFTER it leaves.
+    pub pending_ratchet: bool,
 }
 
 impl ConnectionHot {
@@ -414,6 +421,7 @@ impl ConnectionHot {
             next_message_id: 1,
             next_order_seqs: FxHashMap::default(),
             packets_since_ratchet: 0,
+            pending_ratchet: false,
         }
     }
 
@@ -511,6 +519,47 @@ impl ConnectionHot {
         self.key_phase = !self.key_phase;
         self.key_phase_counter = next_phase;
         self.packets_since_ratchet = 0;
+    }
+
+    /// F2: wire-negotiated ratchet — enqueues the KeyUpdate frame FIRST
+    /// (sealed under the CURRENT key the peer still holds), then ratchets
+    /// on the NEXT produce call AFTER the frame has actually left. Returns
+    /// the announced phase (0 = refused by the grace-window guard).
+    pub fn ratchet_and_announce(&mut self) -> u64 {
+        // Guard: same conditions as ratchet_session_key (grace window, plaintext).
+        if self.rx_protector_prev.is_some() && self.rx_prev_grace_packets > 0 {
+            return 0;
+        }
+        #[cfg(any(test, feature = "insecure-plaintext"))]
+        if matches!(self.tx_protector, Protector::Plaintext(_)) {
+            return 0;
+        }
+        let next_phase = self.key_phase_counter + 1;
+        self.control_queue
+            .push_back(OutgoingControlFrame::KeyUpdate { next_phase });
+        // Deferred: the actual ratchet fires on the produce call AFTER the
+        // KeyUpdate datagram has been sealed (under the old key) and sent.
+        self.pending_ratchet = true;
+        next_phase
+    }
+
+    /// F2: fires the deferred ratchet. Called by produce_outgoing_datagram
+    /// after the datagram carrying the KeyUpdate control frame was accepted.
+    pub fn flush_pending_ratchet(&mut self) {
+        if self.pending_ratchet {
+            self.pending_ratchet = false;
+            self.ratchet_session_key();
+        }
+    }
+
+    /// F2: responds to a received KeyUpdate — ratchets if the announced
+    /// phase is strictly newer than ours; a retransmit/replay (phase <=
+    /// ours) is silently ignored (the initiator will see our traffic under
+    /// the new key and stop retransmitting).
+    pub fn on_key_update(&mut self, announced_phase: u64) {
+        if announced_phase > self.key_phase_counter {
+            self.ratchet_session_key();
+        }
     }
 
     /// Consumes one unit of the post-ratchet grace window and retires the previous

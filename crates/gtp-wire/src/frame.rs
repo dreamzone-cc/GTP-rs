@@ -24,6 +24,10 @@ pub const FRAME_TYPE_HANDSHAKE_FINISH: u8 = 0x0D;
 /// v1.2 (spec amendment: ServerFinish + version binding): the server's
 /// mirrored key-confirmation proof, long-header packets only.
 pub const FRAME_TYPE_SERVER_FINISH: u8 = 0x0E;
+/// F2: wire-level key-phase negotiation. The initiator ratchets then sends
+/// this frame (sealed under the NEW key — decryptability IS the proof);
+/// the responder ratchets on receipt if the phase is strictly newer.
+pub const FRAME_TYPE_KEY_UPDATE: u8 = 0x10;
 /// Protocol version carried in ClientHello and bound into the confirmation
 /// transcript. v1.2 peers reject any other version outright.
 pub const PROTOCOL_VERSION: u32 = 0x0000_0003;
@@ -112,6 +116,13 @@ pub enum Frame<'a> {
     },
     ServerFinish {
         server_proof: [u8; 32],
+    },
+    KeyUpdate {
+        next_phase: u64,
+        /// Reserved for future PSK-anchored modes; in the current pure-AEAD
+        /// mode, successful decryption of this frame under the new key is
+        /// the initiator's proof of derivation.
+        initiator_proof: [u8; 32],
     },
     Padding {
         len: usize,
@@ -203,6 +214,7 @@ impl<'a> Frame<'a> {
             Self::ServerHello { .. } => FRAME_TYPE_SERVER_HELLO,
             Self::HandshakeFinish { .. } => FRAME_TYPE_HANDSHAKE_FINISH,
             Self::ServerFinish { .. } => FRAME_TYPE_SERVER_FINISH,
+            Self::KeyUpdate { .. } => FRAME_TYPE_KEY_UPDATE,
             Self::Padding { .. } => FRAME_TYPE_PADDING,
         }
     }
@@ -488,6 +500,19 @@ impl<'a> Frame<'a> {
                 offset += 32;
             }
 
+            Self::KeyUpdate {
+                next_phase,
+                initiator_proof,
+            } => {
+                if buf.len() < offset + 8 + 32 {
+                    return Err(TransportError::BufferOverflow);
+                }
+                buf[offset..offset + 8].copy_from_slice(&next_phase.to_be_bytes());
+                offset += 8;
+                buf[offset..offset + 32].copy_from_slice(initiator_proof);
+                offset += 32;
+            }
+
             Self::HandshakeFinish {
                 cookie_echo,
                 client_proof,
@@ -750,6 +775,20 @@ impl<'a> Frame<'a> {
                 Ok((Frame::ServerFinish { server_proof }, offset))
             }
 
+            FRAME_TYPE_KEY_UPDATE => {
+                let next_phase = read_u64(buf, &mut offset)?;
+                let proof = read_bytes(buf, &mut offset, 32)?;
+                let mut initiator_proof = [0u8; 32];
+                initiator_proof.copy_from_slice(proof);
+                Ok((
+                    Frame::KeyUpdate {
+                        next_phase,
+                        initiator_proof,
+                    },
+                    offset,
+                ))
+            }
+
             FRAME_TYPE_PADDING => {
                 let padding_len = buf.len().saturating_sub(offset);
                 offset = buf.len();
@@ -764,6 +803,23 @@ impl<'a> Frame<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F2: KeyUpdate round-trips exactly.
+    #[test]
+    fn test_key_update_roundtrip() {
+        let frame = Frame::KeyUpdate {
+            next_phase: 7,
+            initiator_proof: [0xCD; 32],
+        };
+        let mut buf = [0u8; 64];
+        let n = frame.encode(&mut buf).unwrap();
+        assert_eq!(n, 41); // type tag + u64 phase + 32-byte proof
+        let (decoded, consumed) = Frame::decode(&buf[..n]).unwrap();
+        assert_eq!(consumed, n);
+        assert_eq!(decoded, frame);
+        // Truncation is rejected whole.
+        assert!(Frame::decode(&buf[..20]).is_err());
+    }
 
     /// v1.2 amendment: ServerFinish round-trips exactly.
     #[test]

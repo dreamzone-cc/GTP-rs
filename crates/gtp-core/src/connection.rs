@@ -789,6 +789,11 @@ impl GtpConnection {
                     }
                 }
 
+                Frame::KeyUpdate { next_phase, .. } => {
+                    // F2: the peer rotated; follow if their phase is newer.
+                    self.hot.on_key_update(next_phase);
+                }
+
                 Frame::AckFrequency {
                     ack_frequency_packets,
                     max_ack_delay_ms,
@@ -1240,6 +1245,10 @@ impl GtpConnection {
         // exhaust the window within one RTT and drop the old RX key before the reordered
         // inbound packets it was meant to keep openable had arrived.
         let dest = override_dest.unwrap_or(self.hot.active_path);
+        // F2: the datagram (possibly carrying a KeyUpdate) is sealed and
+        // accepted — fire the deferred ratchet NOW so the NEXT datagram
+        // rides the new key while this one left under the old key.
+        self.hot.flush_pending_ratchet();
         Ok(Some((dest, total_datagram_len)))
     }
     fn build_control_frame(ctrl: &OutgoingControlFrame) -> Frame<'_> {
@@ -1268,6 +1277,10 @@ impl GtpConnection {
             OutgoingControlFrame::Close { error_code, reason } => Frame::Close {
                 error_code: *error_code,
                 reason,
+            },
+            OutgoingControlFrame::KeyUpdate { next_phase } => Frame::KeyUpdate {
+                next_phase: *next_phase,
+                initiator_proof: [0u8; 32], // AEAD-decryptability is the proof
             },
         }
     }
@@ -3868,6 +3881,101 @@ mod tests {
         assert_eq!(
             server.control().query_metrics(t2).since_last_rx,
             Some(Duration::from_millis(2_000))
+        );
+    }
+
+    /// F2: wire-negotiated key update — initiator ratchets and announces;
+    /// the responder follows on receipt; a replayed KeyUpdate is ignored.
+    #[test]
+    fn key_update_both_directions_and_replay_rejected() {
+        let cid = ConnectionId(0x5EED_0000_0000_0001);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(1_000_000);
+
+        let initial_key = *client.hot.tx_key;
+
+        // 1. Client initiates: enqueues the KeyUpdate control frame (sealed
+        // under the OLD key — the peer still holds it).
+        let phase = client.control().initiate_key_update();
+        assert_eq!(phase, 1, "first ratchet → phase 1");
+
+        // The control queue carries the KeyUpdate frame; the ratchet is DEFERRED.
+        assert!(matches!(
+            client.hot.control_queue.front(),
+            Some(OutgoingControlFrame::KeyUpdate { next_phase: 1 })
+        ));
+        assert!(
+            client.hot.pending_ratchet,
+            "the ratchet is deferred until the frame has been produced"
+        );
+        // The key has NOT changed yet (deferred design).
+        assert_eq!(*client.hot.tx_key, initial_key);
+
+        // 2. Produce the datagram: the KeyUpdate is sealed under the OLD key,
+        // and AFTER the datagram is accepted the ratchet fires.
+        let mut buf = [0u8; 2048];
+        let Ok(Some((_, len))) = client.produce_outgoing_datagram(now, &mut buf) else {
+            panic!("the KeyUpdate must produce a datagram");
+        };
+        // NOW the key has changed (the deferred ratchet fired on produce).
+        assert_ne!(*client.hot.tx_key, initial_key);
+
+        // 3. The server processes it: the KeyUpdate frame arrives → follows.
+        let _ = server.handle_incoming_datagram(client_addr, &mut buf[..len], now);
+        assert_eq!(
+            server.hot.key_phase_counter, 1,
+            "the responder must have followed to phase 1"
+        );
+        assert_eq!(*server.hot.rx_key, *client.hot.tx_key);
+
+        // 4. A replayed KeyUpdate (phase 1 again) is silently ignored.
+        server.hot.on_key_update(1);
+        assert_eq!(
+            server.hot.key_phase_counter, 1,
+            "replay does not re-ratchet"
+        );
+
+        // 5. A stale (lower-phase) update is also ignored.
+        server.hot.on_key_update(0);
+        assert_eq!(server.hot.key_phase_counter, 1, "stale does not re-ratchet");
+    }
+
+    /// F2: a straggler datagram sealed under the OLD key still decrypts within
+    /// the grace window after a wire-negotiated ratchet.
+    #[test]
+    fn straggler_under_old_key_survives_wire_negotiated_ratchet() {
+        let cid = ConnectionId(0x5EED_0000_0000_0002);
+        let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let (mut client, mut server) = loopback_pair(cid);
+        let now = MonotonicTime::from_micros(1_000_000);
+
+        // Produce a data datagram under the initial key.
+        let mut old_buf = [0u8; 2048];
+        client.send_unreliable(b"before-ratchet".to_vec(), PriorityTier::P1Input, None, now);
+        let Ok(Some((_, old_len))) = client.produce_outgoing_datagram(now, &mut old_buf) else {
+            panic!("initial datagram must produce");
+        };
+
+        // Client ratchets + announces.
+        let phase = client.control().initiate_key_update();
+        assert_eq!(phase, 1);
+        let mut new_buf = [0u8; 2048];
+        let Ok(Some((_, new_len))) = client.produce_outgoing_datagram(now, &mut new_buf) else {
+            panic!("post-ratchet datagram must produce");
+        };
+
+        // Server receives the NEW datagram first (KeyUpdate + possibly data).
+        let _ = server.handle_incoming_datagram(client_addr, &mut new_buf[..new_len], now);
+        assert_eq!(server.hot.key_phase_counter, 1);
+
+        // Then the straggler (old key) arrives — the grace window opens it.
+        let msgs = server
+            .handle_incoming_datagram(client_addr, &mut old_buf[..old_len], now)
+            .expect("grace window must decrypt the old-key straggler");
+        assert!(
+            msgs.iter().any(|m| m.payload == b"before-ratchet"),
+            "the old-key datagram must deliver within the grace window"
         );
     }
 }

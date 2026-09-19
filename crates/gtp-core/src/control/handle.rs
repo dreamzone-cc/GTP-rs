@@ -162,6 +162,13 @@ impl<'a> ConnectionControl<'a> {
         self.hot.ratchet_session_key();
     }
 
+    /// F2: wire-negotiated ratchet — ratchets AND announces (KeyUpdate frame
+    /// rides the P0 control queue; the peer follows on receipt).
+    /// Returns the new phase (0 = refused by the grace-window guard).
+    pub fn initiate_key_update(&mut self) -> u64 {
+        self.hot.ratchet_and_announce()
+    }
+
     /// Take a comprehensive telemetry snapshot of all protocol subsystems.
     pub fn query_metrics(&self, now: MonotonicTime) -> DetailedMetrics {
         let rtt = self.hot.loss_detector.rtt_stats;
