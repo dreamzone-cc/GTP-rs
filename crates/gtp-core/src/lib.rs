@@ -1,6 +1,7 @@
 pub mod api;
 pub mod connection;
 pub mod control;
+pub mod fragment;
 pub mod state;
 
 pub use api::{NetworkFeedback, ReceivedMessage};

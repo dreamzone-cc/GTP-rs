@@ -8,6 +8,10 @@ pub struct RetransmissionRecord {
     pub transmission_id: TransmissionId,
     pub group_id: u16,
     pub order_seq: u32,
+    /// F1: how many fragments the logical message has (1 = unfragmented) —
+    /// a retransmitted fragment must carry its set's total on the wire or
+    /// the receiver would treat it as a complete message.
+    pub total_fragments: u16,
     pub payload: Vec<u8>,
 }
 

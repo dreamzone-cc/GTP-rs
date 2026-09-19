@@ -152,6 +152,8 @@ pub struct ConnectionHot {
     gen_counter: u64,
     /// RX-side freshness table (SEM-2): drops late sequenced state at the receiver.
     pub rx_state_table: StateTable,
+    /// CORE-2/F1: bounded reassembly of fragmented reliable messages.
+    pub reassembler: crate::fragment::MessageReassembler,
     /// ReliableUnordered duplicate-delivery guard (ORD-4).
     pub delivered_index: DeliveredIndex,
     pub replay_window: ReplayWindow,
@@ -388,6 +390,7 @@ impl ConnectionHot {
             group_gens: FxHashMap::default(),
             gen_counter: 0,
             rx_state_table: StateTable::new(),
+            reassembler: crate::fragment::MessageReassembler::new(),
             delivered_index: DeliveredIndex::new(4096),
             replay_window: ReplayWindow::new(),
             tx_protector,
@@ -540,4 +543,6 @@ pub struct ConnectionCold {
     pub total_duplicate_drops: u64,
     /// RT-2: control events shed by the bounded event queue (drop-oldest).
     pub total_dropped_events: u64,
+    /// F1: fragments refused by the bounded reassembler (orphan/poison/cap).
+    pub total_fragment_drops: u64,
 }

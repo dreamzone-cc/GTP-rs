@@ -335,6 +335,7 @@ impl GameScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gtp_types::FragmentId;
     use gtp_types::{Duration, GenerationId, MessageId, StateKey, StateSequence};
 
     fn item(id: u64, tier: PriorityTier, payload: &[u8]) -> SchedulableItem {
@@ -345,6 +346,8 @@ mod tests {
             created_at: MonotonicTime::from_micros(1_000_000),
             deadline: None,
             supersedable: true,
+            fragment_id: FragmentId(0),
+            total_fragments: 1,
             payload: payload.to_vec(),
         }
     }
@@ -362,6 +365,8 @@ mod tests {
             created_at: now,
             deadline: Some(now + Duration::from_millis(20)),
             supersedable: true,
+            fragment_id: FragmentId(0),
+            total_fragments: 1,
             payload: b"input_move".to_vec(),
         };
 
@@ -393,6 +398,8 @@ mod tests {
             created_at: now,
             deadline: None,
             supersedable: true,
+            fragment_id: FragmentId(0),
+            total_fragments: 1,
             payload: b"pos_x10".to_vec(),
         };
         sched.enqueue(state1, now).unwrap();
@@ -409,6 +416,8 @@ mod tests {
             created_at: now,
             deadline: None,
             supersedable: true,
+            fragment_id: FragmentId(0),
+            total_fragments: 1,
             payload: b"pos_x20".to_vec(),
         };
         sched.enqueue(state2, now).unwrap();
@@ -550,6 +559,8 @@ mod tests {
             created_at: now,
             deadline: None,
             supersedable: true,
+            fragment_id: FragmentId(0),
+            total_fragments: 1,
             payload: vec![9u8; 50],
         };
         let mut s2 = s1.clone();

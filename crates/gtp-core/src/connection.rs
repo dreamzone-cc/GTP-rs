@@ -190,6 +190,8 @@ impl GtpConnection {
             created_at: now,
             deadline,
             supersedable: true,
+            fragment_id: FragmentId(0),
+            total_fragments: 1,
             payload,
         };
 
@@ -225,6 +227,8 @@ impl GtpConnection {
             created_at: now,
             deadline,
             supersedable: true,
+            fragment_id: FragmentId(0),
+            total_fragments: 1,
             payload,
         };
 
@@ -239,25 +243,27 @@ impl GtpConnection {
         deadline: Option<MonotonicTime>,
         now: MonotonicTime,
     ) -> Result<MessageId> {
-        // FR-1: reject before consuming a message id so an oversized send leaves no gap.
-        let max = self.max_message_payload();
-        if payload.len() > max {
-            return Err(TransportError::PayloadTooLarge { max });
-        }
+        // CORE-2/F1: oversized reliable messages are fragmented instead of
+        // rejected — each fragment is its own schedulable item and its own
+        // retransmission unit, so a lost fragment retransmits alone.
         let msg_id = MessageId(self.hot.next_message_id);
         self.hot.next_message_id += 1;
-
-        let item = SchedulableItem {
-            message_id: msg_id,
-            class: MessageClass::ReliableUnordered,
-            priority,
-            created_at: now,
-            deadline,
-            supersedable: false,
-            payload,
-        };
-
-        self.hot.scheduler.enqueue(item, now)?;
+        let max = self.max_message_payload();
+        let total = crate::fragment::message_fragment_count(payload.len(), max)?;
+        for (idx, chunk) in payload.chunks(max).enumerate() {
+            let item = SchedulableItem {
+                message_id: msg_id,
+                class: MessageClass::ReliableUnordered,
+                priority,
+                created_at: now,
+                deadline,
+                supersedable: false,
+                fragment_id: FragmentId(idx as u16),
+                total_fragments: total,
+                payload: chunk.to_vec(),
+            };
+            self.hot.scheduler.enqueue(item, now)?;
+        }
         Ok(msg_id)
     }
 
@@ -269,13 +275,12 @@ impl GtpConnection {
         deadline: Option<MonotonicTime>,
         now: MonotonicTime,
     ) -> Result<MessageId> {
-        // FR-1: reject BEFORE consuming an order_seq. An oversized ordered message that
-        // burned a sequence number would leave a permanent gap the receiver waits on
-        // forever, stalling the entire group.
+        // CORE-2/F1: fragmentation replaces the rejection. ONE order_seq is
+        // consumed for the WHOLE logical message and every fragment carries
+        // it — the receiver reassembles below the ordered-group layer, so a
+        // group still sees exactly one sequence number per message.
         let max = self.max_message_payload();
-        if payload.len() > max {
-            return Err(TransportError::PayloadTooLarge { max });
-        }
+        let total = crate::fragment::message_fragment_count(payload.len(), max)?;
         let order_seq = self
             .hot
             .next_order_seqs
@@ -287,20 +292,23 @@ impl GtpConnection {
         let msg_id = MessageId(self.hot.next_message_id);
         self.hot.next_message_id += 1;
 
-        let item = SchedulableItem {
-            message_id: msg_id,
-            class: MessageClass::ReliableOrdered {
-                group_id,
-                order_seq: current_order_seq,
-            },
-            priority,
-            created_at: now,
-            deadline,
-            supersedable: false,
-            payload,
-        };
-
-        self.hot.scheduler.enqueue(item, now)?;
+        for (idx, chunk) in payload.chunks(max).enumerate() {
+            let item = SchedulableItem {
+                message_id: msg_id,
+                class: MessageClass::ReliableOrdered {
+                    group_id,
+                    order_seq: current_order_seq,
+                },
+                priority,
+                created_at: now,
+                deadline,
+                supersedable: false,
+                fragment_id: FragmentId(idx as u16),
+                total_fragments: total,
+                payload: chunk.to_vec(),
+            };
+            self.hot.scheduler.enqueue(item, now)?;
+        }
         Ok(msg_id)
     }
 
@@ -582,11 +590,34 @@ impl GtpConnection {
 
                 Frame::ReliableData {
                     message_id,
+                    fragment_id,
+                    total_fragments,
                     group_id,
                     order_seq,
                     payload,
-                    ..
                 } => {
+                    // F1: fragmented messages reassemble BELOW the delivery
+                    // semantics — ORD-4 dedup and the ordered groups only
+                    // ever see a COMPLETE message, exactly once.
+                    let payload: Vec<u8> = if total_fragments > 1 {
+                        match self.hot.reassembler.push(
+                            message_id.as_u64(),
+                            fragment_id,
+                            total_fragments,
+                            payload,
+                            now,
+                        ) {
+                            crate::fragment::PushOutcome::Delivered(full) => full,
+                            crate::fragment::PushOutcome::Partial => continue,
+                            crate::fragment::PushOutcome::Dropped => {
+                                self.cold.total_fragment_drops += 1;
+                                continue;
+                            }
+                        }
+                    } else {
+                        payload.to_vec()
+                    };
+                    let payload = &payload[..];
                     if group_id.as_u16() == 0 {
                         // ORD-4: unordered reliable delivery is deduplicated by
                         // message id — retransmissions of an already-delivered
@@ -836,6 +867,8 @@ impl GtpConnection {
             created_at: now,
             deadline: None,
             supersedable: false,
+            fragment_id: retrans.fragment_id,
+            total_fragments: retrans.total_fragments,
             payload: retrans.payload,
         }
     }
@@ -1278,8 +1311,8 @@ impl GtpConnection {
             MessageClass::ReliableUnordered => {
                 let frame = Frame::ReliableData {
                     message_id: item.message_id,
-                    fragment_id: FragmentId(0),
-                    total_fragments: 1,
+                    fragment_id: item.fragment_id,
+                    total_fragments: item.total_fragments,
                     group_id: OrderedGroupId(0),
                     order_seq: 0,
                     payload: &item.payload,
@@ -1289,10 +1322,11 @@ impl GtpConnection {
                     .map_err(|_| TransportError::BufferOverflow)?;
                 retransmittables.push(RetransmissionRecord {
                     message_id: item.message_id,
-                    fragment_id: FragmentId(0),
+                    fragment_id: item.fragment_id,
                     transmission_id: TransmissionId(1),
                     group_id: 0,
                     order_seq: 0,
+                    total_fragments: item.total_fragments,
                     payload: item.payload.clone(),
                 });
                 Ok(())
@@ -1303,8 +1337,8 @@ impl GtpConnection {
             } => {
                 let frame = Frame::ReliableData {
                     message_id: item.message_id,
-                    fragment_id: FragmentId(0),
-                    total_fragments: 1,
+                    fragment_id: item.fragment_id,
+                    total_fragments: item.total_fragments,
                     group_id,
                     order_seq,
                     payload: &item.payload,
@@ -1314,10 +1348,11 @@ impl GtpConnection {
                     .map_err(|_| TransportError::BufferOverflow)?;
                 retransmittables.push(RetransmissionRecord {
                     message_id: item.message_id,
-                    fragment_id: FragmentId(0),
+                    fragment_id: item.fragment_id,
                     transmission_id: TransmissionId(1),
                     group_id: group_id.as_u16(),
                     order_seq,
+                    total_fragments: item.total_fragments,
                     payload: item.payload.clone(),
                 });
                 Ok(())
@@ -1386,7 +1421,10 @@ mod tests {
     /// message sat at the head of its tier forever — `pop_next` could never fit it — so
     /// every message queued behind it was silently never sent.
     #[test]
-    fn oversized_payload_is_rejected_and_never_stalls_a_tier() {
+    /// CORE-2/F1: oversized reliable messages are now FRAGMENTED and delivered
+    /// complete; unreliable classes keep the FR-1 rejection (their contract has
+    /// no recovery). The tier is never stalled either way.
+    fn oversized_reliable_fragments_and_unreliable_still_rejects() {
         let cid = ConnectionId(0xF11_0000_0000_0001);
         let client_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let (mut client, mut server) = loopback_pair(cid);
@@ -1394,68 +1432,89 @@ mod tests {
 
         let max = client.max_message_payload();
         assert!(max > 0 && max < client.config.min_mtu);
-        let oversized = vec![0xABu8; max + 1];
 
-        // (a) Every send class rejects an oversized payload with the typed error.
+        // (a) Unreliable classes still reject: no fragmentation for them.
+        let oversized = vec![0xABu8; max + 1];
         assert!(matches!(
             client.send_unreliable(oversized.clone(), PriorityTier::P1Input, None, now),
             Err(TransportError::PayloadTooLarge { max: m }) if m == max
         ));
         assert!(matches!(
-            client.send_reliable_unordered(
-                oversized.clone(),
-                PriorityTier::P3ReliableGameplay,
+            client.send_sequenced(
+                StateKey::new(1, 0),
+                StateSequence(1),
+                GenerationId(1),
                 None,
-                now
-            ),
-            Err(TransportError::PayloadTooLarge { .. })
-        ));
-        assert!(matches!(
-            client.send_reliable_ordered(
-                OrderedGroupId(1),
                 oversized.clone(),
-                PriorityTier::P3ReliableGameplay,
-                None,
                 now
             ),
             Err(TransportError::PayloadTooLarge { .. })
         ));
 
-        // A rejected ordered send must NOT have consumed an order_seq — otherwise the
-        // receiver would wait forever on the missing sequence number.
-        assert!(
-            !client.hot.next_order_seqs.contains_key(&1),
-            "a rejected ordered send must not burn an order_seq"
-        );
-
-        // (b)+(c) A normal message on the SAME group still flows end-to-end: the tier
-        // was never stalled, and the ordered group starts cleanly at seq 0.
-        let payload = b"small_after_rejected_large".to_vec();
+        // (b) Reliable unordered: oversized → fragments → complete delivery.
+        let big_payload: Vec<u8> = (0..(max * 3 + 17)).map(|i| (i % 251) as u8).collect();
         client
-            .send_reliable_ordered(
-                OrderedGroupId(1),
-                payload.clone(),
+            .send_reliable_unordered(
+                big_payload.clone(),
                 PriorityTier::P3ReliableGameplay,
                 None,
                 now,
             )
-            .expect("a within-limit message must be accepted");
+            .expect("oversized reliable is fragmented, not rejected");
 
-        let mut buf = [0u8; 1500];
-        let (_, len) = client
-            .produce_outgoing_datagram(now, &mut buf)
-            .unwrap()
-            .expect("the small message must produce a datagram");
-        let delivered = server
-            .handle_incoming_datagram(client_addr, &mut buf[..len], now)
-            .unwrap();
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].payload, payload);
+        let mut buf = [0u8; 2048];
+        let mut assembled: Option<Vec<u8>> = None;
+        let mut received_bytes = 0usize;
+        for _ in 0..32 {
+            let Ok(Some((_, len))) = client.produce_outgoing_datagram(now, &mut buf) else {
+                break;
+            };
+            let delivered = server
+                .handle_incoming_datagram(client_addr, &mut buf[..len], now)
+                .unwrap();
+            for msg in delivered {
+                received_bytes += msg.payload.len();
+                assembled = Some(msg.payload.clone());
+            }
+        }
+        let assembled = assembled.expect("the fragmented message must deliver");
+        assert_eq!(
+            assembled, big_payload,
+            "the reassembled payload must equal the sent one byte-for-byte"
+        );
+        assert!(received_bytes >= big_payload.len());
+        assert!(
+            server.hot.reassembler.is_empty(),
+            "the reassembler must not hold state after completion"
+        );
 
-        // A payload exactly at the limit is still accepted.
-        assert!(client
-            .send_unreliable(vec![0u8; max], PriorityTier::P1Input, None, now)
-            .is_ok());
+        // (c) Reliable ordered: one order_seq for the whole message; the group
+        // receives it as a single in-order message.
+        let (mut c2, mut s2) = loopback_pair(cid);
+        let ordered_big: Vec<u8> = (0..(max * 2 + 5)).map(|i| (i % 249) as u8).collect();
+        c2.send_reliable_ordered(
+            OrderedGroupId(3),
+            ordered_big.clone(),
+            PriorityTier::P3ReliableGameplay,
+            None,
+            now,
+        )
+        .expect("oversized ordered is fragmented");
+        let mut buf2 = [0u8; 2048];
+        let mut ordered_delivered: Vec<ReceivedMessage> = Vec::new();
+        for _ in 0..32 {
+            let Ok(Some((_, len))) = c2.produce_outgoing_datagram(now, &mut buf2) else {
+                break;
+            };
+            ordered_delivered.extend(
+                s2.handle_incoming_datagram(client_addr, &mut buf2[..len], now)
+                    .unwrap(),
+            );
+        }
+        // The group delivers exactly ONE message (the reassembled whole) — the
+        // fragments never appear individually to the ordered layer.
+        let payloads: Vec<&[u8]> = ordered_delivered.iter().map(|m| &m.payload[..]).collect();
+        assert_eq!(payloads, vec![&ordered_big[..]]);
     }
 
     /// FR-2 / TEST-2: the receive-side ordered-group map must stay bounded even when a

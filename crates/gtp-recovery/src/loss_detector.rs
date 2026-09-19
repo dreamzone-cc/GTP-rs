@@ -499,6 +499,7 @@ mod tests {
                 group_id: 0,
                 order_seq: 0,
                 payload: b"critical_game_event".to_vec(),
+                total_fragments: 1,
             }],
         }
     }
