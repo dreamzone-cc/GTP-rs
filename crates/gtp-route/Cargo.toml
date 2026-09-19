@@ -7,8 +7,8 @@ license.workspace = true
 description = "Pure, deterministic route scoring and selection for the GTP adaptive-routing engine (ARDP B-1 prelude)"
 
 [dependencies]
+gtp-types = { workspace = true }
 
 [dev-dependencies]
 gtp-core = { path = "../gtp-core" }
 gtp-sim = { path = "../gtp-sim" }
-gtp-types = { path = "../gtp-types" }

@@ -34,6 +34,7 @@ pub mod decision_log;
 pub mod report;
 pub mod score;
 pub mod select;
+pub mod switch;
 
 pub use decision_log::{DecisionRecord, DecisionTracker, PolicyClass, DECISION_LOG_PREFIX};
 pub use report::{MeasurementReport, REPORT_GROUP_ID, REPORT_PREFIX};
